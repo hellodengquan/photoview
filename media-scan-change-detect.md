@@ -1722,7 +1722,473 @@ find ./media_cache -mindepth 2 -maxdepth 2 -type d -exec bash -c '
 
 ---
 
-## 20. 设计思考
+## 20. 原始文件元数据被外部工具改写时的检测方法
+
+### 20.1 当前检测能力总览
+
+Photoview 对「原始文件本身发生变化」的检测**几乎为零**。唯一例外是 sidecar `.xmp` 文件。以下是各层检测能力的完整梳理：
+
+| 变更类型 | 当前是否检测 | 检测机制 | 代码位置 |
+|---|---|---|---|
+| 文件新增（新路径） | ✅ | `path_hash` 查重 | `scanner_media.go:28` |
+| 文件删除（路径消失） | ✅ | 差集比对 | `cleanup_media.go:26-31` |
+| 文件改名/移动 | ⚠️ 间接 | 等效删除+新增 | 同上 |
+| Sidecar `.xmp` 内容变更 | ✅ | 内容 MD5 哈希 | `sidecar_task.go:72-79` |
+| **原始文件内容被改写** | ❌ | 无 | - |
+| **原始文件 EXIF/GPS 被改写** | ❌ | 无 | - |
+| **原始文件被原地覆盖（同名同路径）** | ❌ | 无 | - |
+| **原始文件大小/修改时间变化** | ❌ | 无 | - |
+| **原始文件 inode 变化（编辑器保存）** | ❌ | 无 | - |
+
+### 20.2 为什么 mtime 检测不准确
+
+`ScanMedia`（`scanner_media.go:55-65`）中唯一一次读取 `os.Stat`：
+
+```go
+stat, err := os.Stat(mediaPath)
+// ...
+media := models.Media{
+    Title:    mediaName,
+    Path:     mediaPath,
+    AlbumID:  albumId,
+    Type:     mediaTypeText,
+    DateShot: stat.ModTime(),    // 仅用于 DateShot 初始值
+}
+```
+
+**这段代码只在 `newMedia=true` 时执行**。对已存在文件，`ScanMedia` 在第 28-37 行直接返回：
+
+```go
+result := tx.Where("path_hash = ?", models.MD5Hash(mediaPath)).Find(&media)
+if result.RowsAffected > 0 {
+    return media[0], false, nil   // 直接返回，不再 os.Stat
+}
+```
+
+→ **已存在文件的 mtime 变化完全被忽略**。即使文件内容已彻底改变，只要路径不变，`ScanMedia` 不会触发任何重处理。
+
+### 20.3 外部工具改写文件的典型场景
+
+| 场景 | 触发工具 | 文件系统变化 | Photoview 感知 |
+|---|---|---|---|
+| JPEG 无损旋转 | `exiftran -ai`、`jhead -autorot` | 内容变、mtime 变、inode 不变 | ❌ 无感知 |
+| EXIF 日期/ GPS 修正 | `exiftool -GPS*=...`、`exiv2` | 内容变、mtime 变、inode 不变 | ❌ 无感知 |
+| 照片编辑后保存 | Lightroom、GIMP、Photoshop | 内容变、mtime 变、inode 可能变（tmp→rename） | ❌ 无感知 |
+| 视频转码覆盖 | `ffmpeg -i in.mp4 -c:v ... out.mp4` | 内容变、大小变、mtime 变 | ❌ 无感知 |
+| `touch` 修改 mtime | `touch -t 202401010000 IMG.jpg` | 仅 mtime 变、内容不变 | ❌ 无感知 |
+| 文件系统 fsck 修复 | `fsck -y` | inode 可能变、内容可能变 | ❌ 无感知 |
+| 日志轮转覆盖 | `logrotate` 式 rename+create | inode 变、内容变 | 被视为「已存在」 |
+
+### 20.4 理论上的检测方法对比
+
+| 检测方法 | 可靠性 | 性能开销 | 实现复杂度 | 适用场景 |
+|---|---|---|---|---|
+| **mtime + size 对比** | ⚠️ 中 | O(1) per file | 低 | 大多数编辑场景 |
+| **inode + dev 对比** | ⚠️ 中 | O(1) per file | 低 | 检测「原地覆盖」（inode 变） |
+| **文件内容 MD5/SHA256** | ✅ 高 | O(file_size) | 中 | 绝对可靠，但需全文件读取 |
+| **头部采样哈希**（前 64KB） | ⚠️ 中-高 | O(64KB) | 中 | 平衡方案，大文件友好 |
+| **EXIF 标签采样** | ⚠️ 中 | O(1) exiftool 调用 | 高 | 仅检测 EXIF 变更 |
+| **inotify/fsevents** | ✅ 高 | O(event) | 高 | 实时检测，但仅限本地 FS |
+
+### 20.5 mtime 检测的局限分析
+
+即使在 `ScanMedia` 中加入 mtime 比对，仍存在以下问题：
+
+1. **mtime 可被伪造**：`touch -r reference.jpg target.jpg` 可以让 mtime 回到任意值
+2. **NFS 属性缓存**：`actimeo` 导致 mtime 有秒级偏差
+3. **复制保留 mtime**：`cp -p` 保留原始 mtime，内容实际已变
+4. **精度问题**：某些文件系统 mtime 精度仅到秒，1 秒内多次修改无法区分
+5. **编辑器行为差异**：
+   - 原地写入：mtime 变、inode 不变（`echo > file`）
+   - 安全保存：mtime 变、inode 变（`tmpfile → rename`，大多数编辑器的默认行为）
+
+**结论**：mtime 可作为**快速初筛**，但不应作为唯一判定依据。建议采用 **mtime + file_size 双重检查**作为低成本方案，**内容哈希**作为高可靠方案。
+
+### 20.6 推荐的分层检测策略
+
+```
+Layer 1: 快速检测（每次扫描必做）
+  ├── 比较 DB 中保存的 file_size 与 os.Stat().Size()
+  ├── 比较 DB 中保存的 mtime 与 os.Stat().ModTime()
+  └── 任一不匹配 → 标记为 "可能变更"
+
+Layer 2: 精确确认（仅对 Layer 1 标记的文件）
+  ├── 计算文件内容 SHA256（或前 64KB 采样）
+  ├── 与 DB 中保存的 content_hash 对比
+  └── 不匹配 → 触发重处理（重新 EXIF + 缩略图 + 人脸）
+
+Layer 3: 全量确认（按需触发，如 `forceRescan` mutation）
+  └── 对所有文件重新计算 content_hash 并比对
+```
+
+### 20.7 需新增的 DB 字段
+
+```sql
+ALTER TABLE media ADD COLUMN file_size BIGINT;         -- os.Stat().Size()
+ALTER TABLE media ADD COLUMN file_mod_time TIMESTAMP;   -- os.Stat().ModTime()
+ALTER TABLE media ADD COLUMN content_hash VARCHAR(64);  -- SHA256 头部采样或全量
+ALTER TABLE media ADD COLUMN inode BIGINT;              -- os.Stat().Sys().(*syscall.Stat_t).Ino
+ALTER TABLE media ADD COLUMN rescan_needed BOOLEAN DEFAULT FALSE;  -- Layer 1 标记
+```
+
+---
+
+## 21. 视频/照片缩略图与人脸检测共享缓存目录的清理冲突
+
+### 21.1 缓存目录结构回顾
+
+```
+media_cache/
+└── <albumId>/
+    └── <mediaId>/
+        ├── thumbnail_<token>.jpg     ← 照片缩略图 (Purpose=PhotoThumbnail)
+        ├── highres_<token>.jpg       ← 照片高分辨率 (Purpose=PhotoHighRes)
+        ├── video_thumb_<token>.jpg   ← 视频缩略图 (Purpose=VideoThumbnail)
+        ├── web_video_<token>.mp4     ← 视频转码 (Purpose=VideoWeb)
+        └── (原始文件不在此目录，直接读源路径)
+```
+
+**关键事实**：同一个 `<mediaId>/` 目录下，照片缩略图和视频缩略图**不可能同时存在**，因为一个 Media 记录的 `Type` 要么是 `photo` 要么是 `video`。
+
+### 21.2 缩略图的生成者与消费者
+
+| 缩略图类型 | 生成者 | 文件名模式 | 消费者 |
+|---|---|---|---|
+| `PhotoThumbnail` | `ProcessPhotoTask` | `thumbnail_<base>_<token>.jpg` | 前端列表展示、`BlurhashTask`、`FaceDetectionTask` |
+| `VideoThumbnail` | `ProcessVideoTask` | `video_thumb_<base>_<token>.jpg` | 前端列表展示、`BlurhashTask` |
+| `PhotoHighRes` | `ProcessPhotoTask` | `highres_<base>_<token>.jpg` | 前端全屏查看 |
+| `VideoWeb` | `ProcessVideoTask` | `web_video_<base>_<token>.mp4` | 前端视频播放 |
+
+### 21.3 人脸检测对缩略图的依赖链
+
+**位置**：`face_detection/face_detector_impl.go:92-128`
+
+```go
+func (fd *faceDetector) DetectFaces(db, media) error {
+    db.Model(media).Preload("MediaURL").First(&media)
+
+    var thumbnailURL *models.MediaURL
+    for _, url := range media.MediaURL {
+        if url.Purpose == models.PhotoThumbnail {   // ← 只找 PhotoThumbnail
+            thumbnailURL = &url
+            break
+        }
+    }
+
+    thumbnailPath, _ := thumbnailURL.CachedPath()   // ← 读缓存文件
+
+    fd.mutex.Lock()
+    faces, _ := fd.rec.RecognizeFile(thumbnailPath)  // ← 推理输入
+    fd.mutex.Unlock()
+}
+```
+
+**依赖链**：
+
+```
+FaceDetectionTask.AfterProcessMedia
+  → GlobalFaceDetector.DetectFaces
+    → 查找 PhotoThumbnail MediaURL
+    → CachedPath() → media_cache/<albumId>/<mediaId>/thumbnail_xxx.jpg
+    → face.RecognizeFile(thumbnailPath)
+```
+
+**关键**：人脸检测**仅使用 `PhotoThumbnail`**，不使用 `VideoThumbnail`。对视频媒体，`FaceDetectionTask` 在第 20 行检查 `mediaData.Media.Type == models.MediaTypePhoto` 后直接跳过：
+
+```go
+if didProcess && mediaData.Media.Type == models.MediaTypePhoto {
+    // 仅照片做人脸检测
+}
+```
+
+### 21.4 缓存清理操作分析
+
+`CleanupMedia` 的清理粒度是**整个 `<mediaId>/` 目录**：
+
+```go
+cachePath := path.Join(utils.MediaCachePath(),
+    strconv.Itoa(int(albumId)), strconv.Itoa(int(media.ID)))
+os.RemoveAll(cachePath)    // ← 递归删除该 media 的所有缓存文件
+```
+
+**不存在"只删缩略图不删视频"或"只删人脸数据不删缩略图"的细粒度清理**。
+
+### 21.5 潜在冲突场景
+
+#### 场景 1：Sidecar 变更触发缩略图重生成，人脸数据未更新
+
+```
+时序：
+  1. 用户在 Lightroom 中修改照片调色 → XMP 文件变更
+  2. SidecarTask 检测到 SideCarHash 变化
+  3. 重新生成 PhotoThumbnail 和 PhotoHighRes
+     ├── 新的 thumbnail_<new_token>.jpg 写入缓存
+     ├── 旧的 thumbnail_<old_token>.jpg 仍在磁盘上
+     └── MediaURL 表更新为新的 MediaName
+  4. FaceDetectionTask.AfterProcessMedia:
+     ├── updatedURLs 包含新的 thumbnail URL → didProcess = true
+     ├── media.Type == photo → 执行 DetectFaces
+     ├── DetectFaces 读取新的 thumbnail → 在新图片上重新检测人脸
+     └── 但旧的人脸 rectangle 坐标可能不再准确（裁剪/旋转后）
+```
+
+**问题**：Sidecar 变更可能导致图片被裁剪/旋转，人脸位置坐标（`ImageFace.Rectangle` 存储的是相对坐标 0.0-1.0）会偏移，但 `DetectFaces` 会重新检测，**新的 ImageFace 记录会追加而非替换旧的**。
+
+具体来看 `classifyFace`（`face_detector_impl.go:134-189`）：
+
+```go
+// 如果匹配到已有 face_group → Association Append 新 imageFace
+// 如果没有匹配 → 创建新 faceGroup + imageFace
+// 旧 imageFace 记录不会被删除
+```
+
+→ **Sidecar 变更后，同一张照片可能同时存在新旧两套人脸记录**，旧的 rectangle 坐标指向原图位置，新的指向修改后图片位置。前端显示时可能出现重复人脸框或偏移。
+
+#### 场景 2：ProcessPhotoTask 中缩略图缓存缺失自动补全
+
+`process_photo_task.go:73-81` 和 `110-123`：
+
+```go
+// 如果 highResURL 存在但文件不存在 → 重新编码
+if _, err := os.Stat(baseImagePath); os.IsNotExist(err) {
+    log.Info(ctx, "High-res photo found in database but not in cache, re-encoding...")
+    err = mediaData.EncodeHighRes(baseImagePath)
+}
+
+// 如果 thumbURL 存在但文件不存在 → 重新编码
+if _, err := os.Stat(thumbPath); os.IsNotExist(err) {
+    _, err := media_encoding.EncodeThumbnail(ctx.GetDB(), baseImagePath, thumbPath)
+}
+```
+
+**这个"缓存缺失自动补全"逻辑与人脸检测不协调**：
+- 补全缩略图后 `updatedURLs` **不包含**该 URL（因为没有新增 `MediaURL` 记录）
+- `FaceDetectionTask` 检查 `len(updatedURLs) > 0` → false → **跳过人脸检测**
+- 结果：缩略图被重新生成了，但人脸数据可能仍指向旧图片的坐标
+
+#### 场景 3：CleanupMedia 删除缓存时人脸检测正在读同一文件
+
+```
+T1: 相册A的 ScanAlbum → scanMedia(媒体X) → FaceDetectionTask → RecognizeFile(thumbnailPath)
+T2: 相册A的 AfterScanAlbum → CleanupMedia → os.RemoveAll(media_cache/A/X/)
+
+注意：T1 和 T2 不会真正并发，因为它们在同一个 ScanAlbum 串行流程中。
+但跨相册场景可能发生：
+
+T1: 相册A ScanAlbum → 正在处理媒体X的人脸
+T2: （不可能发生，因为同一相册不会并发扫描）
+
+跨相册不会冲突，因为每个相册的缓存目录是独立的（<albumId>/ 不同）。
+```
+
+**结论**：同一相册内不会出现缩略图读写冲突（串行保证）。跨相册不会冲突（目录隔离）。
+
+### 21.6 冲突总结表
+
+| 冲突类型 | 是否真实存在 | 影响 |
+|---|---|---|
+| 缩略图/视频缩略图读写竞争 | ❌ 不存在 | 同一 Media 不可能同时是 photo 和 video |
+| 人脸检测与 CleanupMedia 读写竞争 | ❌ 不存在 | 串行保证 + 目录隔离 |
+| Sidecar 变更后人脸记录重复 | ✅ 存在 | 新旧 ImageFace 并存，rectangle 偏移 |
+| 缓存补全后人脸不重检测 | ✅ 存在 | updatedURLs 为空导致跳过 DetectFaces |
+| 缩略图重生成后旧文件残留 | ✅ 存在 | SidecarTask 生成新文件，旧文件仍留在磁盘 |
+
+### 21.7 修复建议
+
+1. **Sidecar 变更时先删旧人脸**：在 `SidecarTask.ProcessMedia` 中，重生成缩略图后调用 `DELETE FROM image_faces WHERE media_id = ?`，然后让 `FaceDetectionTask` 重新检测
+2. **缓存补全也触发人脸重检测**：`ProcessPhotoTask` 的缓存补全逻辑应在 `updatedURLs` 中标记（如添加一个空 MediaURL 表示"需要重检测"）
+3. **SidecarTask 删除旧缓存文件**：当前用 `.hold` 临时文件保护，但成功后 `os.Remove(tempFile)` 已处理。需确认异常路径下 `.hold` 文件不会残留
+4. **定期清理同一 mediaId 目录下的孤儿文件**：遍历 `media_cache/<albumId>/<mediaId>/` 目录，对比 `media_urls` 表中该 `media_id` 的 `MediaName`，删除不在 DB 中的文件
+
+---
+
+## 22. Docker 卷挂载与原生文件系统行为差异对扫描可靠性的影响
+
+### 22.1 Photoview 的 Docker 部署架构
+
+**Dockerfile 关键配置**（`Dockerfile:156-176`）：
+
+```dockerfile
+ENV PHOTOVIEW_MEDIA_CACHE=/home/photoview/media-cache
+USER photoview                        # UID=999, GID=999
+EXPOSE 80
+HEALTHCHECK CMD curl --fail http://localhost:80/api/graphql ...
+```
+
+**典型 docker-compose 挂载**：
+
+```yaml
+volumes:
+  - /host/photos:/photos:ro           # 源照片目录（只读）
+  - photoview-cache:/home/photoview/media-cache  # 缓存目录
+  - photoview-db:/var/lib/sqlite      # SQLite 数据（如用 SQLite）
+```
+
+### 22.2 Docker 卷类型与行为差异
+
+| 特性 | Bind Mount (`-v /host/path:/container/path`) | Named Volume (`-v name:/path`) | tmpfs (`--tmpfs /path`) |
+|---|---|---|---|
+| 存储位置 | 宿主机文件系统直接映射 | Docker 管理的 `/var/lib/docker/volumes/` | 内存/swap |
+| 文件系统类型 | 宿主机 FS（ext4/xfs/zfs） | 宿主机 FS | tmpfs |
+| inotify/fanotify | ✅ 支持 | ✅ 支持 | ✅ 支持 |
+| inode 稳定性 | ✅ 稳定（与宿主机一致） | ✅ 稳定 | ⚠️ 容器重启后变化 |
+| UID/GID 映射 | 直接使用宿主机数值 | 直接使用宿主机数值 | N/A |
+| 符号链接 | ✅ 遵循 | ✅ 遵循 | ✅ 遵循 |
+| 硬链接 | ⚠️ 仅同挂载点内 | ⚠️ 仅同卷内 | ✅ 同 tmpfs 内 |
+| `os.ReadDir` 性能 | 接近原生 | 接近原生 | 快于原生 |
+| `os.Stat` atime/mtime/ctime | 依赖宿主机挂载参数 | 依赖宿主机挂载参数 | 容器内维护 |
+| 文件锁（flock/fcntl） | ✅ 通过内核传递 | ✅ 通过内核传递 | ✅ 容器内 |
+| Docker Desktop (macOS/Windows) | ⚠️ 通过 VirtioFS/9P 透传 | ✅ Docker 管理 | ✅ 内存 |
+
+### 22.3 Docker 部署下的特殊问题
+
+#### 问题 1：UID/GID 不匹配
+
+Photoview 容器以 `UID=999` 运行，宿主机文件可能属于 `UID=1000`：
+
+```bash
+# 宿主机
+ls -la /photos/2024/
+drwxr-xr-x 1000 1000 4096 Jun 01 10:00 .
+-rw-r--r-- 1000 1000 5.2M Jun 01 10:00 IMG_001.jpg
+
+# 容器内
+ls -la /photos/2024/
+drwxr-xr-x 999 999 4096 Jun 01 10:00 .        # UID 1000 在容器内可能映射到 nobody
+-rw-r--r-- 999 999 5.2M Jun 01 10:00 IMG_001.jpg
+```
+
+**后果**：
+- bind mount 以 `:ro` 挂载且 UID 不匹配 → `os.ReadDir` 成功但 `os.Open` 读文件失败 → EXIF/缩略图生成失败
+- bind mount 以 `:rw` 挂载且 UID 不匹配 → `os.MkdirAll` 创建缓存子目录失败 → 扫描中止
+
+**修复**：
+```yaml
+# 方案 A：运行时指定 UID
+user: "1000:1000"
+
+# 方案 B：修改宿主机目录权限
+chmod -R o+rX /photos/
+
+# 方案 C：Dockerfile 中不固定 UID（需自行构建）
+```
+
+#### 问题 2：Docker Desktop (macOS/Windows) 的 VirtioFS 性能与语义
+
+| 行为 | Linux 原生 bind mount | Docker Desktop macOS (VirtioFS) |
+|---|---|---|
+| `os.ReadDir` 10 万文件 | ~2 秒 | ~30-60 秒（VirtioFS 开销） |
+| `os.Stat` 单文件 | ~0.01ms | ~0.5-2ms |
+| `os.Rename` 原子性 | ✅ 同目录原子 | ⚠️ VirtioFS 可能不保证 |
+| inotify | ✅ 实时 | ⚠️ 可能延迟或丢失事件 |
+| 硬链接 | ✅ | ❌ VirtioFS 不支持跨挂载硬链接 |
+| `os.Open` 大文件 | 流式读 | ⚠️ 可能全量拷贝到 VM 再读 |
+
+**对扫描的实际影响**：
+- macOS 开发环境下 10 万文件首次扫描从 ~15 小时（Linux）延长到 **~20-30 小时**
+- 缓存目录放在 bind mount 上时，缩略图写入性能下降 5-10 倍
+- 建议将 `PHOTOVIEW_MEDIA_CACHE` 放在 **named volume**（Docker 管理的 ext4 卷）而非 bind mount 上
+
+#### 问题 3：OverlayFS 与缓存目录
+
+如果 `PHOTOVIEW_MEDIA_CACHE` 路径在容器的可写层（而非挂载卷），每次容器重建都会丢失全部缓存。Docker 的可写层使用 OverlayFS：
+
+```bash
+# ❌ 不推荐：缓存写入容器可写层
+# 容器重建 → 缓存全部丢失 → 需要重新全量扫描
+ENV PHOTOVIEW_MEDIA_CACHE=/home/photoview/media-cache
+# 没有 -v 挂载该路径
+
+# ✅ 推荐：缓存写入 named volume
+docker run -v photoview-cache:/home/photoview/media-cache ...
+```
+
+#### 问题 4：多容器共享同一照片目录
+
+```yaml
+# docker-compose.yml
+services:
+  photoview-1:
+    volumes:
+      - /photos:/photos:ro
+  photoview-2:        # ❌ 两个实例不能共享同一 SQLite
+    volumes:
+      - /photos:/photos:ro
+```
+
+**问题**：
+- SQLite 在多进程写入时会锁定 → 第二个实例启动失败
+- MySQL/PostgreSQL 可支持多实例，但 `ScannerQueue` 的作业去重是**进程内**的（`in_progress` 切片），多实例间不共享 → 可能重复扫描
+- `CleanupMedia` 在两个实例上同时执行 → DB 唯一键冲突或级联删除竞争
+
+#### 问题 5：Docker 容器内文件系统事件丢失
+
+```go
+// 场景：容器内用 inotify 监控文件变更（虽然 Photoview 当前不使用 inotify）
+// 容器内只能看到容器 mount namespace 内的事件
+// 宿主机上的文件变更通过 bind mount 传递到容器内：
+//   - Linux: inotify 事件可穿透 bind mount ✅
+//   - macOS Docker Desktop: inotify 不可用 ❌
+//   - Windows Docker Desktop: inotify 不可用 ❌
+```
+
+Photoview 当前不使用 inotify，依赖周期性全量扫描，因此此问题暂不影响。
+
+### 22.4 Docker 环境下的缓存一致性
+
+| 操作 | 行为 | 风险 |
+|---|---|---|
+| 容器正常重启 | named volume 数据保留，SQLite 文件锁释放 | ✅ 无风险 |
+| 容器被 `docker kill -9` | 可能丢失正在写入的 JPEG/MP4 | ⚠️ 缓存文件可能不完整，但 `ProcessPhotoTask` 的缓存补全逻辑可自动修复 |
+| 容器被 `docker rm` 重建 | named volume 保留，容器可写层丢失 | ⚠️ 如 `PHOTOVIEW_MEDIA_CACHE` 未挂载卷则全部丢失 |
+| `docker system prune --volumes` | **named volume 也被删除** | ❌ 缓存+SQLite 全部丢失 |
+| 宿主机内核升级 | bind mount 重新挂载 | ⚠️ NFS/SMB 挂载可能需要重新 `mount` |
+| 容器镜像升级 | 新二进制，数据库 AutoMigrate 可能执行 | ⚠️ 如新版本 schema 不兼容旧 DB，启动失败 |
+
+### 22.5 Docker 部署最佳实践
+
+```yaml
+# 推荐的 docker-compose.yml
+services:
+  photoview:
+    image: photoview/photoview:latest
+    user: "1000:1000"                       # 与宿主机照片目录 UID 一致
+    environment:
+      - PHOTOVIEW_DATABASE_DRIVER=postgres  # 不用 SQLite（避免写锁问题）
+      - PHOTOVIEW_POSTGRES_URL=postgres://user:pass@db:5432/photoview
+      - PHOTOVIEW_MEDIA_CACHE=/cache
+      - PHOTOVIEW_DISABLE_FACE_DETECTION=0
+    volumes:
+      # 源照片：只读 bind mount
+      - /host/photos:/photos:ro
+      # 缓存：named volume（高性能，持久化）
+      - photoview-cache:/cache
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=photoview
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+    volumes:
+      - photoview-db:/var/lib/postgresql/data
+
+volumes:
+  photoview-cache:     # Docker 管理的 ext4 卷
+  photoview-db:        # 持久化数据库
+```
+
+**关键要点**：
+1. 缓存目录必须用 **named volume**，不能放 bind mount（macOS 性能差）也不能放容器可写层（重启丢）
+2. 数据库用 **PostgreSQL/MySQL**，不用 SQLite（Docker 多容器场景下 SQLite 写锁是致命的）
+3. `user: "1000:1000"` 确保 UID 与宿主机照片目录一致
+4. 源照片以 **`:ro`** 挂载，防止扫描进程意外修改源文件
+
+---
+
+## 23. 设计思考
 
 ### 优点
 
@@ -1753,6 +2219,11 @@ find ./media_cache -mindepth 2 -maxdepth 2 -type d -exec bash -c '
 19. **无原生备份恢复**：无 `backup/restore` mutation，恢复依赖外部工具；扫描仅能修复路径一致性，人工元数据（user_media_data、share_tokens）ID 变化后全部失效
 20. **缓存孤儿无自动清理**：DB 回滚或媒体重生成后，旧 `media_cache/<albumId>/<oldMediaId>/` 目录永久残留，仅能手动脚本清理
 21. **部分处理失败状态无重试**：磁盘空间不足导致 MediaURL 缺失，下次扫描因 `path_hash` 命中不会重新走 `ProcessMedia`，需人工干预
+22. **原始文件内容变更无检测**：`ScanMedia` 对已存在文件直接返回，不比较 mtime/size/inode，外部工具（exiftool/Lightroom/GIMP）改写文件后扫描无感知
+23. **Sidecar 变更后人脸记录重复**：`classifyFace` 追加新 ImageFace 而不删除旧的，裁剪/旋转后新旧 rectangle 并存导致前端人脸框偏移
+24. **缓存补全不触发人脸重检测**：`ProcessPhotoTask` 缓存缺失补全后 `updatedURLs` 为空，`FaceDetectionTask` 跳过检测
+25. **Docker UID 不匹配**：容器固定 UID=999，与宿主机照片目录 UID 不一致时扫描失败或权限错误
+26. **Docker Desktop VirtioFS 性能差**：macOS/Windows 下 bind mount 的 `ReadDir`/`Stat` 比 Linux 原生慢 10-30 倍
 
 ### 优化方向（潜在）
 
@@ -1782,6 +2253,18 @@ find ./media_cache -mindepth 2 -maxdepth 2 -type d -exec bash -c '
 - 解析并持久化 XMP 标签字段：`dc:subject`（关键词）、`xmp:Rating`（评分）、`lr:hierarchicalSubject`（层级标签）
 - 提供批量刷新 EXIF 的 API：按相册/按时间范围重解析元数据而不重编码图片
 
+**原始文件变更检测**：
+- `ScanMedia` 增加对已存在文件的 `mtime + file_size` 快速比对，不匹配时标记为需重处理
+- Media 表新增 `file_size`/`file_mod_time`/`content_hash`/`inode` 字段，支持分层检测
+- 提供 `forceRescan` mutation：按媒体 ID/相册/路径范围强制重新处理（忽略 path_hash 命中）
+- 内容哈希采用「头部 64KB 采样 + 全量回退」策略，平衡可靠性与性能
+
+**缓存与清理冲突**：
+- `SidecarTask.ProcessMedia` 重生成缩略图前先删除该 media 的旧 `image_faces` 记录
+- `ProcessPhotoTask` 缓存补全后将补全的 MediaURL 加入 `updatedURLs`，确保 `FaceDetectionTask` 被触发
+- 缓存目录内孤儿文件定期清理：扫描 `media_cache/<albumId>/<mediaId>/` 目录，删除不在 `media_urls` 表中的文件
+- `.hold` 临时文件超时清理：启动时扫描 `media_cache` 中所有 `.hold` 文件，超过 1 小时的自动删除
+
 **资源监控**：
 - 扫描 goroutine 中采样 `runtime.ReadMemStats`，`HeapAlloc` 超过阈值时输出 warn 日志
 - 支持通过环境变量 `GOMEMLIMIT` / `GOGC` 配置文档化并在启动时打印
@@ -1799,6 +2282,12 @@ find ./media_cache -mindepth 2 -maxdepth 2 -type d -exec bash -c '
 - 提供 `mediaRehash` mutation：批量改名时基于内容哈希匹配旧记录并更新 `path/path_hash`（保留 ID 和人工元数据）
 - 引入「修复扫描」模式：跳过 `CleanupMedia`（不检测删除），仅补全缺失 media 并重建缺失的 MediaURL
 - 提供 `databaseBackup` mutation：封装 `pg_dump` / `mysqldump` 并下载
+
+**Docker 部署**：
+- Dockerfile 中 UID 可通过 build arg 自定义（`ARG PUID=999`），避免与宿主机冲突
+- `docker-compose.yml` 示例中缓存目录使用 named volume，数据库使用 PostgreSQL
+- 启动时检测 `PHOTOVIEW_MEDIA_CACHE` 是否在容器可写层，如是则输出 warn 日志
+- 文档化 Docker Desktop (macOS/Windows) 的 VirtioFS 性能限制和替代方案
 
 **运营友好**：
 - 扫描进度持久化（按文件粒度记录 offset），中断后可恢复
