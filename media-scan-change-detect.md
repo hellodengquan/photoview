@@ -797,7 +797,444 @@ type AlbumScannerCache struct {
 
 ---
 
-## 14. 设计思考
+## 14. Sidecar XMP/JSON 元数据变更识别与批量标签修改
+
+### 14.1 Sidecar 文件支持范围
+
+Photoview 仅支持 **XMP 格式** 的 sidecar 文件，不支持 JSON 格式。
+
+**位置**：`api/scanner/scanner_tasks/processing_tasks/sidecar_task.go:133-141`
+
+```go
+func scanForSideCarFile(path string) *string {
+    testPath := path + ".xmp"   // 仅匹配 <photo>.xmp
+    if scanner_utils.FileExists(testPath) {
+        return &testPath
+    }
+    return nil
+}
+```
+
+**匹配规则**：
+- 仅查找 `<photo_filename>.xmp`，即照片同名加 `.xmp` 后缀
+- 不支持 JSON sidecar、不支持 XML sidecar、不支持 Lightroom 目录级别的 `.lrcat`
+- 大小写敏感（Linux 下 `IMG.jpg.XMP` 不会被匹配）
+
+### 14.2 变更识别算法：内容 MD5 哈希
+
+Sidecar 是系统中**唯一使用内容哈希**做变更检测的模块（见第 7 章）。此处补充细节：
+
+**哈希计算位置**：`sidecar_task.go:143-160`
+
+```go
+func hashSideCarFile(path *string) *string {
+    f, _ := os.Open(*path)
+    defer f.Close()
+    h := md5.New()
+    io.Copy(h, f)           // 流式读取整个 XMP 文件内容
+    hash := hex.EncodeToString(h.Sum(nil))
+    return &hash
+}
+```
+
+**存储位置**：`models.Media.SideCarHash`（`media.go:30`）
+
+```go
+type Media struct {
+    // ...
+    SideCarPath     *string
+    SideCarHash     *string   `gorm:"unique"`   // XMP 文件的 MD5
+}
+```
+
+### 14.3 变更触发后实际执行的操作
+
+Sidecar 变更**不会重新解析 EXIF**，也**不会触发人脸识别**，仅做两件事：
+
+**位置**：`sidecar_task.go:85-130`
+
+| 操作 | 是否执行 | 说明 |
+|---|---|---|
+| 重新生成高分辨率 JPEG | ✅ | `generateSaveHighResJPEG`，会应用新的 XMP 调色参数 |
+| 重新生成缩略图 JPEG | ✅ | `generateSaveThumbnailJPEG` |
+| 更新 MediaURL.Width/Height/FileSize | ✅ | XMP 可能裁剪了图片，尺寸会变 |
+| 更新 `SideCarHash` 到 DB | ✅ | 保存新哈希避免下次重复处理 |
+| 重新解析 EXIF | ❌ | EXIF 仅在 `newMedia=true` 时解析一次 |
+| 重新计算 DateShot | ❌ | 时间戳只在首次入库时由 EXIF 或文件 ModTime 决定 |
+| 重新人脸识别 | ❌ | 人脸检测在 FaceDetectionTask 中独立执行 |
+| 重新计算 Blurhash | ❌ | 不涉及 |
+
+**关键结论**：XMP 变更仅影响**视觉输出（缩略图/高分辨率图）**，不影响数据库中的 EXIF 元数据字段。
+
+### 14.4 EXIF 解析的执行时机
+
+对比 `ExifTask.AfterMediaFound`（`exif_task.go:19-29`）：
+
+```go
+func (t ExifTask) AfterMediaFound(ctx, media, newMedia bool) error {
+    if !newMedia {          // 仅在媒体首次入库时执行
+        return nil
+    }
+    SaveEXIF(ctx.GetDB(), media)
+    return nil
+}
+```
+
+**EXIF 解析条件矩阵**：
+
+| 场景 | newMedia | SideCarHash 变化 | EXIF 重新解析 |
+|---|---|---|---|
+| 文件第一次被扫描 | true | 不相关 | ✅ |
+| 文件已存在，仅 XMP 被修改 | false | 是 | ❌ |
+| 文件已存在，XMP 未变 | false | 否 | ❌ |
+| 文件改名（等效新文件） | true | 不相关 | ✅ |
+
+**运营影响**：
+- 在 Lightroom 中修改「描述」「关键词」「标题」等仅存于 XMP 的字段 → **数据库不更新这些字段**（Photoview 不解析 XMP 标签字段，仅用 XMP 调色）
+- 修改 EXIF（如相机信息、GPS、拍摄时间）后，需**先删除 DB 中该媒体记录或触发重新扫描**才能生效
+
+### 14.5 EXIF 解析实际提取的字段
+
+**位置**：`api/scanner/externaltools/exiftool/values.go` + `api/scanner/externaltools/exif/exif.go:53-94`
+
+Photoview 从 EXIF/XMP 中提取以下字段存入 `MediaEXIF` 表：
+
+| EXIF 字段 | DB 列 | 来源 |
+|---|---|---|
+| Model / Make | Camera, Maker | EXIF |
+| LensModel | Lens | EXIF |
+| ISO / Flash / Orientation | Iso, Flash, Orientation | EXIF |
+| ExposureProgram / ExposureTime | ExposureProgram, Exposure | EXIF |
+| Aperture / FocalLength | Aperture, FocalLength | EXIF |
+| ImageDescription | Description | EXIF |
+| DateTimeOriginal / SubSecDateTimeOriginal | DateShot, OffsetSecShot | EXIF（优先级最高） |
+| GPSLatitude / GPSLongitude | GPSLatitude, GPSLongitude | EXIF |
+
+**注意**：Photoview **不解析 XMP 中的 `dc:subject`（关键词/标签）、`lr:hierarchicalSubject`（层级关键字）、`xmp:Rating`（评分）** 等元数据。这些字段在 Lightroom 批量修改后，Photoview 数据库中**完全不可见**。
+
+### 14.6 批量修改标签的实际影响
+
+运营常见场景：用 Lightroom 对 1 万张图批量修改关键词/评分/调色，随后触发全量重扫。
+
+| 修改项 | 全量重扫是否生效 | 性能影响 |
+|---|---|---|
+| 调色（曝光/色温/裁剪） | ✅ 缩略图和高分辨率图会重新生成 | 大！1 万张图全部重新编码 JPEG |
+| XMP 描述/标题 | ❌ DB 中 Description 不更新（仅首次扫时从 EXIF 读） | 同上（仍会重编码，因为 XMP 哈希变了） |
+| XMP 关键词/标签 | ❌ Photoview 不存这些字段 | 同上（仍会重编码） |
+| XMP 评分/颜色标签 | ❌ Photoview 不存这些字段 | 同上（仍会重编码） |
+| EXIF GPS / 拍摄时间 | ❌ EXIF 仅 newMedia 时解析一次 | 同上（XMP 哈希变则重编码，但 EXIF 字段不更新） |
+
+**关键结论**：批量改标签后执行全量重扫，**只会重新生成所有缩略图/高分辨率图（耗时几小时），但数据库中的 EXIF 元数据完全不变**。如果运营目的是更新 DB 中的描述/关键词，当前架构**无法实现**。
+
+### 14.7 RAW + JPEG 配对文件的 sidecar 行为
+
+`CounterpartFilesTask`（`counterpart_files_task.go`）处理 RAW + JPEG 配对：
+
+```
+场景：
+  IMG_0001.ARW (SONY RAW)
+  IMG_0001.JPG (对应 JPEG)
+  IMG_0001.JPG.xmp (sidecar)
+
+行为：
+  - JPEG 被识别为 RAW 的 counterpart 而跳过（不入库）
+  - 仅 RAW 入库，但其编码处理使用 JPEG 作为 baseImagePath
+  - sidecar 关联到 RAW 文件的 media 记录上
+```
+
+**修改 RAW 的 XMP 调色 → 实际上重编码的是 counterpart JPEG**。
+
+---
+
+## 15. 媒体删除：软删（Trash）与硬删（Hard Delete）恢复路径
+
+### 15.1 系统不存在软删机制
+
+经过完整代码分析，Photoview **没有实现 Trash/回收站/软删 功能**。
+
+**证据 1：Model 基类无 DeletedAt**
+`api/graphql/models/base.go:7-15`
+
+```go
+type Model struct {
+    ID int `gorm:"primarykey"`
+    ModelTimestamps
+}
+
+type ModelTimestamps struct {
+    CreatedAt time.Time
+    UpdatedAt time.Time
+    // 没有 DeletedAt time.Time → GORM 不会启用软删
+}
+```
+
+GORM 软删需要嵌入 `gorm.Model` 或手动添加 `DeletedAt gorm.DeletedAt` 字段，当前基类均无。
+
+**证据 2：所有删除操作均为 DELETE SQL**
+
+`CleanupMedia`（`cleanup_media.go:52`）：
+```go
+db.Where("id IN (?)", mediaIDs).Delete(models.Media{})
+// 执行：DELETE FROM media WHERE id IN (...)
+```
+
+`DeleteOldUserAlbums`（`cleanup_media.go:111-121`）：
+```go
+tx.Where("album_id IN (?)", deleteAlbumIDs).Delete(&models.UserAlbums{})
+tx.Where("id IN (?)", deleteAlbumIDs).Delete(models.Album{})
+```
+
+均为**物理删除**，无 `UPDATE deleted_at = NOW()` 软删语句。
+
+### 15.2 删除操作的完整链路
+
+```
+CleanupMedia(albumId, albumMedia)
+  │
+  ├── 1. 计算差集：DB media - albumMedia = 待删除集合
+  │
+  ├── 2. 删除磁盘缓存
+  │     cachePath = <MediaCachePath>/<albumId>/<mediaId>/
+  │     os.RemoveAll(cachePath)       ← 递归删除缩略图/高分辨率图
+  │
+  ├── 3. 删除 DB 记录
+  │     DELETE FROM media WHERE id IN (...)
+  │     └── GORM 级联 OnDelete:CASCADE
+  │           ├── DELETE FROM media_urls        (缩略图/高分辨率元数据)
+  │           ├── DELETE FROM media_exif         (EXIF 信息)
+  │           ├── DELETE FROM image_faces        (人脸识别结果)
+  │           └── DELETE FROM video_metadata     (视频元数据)
+  │
+  └── 4. 重新加载人脸检测器索引
+        face_detection.GlobalFaceDetector.ReloadFacesFromDatabase(db)
+```
+
+**级联删除配置**（`media.go:21-31`）：
+```go
+type Media struct {
+    Album           Album          `gorm:"constraint:OnDelete:CASCADE;"`
+    Exif            *MediaEXIF     `gorm:"constraint:OnDelete:CASCADE;"`
+    MediaURL        []MediaURL     `gorm:"constraint:OnDelete:CASCADE;"`
+    VideoMetadata   *VideoMetadata `gorm:"constraint:OnDelete:CASCADE;"`
+    Faces           []*ImageFace   `gorm:"constraint:OnDelete:CASCADE;"`
+}
+```
+
+### 15.3 Trash 软删 vs Hard Delete 对比
+
+| 维度 | 理想 Trash 软删 | 当前实现（Hard Delete） |
+|---|---|---|
+| DB 操作 | `UPDATE media SET deleted_at = NOW()` | `DELETE FROM media` |
+| 缓存目录 | 移动到 trash/ 或保留 | `os.RemoveAll` 立即删除 |
+| 恢复路径 | `UPDATE media SET deleted_at = NULL` + 重建缓存 | ❌ 无法恢复 |
+| UI 可见性 | 被 WHERE deleted_at IS NULL 过滤 | 记录已不存在 |
+| 用户收藏/标签 | 保留在 user_media_data 表 | 可能成为孤儿（无外键级联） |
+| 误删恢复时间 | 秒级 | 不可恢复，只能重新扫描（丢失人工标签） |
+
+### 15.4 当前唯一"恢复路径"
+
+由于是硬删，**Photoview 自身无恢复能力**。唯一可行路径：
+
+```
+方案 A：从数据库备份恢复
+  ├── 前提：定期备份 PostgreSQL/MySQL
+  ├── 操作：还原备份 → 重新扫描未备份期间的增量
+  └── 丢失：备份时间点之后的人工标签/收藏/分享链接
+
+方案 B：重新扫描源文件
+  ├── 前提：源文件仍在磁盘上
+  ├── 操作：触发全量扫描，文件重新入库
+  └── 丢失：所有人工元数据（收藏、分享、人脸标注、相册封面设置）全部清零
+
+方案 C：缓存目录手动恢复
+  ├── 前提：有文件系统备份（如 ZFS snapshot / Time Machine）
+  └── 操作：还原 <MediaCachePath>/<albumId>/<mediaId>/ 目录
+      （但 DB 记录已删，仅还原缓存无意义，需配合方案 A+B）
+```
+
+### 15.5 删除的触发入口
+
+| 触发方式 | 调用方 | 行为 |
+|---|---|---|
+| 自动扫描 | `MediaCleanupTask.AfterScanAlbum` | 差集计算后硬删 |
+| 用户触发扫描 | `scanner_queue.AddUserToQueue` | 同上 |
+| 周期性扫描 | `periodic_scanner.AddAllToQueue` | 同上 |
+| UI 删除按钮 | ❌ 无此功能 | - |
+| GraphQL 删除 Mutation | ❌ 无 `deleteMedia` mutation | - |
+
+**注意**：当前系统**没有提供用户主动删除单张图片的 API**，所有删除都是扫描时「源文件已不存在」的被动触发。
+
+---
+
+## 16. 专辑封面与缩略图：源文件删除后的孤儿清理
+
+### 16.1 专辑封面的引用方式
+
+**数据结构**（`album.go:10-21`）：
+
+```go
+type Album struct {
+    // ...
+    CoverID  *int       // 指向 media.id，可为 NULL
+}
+```
+
+**封面设置 API**（`album_actions.go:139-166`）：
+
+```go
+func SetAlbumCover(db, user, mediaID) (*Album, error) {
+    db.Find(&media, mediaID)              // 校验 media 存在
+    db.Find(&album, media.AlbumID)        // 校验用户有权限
+    db.Model(&album).Update("cover_id", mediaID)
+}
+
+func ResetAlbumCover(db, user, albumID) (*Album, error) {
+    db.Model(&album).Update("cover_id", nil)  // 置 NULL
+}
+```
+
+**封面读取逻辑**（`album.go:83-115`，使用递归 CTE）：
+
+```go
+func (a *Album) Thumbnail(db) (*Media, error) {
+    // 1. 如果 CoverID 有值，优先使用指定封面
+    if a.CoverID != nil {
+        db.First(&media, *a.CoverID)
+        if err == nil { return &media, nil }
+        // CoverID 指向的 media 不存在 → 继续执行兜底逻辑
+    }
+
+    // 2. 兜底：取该相册（含子相册）下最新的一张 media
+    query := `
+        WITH RECURSIVE sub_albums AS (...)
+        SELECT * FROM media
+        WHERE media.album_id IN (SELECT id FROM sub_albums)
+        ORDER BY media.id DESC
+        LIMIT 1
+    `
+    db.Raw(query, a.ID).Scan(&media)
+    return &media, nil
+}
+```
+
+### 16.2 封面成为孤儿的场景
+
+```
+场景 1：CoverID 指向的 media 被 CleanupMedia 删除
+  ├── 触发：源文件被删，扫描后 DB 执行 DELETE FROM media
+  ├── 结果：album.cover_id 仍指向已删除的 media.id（悬挂指针）
+  └── 读取：Album.Thumbnail() 中 db.First 失败 → 自动回退到兜底逻辑
+
+场景 2：CoverID 指向的 media 因改名被删+重建
+  ├── 触发：源文件改名，旧 media.id 被删，新 media.id 生成
+  ├── 结果：album.cover_id 指向旧的（已不存在）media.id
+  └── 读取：同上，兜底为最新图片
+
+场景 3：整个相册被删除（DeleteOldUserAlbums）
+  ├── 触发：相册目录被删，扫描后 Album 记录被 DELETE
+  ├── 结果：子相册 CoverID 关联父相册的 media 可能也失效
+  └── 但 Album 记录本身已删，不影响
+```
+
+### 16.3 孤儿 CoverID 的清理流程
+
+**结论：Photoview 没有显式的孤儿 CoverID 清理流程。**
+
+现有代码中**无任何地方**执行：
+```go
+// 不存在这样的代码
+db.Where("cover_id NOT IN (SELECT id FROM media)").Update("cover_id", nil)
+```
+
+**CoverID 的容错依赖读取时兜底**：
+
+```
+用户访问 Album → resolver 调用 Album.Thumbnail()
+  → db.First(media, CoverID) → 失败（gorm.ErrRecordNotFound）
+  → 执行兜底 SQL：SELECT ... ORDER BY media.id DESC LIMIT 1
+  → 返回子树中最新一张图片作为封面
+  → 但 album.cover_id 仍为旧值，下次访问仍重复此过程
+```
+
+**运营影响**：
+- 封面图片被删后，相册**不会显示空白**（兜底逻辑生效）
+- 但会出现「封面不一致」：UI 实际显示的图片 ≠ `album.cover_id` 指向的图片
+- 大量孤儿 CoverID 会导致每次封面读取都多一次无效的 DB 查询
+
+### 16.4 缩略图缓存（MediaCache）的孤儿清理
+
+缩略图缓存目录结构：`api/utils/media_cache.go:59-73`
+
+```
+<MediaCachePath>/                  默认: ./media_cache
+├── <albumId>/
+│   ├── <mediaId>/
+│   │   ├── thumbnail_xxx.jpg
+│   │   ├── highres_xxx.jpg
+│   │   └── video-web_xxx.mp4
+```
+
+**清理逻辑**（与 Media 删除同步执行）：
+
+`CleanupMedia` 中（`cleanup_media.go:40-48`）：
+```go
+for _, media := range mediaList {
+    cachePath := path.Join(utils.MediaCachePath(),
+        strconv.Itoa(albumId), strconv.Itoa(media.ID))
+    os.RemoveAll(cachePath)    // ← 精确匹配 albumId + mediaId 删除
+}
+```
+
+`DeleteOldUserAlbums` 中（`cleanup_media.go:100-108`）：
+```go
+for _, album := range deleteAlbums {
+    cachePath := path.Join(utils.MediaCachePath(), strconv.Itoa(album.ID))
+    os.RemoveAll(cachePath)    // ← 删除整个相册缓存目录
+}
+```
+
+### 16.5 媒体缩略图（MediaURL）的孤儿清理
+
+`media_urls` 表通过外键约束自动清理：
+
+`media.go:24`：
+```go
+MediaURL []MediaURL `gorm:"constraint:OnDelete:CASCADE;"`
+```
+
+→ 删除 Media 记录时，数据库自动级联删除关联的 `media_urls` 行。
+
+### 16.6 未被清理的孤儿类型总结
+
+| 孤儿类型 | 是否自动清理 | 清理机制 | 影响 |
+|---|---|---|---|
+| `album.cover_id` 指向已删除 media | ❌ 否 | 仅读取时兜底，DB 值仍脏 | 无效 DB 查询 |
+| `media_cache/<albumId>/` 目录（Album 被删） | ✅ 是 | `DeleteOldUserAlbums → os.RemoveAll` | - |
+| `media_cache/<albumId>/<mediaId>/` 目录（Media 被删） | ✅ 是 | `CleanupMedia → os.RemoveAll` | - |
+| `media_urls` 表记录（Media 被删） | ✅ 是 | DB ON DELETE CASCADE | - |
+| `media_exif` / `image_faces` 表记录 | ✅ 是 | DB ON DELETE CASCADE | - |
+| `user_media_data` 用户收藏/标签 | ❓ 依赖外键 | 需检查 user_media_data 是否有级联 | 可能成为孤儿 |
+| `share_tokens` 分享链接 | ❓ 依赖外键 | 需检查 share_tokens 是否有级联 | 可能成为孤儿 |
+| 空的 `media_cache/<albumId>/` 目录（Album 下 media 全删光） | ❌ 否 | 无定期清理空目录逻辑 | 占用少量 inode |
+
+### 16.7 运营建议：CoverID 孤儿修复
+
+```sql
+-- 定期执行（如每天 cron），清理悬挂的 album.cover_id
+UPDATE albums
+SET cover_id = NULL
+WHERE cover_id IS NOT NULL
+  AND cover_id NOT IN (SELECT id FROM media);
+```
+
+```bash
+# 定期清理空的缓存目录
+find ./media_cache -type d -empty -delete
+```
+
+---
+
+## 17. 设计思考
 
 ### 优点
 
@@ -815,6 +1252,12 @@ type AlbumScannerCache struct {
 6. **NFS/SMB 无适配**：无网络文件系统检测与容错，挂载失联可能导致整相册媒体被误删
 7. **半写文件检测弱**：仅通过 `Size == 0` 跳过，无法处理预分配或部分写入的文件
 8. **TOCTOU 竞态**：`ScanMedia` 的查-插窗口可能导致唯一键冲突，文件处理失败
+9. **Sidecar 元数据不更新**：XMP 变更仅重生成缩略图，数据库中的 EXIF 字段（描述/时间/GPS）不刷新，批量改标签在 DB 中完全不可见
+10. **不支持关键词/标签**：不解析 `dc:subject`、`lr:hierarchicalSubject`、`xmp:Rating` 等 XMP 标签字段
+11. **无软删/回收站**：所有删除均为物理删除，误删无恢复路径，人工标签/收藏/分享链接全部丢失
+12. **CoverID 孤儿无清理**：`album.cover_id` 指向已删除 media 时不自动置 NULL，仅在读取时兜底，DB 脏数据累积
+13. **无用户主动删除 API**：只能通过从磁盘删文件 + 触发扫描来删除媒体，无直接删除 Mutation
+14. **Sidecar 格式单一**：仅支持 `.xmp`，不支持 JSON sidecar、Lightroom `.lrcat`、Capture One 目录等
 
 ### 优化方向（潜在）
 
@@ -825,7 +1268,7 @@ type AlbumScannerCache struct {
 
 **并发与性能**：
 - 将单相册串行改为文件级并发（需要 DB 连接池与事务隔离级别的配合）
-- 使用 `exiftool` `-stay_open` 模式或多进程池，消除 EXIF 全局串行瓶颈
+- `exiftool` 已是 `-stay_open True` 模式，可进一步改为多进程池消除全局互斥锁
 - 人脸检测支持批量推理与 GPU 并发
 
 **可靠性**：
@@ -833,8 +1276,18 @@ type AlbumScannerCache struct {
 - 增加文件完整性检测：`Size > 0` 后增加 `ModTime` 稳定检查（如 30 秒内未变化）
 - `ScanMedia` 的查-插竞态：改用 `INSERT ... ON CONFLICT DO NOTHING` 加返回判断
 - SMB 大小写折叠处理：`path_hash` 计算前统一转为小写，避免重复扫描
+- 新增媒体 Trash/回收站机制：`Media` 增加 `DeletedAt` 字段，支持软删与一键恢复
+- CoverID 孤儿定期清理：在 `AfterScanAlbum` 中增加 `UPDATE albums SET cover_id = NULL WHERE cover_id NOT IN (SELECT id FROM media)`
+
+**Sidecar 与元数据**：
+- XMP 变更时重新解析 EXIF（当前仅重编码图片不刷新 DB 字段）
+- 扩展 sidecar 支持：JSON 格式、大小写不敏感匹配（`.XMP`）
+- 解析并持久化 XMP 标签字段：`dc:subject`（关键词）、`xmp:Rating`（评分）、`lr:hierarchicalSubject`（层级标签）
+- 提供批量刷新 EXIF 的 API：按相册/按时间范围重解析元数据而不重编码图片
 
 **运营友好**：
 - 扫描进度持久化（按文件粒度记录 offset），中断后可恢复
-- 新增 API：按路径范围扫描、按修改时间增量扫描
+- 新增 API：按路径范围扫描、按修改时间增量扫描、单张图片强制重扫（刷新 EXIF）
 - 慢扫描告警：单文件处理 > N 秒时输出详细日志（文件大小、耗时分布）
+- 新增 `deleteMedia(id)` GraphQL Mutation：支持用户从 UI 主动删除/恢复单张图片
+- 缓存孤儿清理 cron：定期执行 `find ./media_cache -type d -empty -delete`，并在 `CleanupMedia` 中同步清理空 album 目录
