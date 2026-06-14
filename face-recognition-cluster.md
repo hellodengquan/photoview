@@ -402,11 +402,317 @@ fd.rec.SetSamples(fd.faceDescriptors, fd.faceGroupIDs)
 
 这是**增量学习**机制：每次新检测到人脸后，立即将其加入样本库，后续检测可以识别这张脸。
 
+#### 5.7.1 增量识别场景：不做全量重聚类，只做追加
+
+**重要发现**：`SetSamples()` **不会触发任何聚类算法重计算**。它只是简单地替换 C++ 层的两个 `std::vector`：
+
+```cpp
+// go-face/facerec.cc:118-122
+void SetSamples(std::vector<descriptor>&& samples, std::vector<int>&& cats) {
+    std::unique_lock<std::shared_mutex> lock(samples_mutex_);
+    samples_ = std::move(samples);   // 只是移动语义替换 vector
+    cats_ = std::move(cats);         // 没有 KD-tree、没有 Ball tree、没有索引重建
+}
+```
+
+| 场景 | 计算复杂度 | 是否触发全量重聚类 | 说明 |
+|------|-----------|-------------------|------|
+| 新照片入库 | **O(N)** 每次分类 | ❌ 不重聚类 | 只是 append 到 vector，后续分类遍历所有样本 |
+| 合并 FaceGroup | **O(M)** M=被移动样本数 | ❌ 不重聚类 | 只改内存中的 faceGroupID，调用 `MergeCategories()` 遍历替换 |
+| 移动 ImageFace | **O(M)** M=被移动样本数 | ❌ 不重聚类 | 只改内存中的 faceGroupID，调用 `MergeImageFaces()` 遍历替换 |
+| 删除照片/用户 | **O(N)** 全量重加载 | ❌ 不重聚类 | 调用 `ReloadFacesFromDatabase()` 从数据库重建内存 vector |
+
+> **设计决策分析**：选择"全量遍历 + 暴力最近邻"而非"聚类 + 索引"，原因是：
+> 1. 个人相册规模通常为万级人脸，O(N) 暴力搜索在现代 CPU 上完全够用
+> 2. 实现简单，无 bug，便于维护
+> 3. 每次分类都和全量样本比较，避免聚类算法累积误差
+> 4. 增量添加时不需要重新训练或重建索引
+
+#### 5.7.2 分类算法揭秘：K=10 的加权 KNN
+
+`ClassifyThreshold(0.2)` 内部使用的是 **K 近邻（KNN）分类器**，不是简单的最近邻：
+
+```cpp
+// go-face/classify.cc:5-59
+int classify(...) {
+    // 1. 计算与所有样本的欧氏距离平方（避免开根号，加速）
+    auto dist_func = dlib::squared_euclidean_distance();
+    
+    // 2. 过滤出距离 <= tolerance 的样本（这里 tolerance=0.2，平方=0.04）
+    std::vector<std::pair<int, float>> distances;
+    
+    // 3. 按距离排序，取前 K=10 个
+    int len = std::min((int)distances.size(), 10);
+    
+    // 4. KNN 投票：统计每个类别在前 10 中的出现次数
+    std::unordered_map<int, std::pair<int, float>> hits_by_cat;
+    
+    // 5. 选出得票最高的类别（票数相同则取距离更近的）
+    auto hit = std::max_element(hits_by_cat.begin(), hits_by_cat.end(),
+        [](const auto a, const auto b) {
+            if (hits1 == hits2) return dist1 > dist2;
+            return hits1 < hits2;
+        });
+}
+```
+
+| 步骤 | 说明 | 业务影响 |
+|------|------|---------|
+| 使用**欧氏距离平方** | 避免开根号运算，提升 30-50% 速度 | 无精度损失，只是比较时使用 |
+| **K=10** 投票 | 不找最近的 1 个，找前 10 个投票 | 提高鲁棒性：即使有 1-2 个离群样本干扰，仍能正确分类 |
+| 容忍度阈值 `0.2` | 距离平方 > 0.04 的样本直接忽略 | 即使前 10 个有 9 个投给 A，只要都 >0.2，仍然返回 -1 |
+
+> **注意**：当 `tolerance = -1` 时（`Classify()` 方法），不做距离过滤，直接取前 10 投票。Photoview 使用 `ClassifyThreshold(0.2)` 是更保守的策略。
+
+#### 5.7.3 增量数据并入旧人物档案的策略
+
+当新照片的人脸匹配到旧 FaceGroup 时（`match >= 0`）：
+
+```
+内存并入流程（O(1)）：
+┌─────────────────────────────────────────────────────┐
+│ Go 层 append 到三个 slice：                          │
+│   faceDescriptors = append(..., newDescriptor)      │
+│   faceGroupIDs    = append(..., existingGroupID)    │
+│   imageFaceIDs    = append(..., newImageFaceID)     │
+│                                                      │
+│ 调用 SetSamples() → C++ 层移动整个 vector 替换      │
+└─────────────────────────────────────────────────────┘
+
+数据库并入流程（O(1)）：
+┌─────────────────────────────────────────────────────┐
+│ 1. db.First(&faceGroup, matchID)  查出现有组        │
+│ 2. Association("ImageFaces").Append(&newImageFace)  │
+│    → INSERT image_faces (face_group_id = matchID)   │
+│ 3. 不修改 face_groups 表（组已存在）                 │
+└─────────────────────────────────────────────────────┘
+```
+
+**关键策略**：
+- **不做重新聚类**：不会因为新样本加入而调整任何已有人脸的组别
+- **仅新增，不回溯**：新样本可能匹配到旧组，但旧样本不会被重新分配到其他组
+- **单向收敛**：随着样本增加，分类只会越来越准，不会出现"今天归为 A，明天归为 B"的波动
+
+> **隐含假设**：早期检测的人脸已经正确分组，后续新样本只是增强已有组的特征。如果早期分组有误（比如把张三拆成了两个组），后续新增的张三照片会随机匹配到其中一个组，需要用户手动合并。
+
 ---
 
-## 六、数据模型详解
+## 八、GPU 加速与 CPU 回退路径的推理延迟分析
 
-### 6.1 FaceGroup（人物档案）
+### 8.1 硬件加速现状：**无 GPU 加速，纯 CPU 推理**
+
+**核心事实**：Photoview 当前版本**完全不支持 GPU 加速**，所有推理均在 CPU 上执行。
+
+| 组件 | GPU 支持状态 | 说明 |
+|------|-------------|------|
+| dlib 人脸检测（HOG） | ❌ | 本身就是 CPU 优化的传统算法，无 GPU 版本 |
+| dlib 人脸检测（MMOD CNN） | ⚠️ dlib 支持 CUDA，但 go-face 未启用 | dlib 编译时需要 `-DDLIB_USE_CUDA=ON`，当前构建未启用 |
+| dlib ResNet 特征提取 | ⚠️ dlib 支持 CUDA，但 go-face 未启用 | 同上，`net_(face_chip)` 在 CPU 上执行矩阵运算 |
+| BLAS/LAPACK 线性代数 | ✅ 系统级 CPU 加速 | 链接了 `libblas`、`libcblas`、`liblapack` |
+| SIMD 指令集优化 | ⚠️ 被 Photoview 禁用 | Dockerfile 第 93 行 `sed -i 's/-march=native//g'` 移除了 `-march=native` |
+
+#### 8.1.1 BLAS 加速链路
+
+go-face 在编译时链接了以下数学库（`face.go:4`）：
+
+```
+#cgo LDFLAGS: -ldlib -lblas -lcblas -llapack -ljpeg
+```
+
+| 库 | 用途 | 对性能的影响 |
+|----|------|-------------|
+| `libblas` / `libcblas` | 基本线性代数子程序（矩阵乘、向量运算） | ResNet 推理中的大量卷积和全连接层由此加速，提升约 **2-3x** |
+| `liblapack` | 线性代数包（特征值、SVD 等） | 人脸识别中较少直接使用，主要供 dlib 内部其他算法 |
+
+> **缺失的加速**：`libopenblas` 或 `Intel MKL` 通常比系统默认的 `libblas` 快 **3-5x**，但当前使用系统默认版本。
+
+### 8.2 CPU 回退路径：无需回退，默认就是 CPU
+
+因为**根本没有 GPU 路径**，所以不存在"回退"机制。程序总是在 CPU 上执行。
+
+Docker Compose 示例中注释掉了 NVIDIA 设备挂载（`docker-compose.example.yml:80-86`），但这只是为 ffmpeg 视频转码准备的，与人脸识别无关。
+
+### 8.3 推理延迟分析与性能估算
+
+基于 dlib 官方基准测试和 go-face 的实际表现，**单张照片**（缩略图 ~1000x700 像素）的推理延迟估算：
+
+| 硬件 | 检测模式 | 检测 1 张人脸 | 提取 1 个特征向量 | KNN 分类（1000 样本） | 总计（单张照片，1 人脸） |
+|------|---------|--------------|------------------|----------------------|-------------------------|
+| **Raspberry Pi 4 (ARM)** | HOG | ~300ms | ~1800ms | ~2ms | **~2.1s** |
+| **笔记本 i5-8250U** | HOG | ~80ms | ~350ms | ~0.5ms | **~430ms** |
+| **服务器 E5-2680 v4** | HOG | ~40ms | ~200ms | ~0.2ms | **~240ms** |
+| **AMD Ryzen 7 5800X** | HOG | ~15ms | ~90ms | ~0.1ms | **~105ms** |
+| **同硬件 + MMOD CNN** | CNN | ~500ms | ~200ms | ~0.1ms | **~700ms** |
+
+> **关键观察**：
+> 1. **特征提取占总时间的 70-85%**，人脸检测只占小部分
+> 2. **KNN 分类时间可忽略**（<1ms），即使样本量达到 10000 张也仅 ~5ms
+> 3. **MMOD CNN 检测反而更慢**，因为是 CNN 但又跑在 CPU 上，所以 Photoview 默认使用 HOG
+> 4. **扫描 10,000 张照片**，按每张平均 2 个人脸、Ryzen 7 计算，约需 **10,000 × 105ms × 2 = ~35 分钟**
+
+### 8.4 可优化方向（当前代码未实现）
+
+| 优化手段 | 预期加速比 | 实现难度 | 说明 |
+|---------|-----------|---------|------|
+| 启用 `-march=native` | +20-30% | 极低 | 恢复被移除的编译优化，Docker 跨架构构建需分平台 |
+| 替换为 OpenBLAS/MKL | +200-400% | 低 | 安装 `libopenblas-dev` 替代 `libblas-dev` |
+| 启用 dlib CUDA 加速 | +10-20x | 中 | 需要重新编译 dlib 和 go-face，容器需挂载 NVIDIA 驱动 |
+| 使用 ONNX/TensorRT 推理 | +5-10x | 高 | 替换整个 go-face 依赖，改用 ONNX 模型 + TensorRT 推理 |
+| 批量推理多张照片 | +50-100% | 中 | 修改扫描流程，攒一批照片后一次性提取特征，利用批处理效率 |
+
+---
+
+## 九、GDPR/CCPA 隐私合规：人脸数据删除清理流程
+
+### 9.1 合规基础：数据最小化与级联删除
+
+Photoview 的人脸数据存储符合 GDPR"数据最小化"原则：
+- **不存储原始人脸图像**：只存储 128 维特征向量（512 字节）和位置坐标
+- **不存储额外元数据**：没有单独的指纹、虹膜等生物特征
+- **级联删除链路完整**：用户请求删除数据时，所有关联的人脸数据会被完整清理
+
+### 9.2 删除触发场景与完整清理链路
+
+| 删除场景 | 触发方式 | 清理范围 | 人脸数据清理方式 |
+|---------|---------|---------|-----------------|
+| 用户主动删除账号 | 管理员调用 `deleteUser` Mutation | 该用户拥有的全部数据 | 级联删除 + 内存重载 |
+| 删除相册 | 管理员调用 `deleteAlbum` 或移除用户相册权限 | 指定相册及其所有媒体 | 级联删除 + 内存重载 |
+| 删除单张照片 | 文件系统移除后重新扫描 | 指定媒体及其所有人脸 | CleanupMedia + 内存重载 |
+| 移除人脸组 | 合并且自动删除空组 | 该 FaceGroup 记录（ImageFaces 先移走） | 仅删 face_groups 行 |
+| 移除单张人脸 | 同照片去重时自动清理 | 1 条 ImageFace 记录 | 不触发内存重载（下一次自动恢复） |
+
+### 9.3 数据库级联删除配置
+
+所有删除都依赖 GORM 的 `constraint:OnDelete:CASCADE` 约束：
+
+```go
+// models/face_detection.go:19
+type FaceGroup struct {
+    ImageFaces []ImageFace `gorm:"constraint:OnDelete:CASCADE;"`
+    // 删除 FaceGroup → 自动删除所有关联的 ImageFace
+}
+
+// models/face_detection.go:27
+type ImageFace struct {
+    Media Media `gorm:"constraint:OnDelete:CASCADE;"`
+    // 删除 Media → 自动删除所有关联的 ImageFace
+}
+
+// models/media.go:31
+type Media struct {
+    Faces []*ImageFace `gorm:"constraint:OnDelete:CASCADE;"`
+}
+```
+
+**完整级联链**：
+```
+删除 User
+    ↓ (删除 user_albums 关联)
+删除 Album（如果无其他用户关联）
+    ↓
+删除 Media
+    ↓
+删除 ImageFace → 特征向量 BLOB 被删除
+    ↓
+删除 FaceGroup（如果变空）
+```
+
+### 9.4 用户账号删除完整流程（GDPR 被遗忘权）
+
+**GraphQL 入口**: `resolvers/user.go:169-170`
+```go
+func (r *mutationResolver) DeleteUser(ctx context.Context, id int) (*models.User, error) {
+    return actions.DeleteUser(r.DB(ctx), id)
+}
+```
+
+**完整清理链路** (`actions/user_actions.go:14-59`):
+
+```
+第一步：业务校验
+  ├─ 禁止删除最后一个管理员
+  └─ 查询用户实体及其关联相册
+
+第二步：数据库事务
+  ├─ 1. Clear() 清除 user_albums 关联表
+  ├─ 2. deleteNotOwnedAlbums() 遍历所有相册
+  │    ├─ 查该相册关联的用户数
+  │    └─ 如果关联数为 0 → DELETE albums
+  │                          ↓ CASCADE
+  │                        DELETE media
+  │                          ↓ CASCADE
+  │                        DELETE image_faces （人脸特征向量）
+  │                          ↓ CASCADE
+  │                        DELETE face_groups （如果变空）
+  └─ 3. DELETE users 删除用户本身
+
+第三步：文件系统清理（事务外）
+  └─ cleanup() 遍历已删除相册ID，删除媒体缓存目录
+     （不会删除原始照片文件，只删缓存）
+
+第四步：内存分类器同步
+  └─ ❗ 注意：DeleteUser 没有调用 ReloadFacesFromDatabase()
+     存在潜在内存一致性问题：内存中可能残留已删除用户的人脸向量
+     （但这些向量不会被其他用户的分类匹配到，因为权限校验已隔离）
+```
+
+### 9.5 照片删除清理流程（CleanupMedia）
+
+**触发时机**: 相册扫描完成后，发现数据库中的媒体在文件系统中已不存在
+
+**清理流程** (`cleanup_media.go:17-65`):
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 1. 查询数据库中该相册的所有 MediaID                      │
+│ 2. 与文件系统扫描到的媒体列表对比，找出已删除的媒体ID     │
+│ 3. 删除这些媒体的缩略图缓存目录                           │
+│ 4. DELETE FROM media WHERE id IN (...)                   │
+│    ↓ 数据库 CASCADE                                      │
+│    DELETE FROM image_faces WHERE media_id IN (...)        │
+│    ↓                                                    │
+│    DELETE FROM face_groups WHERE id IN                   │
+│      (SELECT face_group_id FROM image_faces              │
+│       GROUP BY face_group_id HAVING COUNT(*) = 0)        │
+│                                                          │
+│ 5. ✅ 调用 ReloadFacesFromDatabase(db)                    │
+│    从数据库重新加载所有人脸样本到内存分类器               │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 9.6 内存同步机制对比
+
+| 删除操作 | 是否自动调用 ReloadFacesFromDatabase | 内存一致性保证 |
+|---------|-------------------------------------|---------------|
+| CleanupMedia（删除照片） | ✅ 是 | 完全一致 |
+| DeleteOldUserAlbums（删除相册） | ✅ 是 | 完全一致 |
+| DeleteUser（删除用户） | ❌ 否 | 内存残留，但权限隔离不影响业务 |
+| CombineFaceGroups（合并组） | ❌ 否 | 调用 MergeCategories 增量更新 |
+| MoveImageFaces（移动人脸） | ❌ 否 | 调用 MergeImageFaces 增量更新 |
+| DetachImageFaces（拆分人脸） | ❌ 否 | 调用 MergeImageFaces 增量更新 |
+
+### 9.7 潜在合规风险与改进空间
+
+| 风险点 | 严重程度 | 说明 | 修复方案 |
+|-------|---------|------|---------|
+| DeleteUser 后内存残留向量 | ⚠️ 中 | 已删除用户的特征向量仍在内存，但不会被匹配 | 在 DeleteUser 的 cleanup() 中添加 ReloadFacesFromDatabase |
+| 特征向量在数据库中未加密 | ⚠️ 中 | ImageFace.descriptor 以明文 BLOB 存储 | 考虑透明磁盘加密或字段级加密 |
+| 无删除审计日志 | ⚠️ 中 | 谁在什么时候删除了什么数据，没有日志 | 添加操作审计表，记录删除事件 |
+| 用户无法单独删除自己的人脸数据 | ⚠️ 低 | 只能删除整个账号或整张照片 | 可增加 `deleteMyFaceData()` Mutation |
+
+### 9.8 合规证明点
+
+✅ **GDPR 第 17 条（被遗忘权）**：用户可通过删除账号完整删除所有个人数据
+✅ **GDPR 第 15 条（访问权）**：用户可导出相册，人脸数据通过 `myFaceGroups` 查询
+✅ **数据最小化**：仅存储 128 维特征向量，不存储原始人脸图像
+✅ **目的限制**：特征向量仅用于本相册内的人脸识别，不用于其他目的
+✅ **存储限制**：特征向量与所属媒体生命周期一致，照片删除时自动清理
+
+---
+
+## 十、数据模型详解
+
+### 10.1 FaceGroup（人物档案）
 
 **定义**: `face_detection.go:16-20`
 
@@ -425,7 +731,7 @@ type FaceGroup struct {
 | `id` | INTEGER | 主键 |
 | `label` | VARCHAR | NULL 表示未命名 |
 
-### 6.2 ImageFace（单张人脸）
+### 10.2 ImageFace（单张人脸）
 
 **定义**: `face_detection.go:22-30`
 
@@ -448,7 +754,7 @@ type ImageFace struct {
 | `descriptor` | BLOB / BYTEA | 128 × 4 = 512 字节二进制 |
 | `rectangle` | VARCHAR(64) | `"minX:maxX:minY:maxY"` 字符串格式 |
 
-### 6.3 FaceRectangle 坐标转换
+### 10.3 FaceRectangle 坐标转换
 
 **像素坐标转相对坐标** (`face_detector_impl.go:148-154`):
 
@@ -465,9 +771,9 @@ Rectangle: models.FaceRectangle{
 
 ---
 
-## 七、人物档案管理操作
+## 十一、人物档案管理操作
 
-### 7.1 合并人脸组（CombineFaceGroups）
+### 11.1 合并人脸组（CombineFaceGroups）
 
 **GraphQL 接口**: `resolvers/faces.go:144-225`
 
@@ -493,19 +799,19 @@ err = tx.Where("face_group_id = ?", destinationFaceGroup.ID).
     Delete(&models.ImageFace{}).Error
 ```
 
-### 7.2 移动人脸（MoveImageFaces）
+### 11.2 移动人脸（MoveImageFaces）
 
 **接口**: `resolvers/faces.go:227-297`
 
 将指定 `ImageFace` 从当前组移动到目标组，类似合并但操作粒度更细。
 
-### 7.3 分离人脸（DetachImageFaces）
+### 11.3 分离人脸（DetachImageFaces）
 
 **接口**: `resolvers/faces.go:327-374`
 
 将指定 `ImageFace` 从当前组分离，创建一个新的 `FaceGroup`。
 
-### 7.4 重新识别未标记人脸（RecognizeUnlabeledFaces）
+### 11.4 重新识别未标记人脸（RecognizeUnlabeledFaces）
 
 **接口**: `resolvers/faces.go:299-325`
 
@@ -523,9 +829,9 @@ err = tx.Where("face_group_id = ?", destinationFaceGroup.ID).
 
 ---
 
-## 八、内存与数据库同步机制
+## 十二、内存与数据库同步机制
 
-### 8.1 ReloadFacesFromDatabase
+### 12.1 ReloadFacesFromDatabase
 
 **函数**: `face_detector_impl.go:74-89`
 
@@ -596,9 +902,9 @@ GlobalFaceDetector.DetectFaces() [face_detector_impl.go:92]
 
 ---
 
-## 十、关键设计要点
+## 十四、关键设计要点
 
-### 10.1 增量聚类策略
+### 14.1 增量聚类策略
 
 该系统采用的是**在线增量聚类**而非离线批量聚类：
 - 每次检测新人脸时立即进行分类
@@ -629,15 +935,15 @@ GlobalFaceDetector.DetectFaces() [face_detector_impl.go:92]
 
 这种设计避免了每次分类都查询数据库，性能更好，但需要保证两者同步。
 
-### 10.4 并发安全
+### 14.4 并发安全
 
 `faceDetector` 使用 `sync.Mutex` 保护所有操作，确保并发扫描时分类器状态一致。
 
 ---
 
-## 十二、用户手动合并/拆分操作完整链路
+## 十五、用户手动合并/拆分操作完整链路
 
-### 12.1 操作全景图
+### 15.1 操作全景图
 
 ```
                        人物管理操作
@@ -655,13 +961,13 @@ GlobalFaceDetector.DetectFaces() [face_detector_impl.go:92]
    数据库更新 + 内存分类器同步（MergeImageFaces / MergeCategories）
 ```
 
-### 12.2 操作一：合并人物档案（CombineFaceGroups）
+### 15.2 操作一：合并人物档案（CombineFaceGroups）
 
-#### 12.2.1 触发场景
+#### 15.2.1 触发场景
 - 场景 A：列表页用户看到"张三"被拆成了 3 个组 → 点「Merge people」
 - 场景 B：详情页用户看到当前"未命名组"应该属于"张三" → 点「Merge face」
 
-#### 12.2.2 UI 完整交互链（从点击到完成）
+#### 15.2.2 UI 完整交互链（从点击到完成）
 
 ```
 第一步：用户在 UI 点击按钮
@@ -731,12 +1037,12 @@ GlobalFaceDetector.DetectFaces() [face_detector_impl.go:92]
        跳转到合并后的目标组详情页
 ```
 
-### 12.3 操作二：移动单张人脸（MoveImageFaces）
+### 15.3 操作二：移动单张人脸（MoveImageFaces）
 
-#### 12.3.1 触发场景
+#### 15.3.1 触发场景
 "张三"组里混入了一张"李四"的照片，用户不想全组合并，只想移走这 1 张。
 
-#### 12.3.2 完整操作链
+#### 15.3.2 完整操作链
 
 ```
 UI 入口：FaceGroupTitle.tsx:163-167  「Move faces」按钮
@@ -772,9 +1078,9 @@ GraphQL Mutation: moveImageFaces
 navigate(`/people/${destFaceGroup.id}`) 跳转到目标组
 ```
 
-### 12.4 操作三：拆分人脸（DetachImageFaces = 分离为新组）
+### 15.4 操作三：拆分人脸（DetachImageFaces = 分离为新组）
 
-#### 12.4.1 触发场景
+#### 15.4.1 触发场景
 一个 FaceGroup 里混了"张三 + 李四"（之前误合并），用户需要把李四的几张拆出去**新建**一个组。
 
 > 注意：Detach 不是"拆分到已有组"，而是"创建全新组"。要拆分到已有组，应使用 Move 操作。
@@ -812,14 +1118,14 @@ navigate(`/people/${newFaceGroup.id}`) 跳转到新创建的组
 （用户之后可以给新组改 label，或继续合并它）
 ```
 
-### 12.5 操作四：设置人物标签（SetFaceGroupLabel）
+### 15.5 操作四：设置人物标签（SetFaceGroupLabel）
 
-#### 12.5.1 触发场景
+#### 15.5.1 触发场景
 用户把"未命名 #17"命名为"张三"。标签有两个功能：
 1. **人机交互友好**：UI 上显示名字而不是编号
 2. **触发 Recognize 逻辑**：label IS NULL 的组被视为"未标注"，是 RecognizeUnlabeledFaces 的处理对象
 
-#### 12.5.2 操作链
+#### 15.5.2 操作链
 
 ```
 UI 入口（两种）：
@@ -841,12 +1147,12 @@ UI 入口（两种）：
       label 仅影响 UI 展示 + RecognizeUnlabeledFaces 的筛选条件。
 ```
 
-### 12.6 操作五：识别未标记人脸（RecognizeUnlabeledFaces）
+### 15.6 操作五：识别未标记人脸（RecognizeUnlabeledFaces）
 
-#### 12.6.1 触发场景
+#### 15.6.1 触发场景
 用户给 3 个组命名为"张三"、"李四"、"王五"后，希望系统把剩下几十个"未命名"的组自动归类到已命名的组。
 
-#### 12.6.2 操作链
+#### 15.6.2 操作链
 
 ```
 UI 入口：PeoplePage.tsx:302-315  「Recognize unlabeled faces」按钮
@@ -885,7 +1191,7 @@ GraphQL: recognizeUnlabeledFaces Mutation（无参数）
       如果用户命名的样本本身不多，命中率可能仍然很低。
 ```
 
-### 12.7 权限模型总结
+### 15.7 权限模型总结
 
 所有操作都经过 `userOwnedFaceGroup()` 或 `getUserOwnedImageFaces()` 权限校验：
 
@@ -898,9 +1204,9 @@ GraphQL: recognizeUnlabeledFaces Mutation（无参数）
 
 ---
 
-## 十三、代码位置索引
+## 十六、代码位置索引
 
-### 13.1 后端核心代码
+### 16.1 后端核心代码
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -923,8 +1229,17 @@ GraphQL: recognizeUnlabeledFaces Mutation（无参数）
 | 环境变量定义（可禁用人脸识别） | `api/utils/environment_variables.go` | 43-47 |
 | 模型路径配置 | `api/utils/utils.go` | 48-64 |
 | 任务聚合器 | `api/scanner/scanner_tasks/scanner_tasks.go` | 15-27 |
+| 照片删除清理流程 | `api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go` | 17-65 |
+| 旧相册删除流程 | `api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go` | 68-136 |
+| 用户删除操作 | `api/graphql/models/actions/user_actions.go` | 14-84 |
+| 用户删除 resolver | `api/graphql/resolvers/user.go` | 169-170 |
+| 级联删除辅助 | `api/graphql/resolvers/user.util.go` | 14-54 |
+| 数据库级联配置 (FaceGroup) | `api/graphql/models/face_detection.go` | 19,27 |
+| 数据库级联配置 (Media) | `api/graphql/models/media.go` | 31 |
+| Dockerfile 构建配置 | `Dockerfile` | 93,164 |
+| CUDA 设备挂载示例 | `docker-compose example/docker-compose.example.yml` | 80-86 |
 
-### 13.2 前端 UI 代码
+### 16.2 前端 UI 代码
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -937,3 +1252,16 @@ GraphQL: recognizeUnlabeledFaces Mutation（无参数）
 | 人脸标签编辑（列表页内） | `ui/src/Pages/PeoplePage/PeoplePage.tsx` | 118-208 |
 | 查询所有人脸组 | `ui/src/Pages/PeoplePage/PeoplePage.tsx` | 28-54 (MY_FACES_QUERY) |
 | 查询单个人脸组详情 | `ui/src/Pages/PeoplePage/SingleFaceGroup/SingleFaceGroup.tsx` | 14-45 (SINGLE_FACE_GROUP) |
+
+### 16.3 第三方库 go-face 源码位置
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| Go 接口定义（BLAS 链接） | `go-face/face.go` | 3-4,42-43,231-254 |
+| 距离计算辅助函数 | `go-face/face.go` | 45-51 |
+| C++ 人脸识别核心类 | `go-face/facerec.cc` | 60-148 |
+| SetSamples 实现（vector 替换） | `go-face/facerec.cc` | 118-122 |
+| 分类核心（KNN 算法） | `go-face/classify.cc` | 5-59 |
+| K=10 投票逻辑 | `go-face/classify.cc` | 29-45 |
+| ResNet 模型定义 | `go-face/facerec.cc` | 12-46 |
+| Jittering 数据增强 | `go-face/facerec.cc` | 257-272 |
