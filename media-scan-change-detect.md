@@ -1234,7 +1234,495 @@ find ./media_cache -type d -empty -delete
 
 ---
 
-## 17. 设计思考
+## 17. 扫描过程中的 GC 行为与磁盘占用监控
+
+### 17.1 GC（垃圾回收）监控现状
+
+Photoview 代码中**没有任何显式的 GC 触发或内存监控逻辑**。在整个 `api/` 目录下 grep 以下关键字均无业务层调用：
+
+| 关键字 | 命中情况 |
+|---|---|
+| `runtime.GC()` | ❌ 无 |
+| `runtime.ReadMemStats` | ❌ 无 |
+| `debug.FreeOSMemory` | ❌ 无 |
+| `debug.SetGCPercent` | ❌ 无 |
+| `GOGC` 环境变量使用 | ❌ 无 |
+
+**GC 完全依赖 Go 运行时默认行为**（触发阈值：堆增长 100% 或 2 分钟定时器）。扫描过程中 Go 的 GC 不会被主动干扰。
+
+### 17.2 扫描过程中的主要内存消耗点
+
+按量级从大到小排序：
+
+#### 1. 人脸检测内存（最大）
+**位置**：`face_detection/face_detector_impl.go:17-23`
+
+```go
+type faceDetector struct {
+    mutex           sync.Mutex
+    rec             *face.Recognizer
+    faceDescriptors []face.Descriptor   // 每张人脸 128 个 float32 = 512 字节
+    faceGroupIDs    []int32
+    imageFaceIDs    []int
+}
+```
+
+- 每张照片平均 2-3 张人脸，10 万张照片约 25 万张人脸 → `faceDescriptors` 占用约 **128 MB**
+- `face.Recognizer`（dlib 模型）自身常驻约 **200-300 MB**
+- 每次 `ReloadFacesFromDatabase` 时旧切片被 GC 回收，但峰值会短暂翻倍
+
+#### 2. MagickWand 像素缓冲区
+**位置**：`media_encoding/executable_worker/magickwand.go`
+
+- 处理 24MP 照片（6000×4000）解码为 RGB：`6000*4000*3 = 72 MB / 张`
+- 每个相册 worker 同时只处理 1 张，但 `ConcurrentWorkers = 4` 时峰值可达 **288 MB**
+- MagickWand C 库内存不由 Go GC 管理，依赖 `DestroyMagickWand()` 手动释放
+
+#### 3. ffmpeg 视频转码临时文件
+- 视频转码时 `ffmpeg` 子进程独立占用内存，不受 Go GC 控制
+- 1080p MP4 转码约占 **200-500 MB / 进程**
+
+#### 4. 缩略图/高分辨率图生成的中间 JPEG
+- 单张高分辨率 JPEG 约 **5-15 MB**
+- 存入 `[]byte` 后写磁盘，函数返回时被 GC
+
+#### 5. 目录遍历缓冲区
+- `os.ReadDir` 返回的 `[]DirEntry` 对大目录（1 万文件）约 **几百 KB**
+- 遍历完即释放
+
+### 17.3 磁盘占用监控现状
+
+**同样无任何磁盘空间/容量检测代码**。grep 关键字结果：
+
+| 关键字 | 命中情况 |
+|---|---|
+| `statfs` / `unix.Statfs` | ❌ 无 |
+| `disk.Available` | ❌ 无 |
+| `AvailableSpace` | ❌ 无 |
+| `df` 命令调用 | ❌ 无 |
+
+以下高危操作**均不做磁盘空间预检查**：
+
+```go
+// 生成高分辨率 JPEG（process_photo_task.go）
+// 直接写磁盘，无剩余空间判断
+jpeg.Encode(file, img, &jpeg.Options{Quality: 95})
+
+// ffmpeg 转码输出（ffmpeg_cli.go）
+// 直接运行 ffmpeg -i input -o output.mp4，无空间预检查
+cmd := exec.Command("ffmpeg", ..., outputPath)
+```
+
+### 17.4 磁盘空间不足的实际后果
+
+| 操作 | 磁盘满时的表现 |
+|---|---|
+| 缩略图生成 | `jpeg.Encode` 返回 `ENOSPC` 错误 → 该 media 处理失败，记录错误日志，**但 media 已入库**（仅 `MediaURL` 缺失） |
+| 高分辨率图生成 | 同上，缩略图可能已写成功但高分辨率图失败 → 状态不一致 |
+| ffmpeg 视频转码 | ffmpeg 进程退出码非 0 → `ProcessVideoTask` 报错，media 已入库但无播放 URL |
+| `CleanupMedia` 删除 | 成功释放空间（仅删文件不写） |
+| EXIF 解析 | 只读，不受影响 |
+| Blurhash 计算 | 只读，不受影响 |
+
+**问题**：Media 记录已创建但 `MediaURL` 缺失，前端访问时返回 404 或空白。下次全量扫描不会修复，因为 `ScanMedia` 判定为「已存在」（path_hash 命中），不会重新走 `ProcessMedia`。
+
+### 17.5 磁盘占用总量估算
+
+以 10 万张 12MP JPEG（平均 5MB 源文件）为例：
+
+| 项目 | 单文件大小 | 10 万文件总量 |
+|---|---|---|
+| 源文件（只读） | 5 MB | **500 GB** |
+| 缩略图 thumbnail_1024.jpg | ~80 KB | **8 GB** |
+| 缩略图 thumbnail_2048_high.jpg | ~300 KB | **30 GB** |
+| 高分辨率图 highres.jpg | ~2-3 MB | **250 GB** |
+| 缓存合计 | - | **~290 GB**（约源文件的 58%） |
+| 数据库（含人脸 descriptor BLOB） | - | **~2-5 GB** |
+
+**关键结论**：`PHOTOVIEW_MEDIA_CACHE` 目录需预留**源文件大小的 60%** 以上空间。
+
+### 17.6 运营建议
+
+**内存侧**：
+```bash
+# 建议在 systemd/docker 中显式设置
+GOGC=50                    # 更积极的 GC（默认 100），降低峰值内存
+GOMEMLIMIT=6GiB            # Go 1.19+ 软内存上限（优先推荐）
+```
+
+**磁盘侧**：
+```bash
+# 用外部监控（prometheus/node_exporter）告警
+- node_filesystem_avail_bytes{fstype!~"tmpfs|fuse.lxcfs"} < 10%
+- 监控 PHOTOVIEW_MEDIA_CACHE 目录增长速率
+```
+
+**代码层建议**：
+- 缩略图生成前执行 `unix.Statfs` 预估剩余空间，< 1GB 时暂停扫描并告警
+- `ProcessMedia` 失败时标记 `media.status = 'partial'`，下次扫描重试失败项
+
+---
+
+## 18. 多用户多相册场景：扫描权限边界分析
+
+### 18.1 权限模型总览
+
+**核心关系表**：`user_albums`（多对多）
+
+```
+users ──< user_albums >── albums ──< media
+          (user_id, album_id)         (album_id)
+```
+
+`models/user.go:19`：
+```go
+type User struct {
+    Albums []Album `gorm:"many2many:user_albums;constraint:OnDelete:CASCADE;"`
+    Admin  bool    `gorm:"default:false"`
+}
+```
+
+**所有权判定**：`User.OwnsAlbum()`（`user.go:167-180`）
+
+```go
+func (user *User) OwnsAlbum(db *gorm.DB, album *Album) (bool, error) {
+    filter := func(query *gorm.DB) *gorm.DB {
+        return query.Where(
+            "EXISTS (SELECT 1 FROM user_albums WHERE user_id = ? AND album_id = id LIMIT 1)",
+            user.ID)
+    }
+    ownedParents, err := album.GetParents(db, filter)
+    // 如果 album 本身或任意父级在 user_albums 中，则视为拥有
+    return len(ownedParents) > 0, nil
+}
+```
+
+→ **递归向上判断父目录是否在用户的相册列表中**，子相册自动继承父相册的所有权。
+
+### 18.2 Root Album 的创建与重叠检测
+
+**位置**：`scanner_album.go:19-73`
+
+```go
+func NewRootAlbum(db, rootPath, owner) (*Album, error) {
+
+    // 1. 路径有效性检查
+    if !ValidRootPath(rootPath) { return ErrorInvalidRootPath }
+
+    // 2. 通过 path_hash 查是否已有该 Album
+    db.Where("path_hash = ?", MD5Hash(rootPath)).Find(&matchedAlbums)
+
+    for _, matchedAlbum := range matchedAlbums {
+
+        // 3. 检测路径重叠：新路径不能是已有路径的子目录，反之亦然
+        var count int64
+        db.Raw(`
+            SELECT COUNT(*) FROM user_albums
+            JOIN albums ON user_albums.album_id = albums.id
+            WHERE user_albums.user_id = ?
+              AND (? LIKE albums.path || '%' OR albums.path LIKE ? || '%')
+        `, owner.ID, rootPath, rootPath).Scan(&count)
+
+        if count > 0 {
+            return nil, errors.New("user already owns a path containing this path")
+        }
+
+        // 4. 已有 Album 但用户不拥有 → 直接关联（共享相册）
+        db.Create(&UserAlbums{UserID: owner.ID, AlbumID: matchedAlbum.ID})
+        return &matchedAlbum, nil
+    }
+
+    // 5. 新路径 → 创建 Album + UserAlbums 关联
+    db.Create(&album)
+    db.Create(&UserAlbums{UserID: owner.ID, AlbumID: album.ID})
+    return &album, nil
+}
+```
+
+**重叠检测矩阵**：
+
+| 用户已有路径 | 新添加路径 | 结果 |
+|---|---|---|
+| `/photos/2024` | `/photos/2024/06` | ❌ 拒绝（包含关系） |
+| `/photos/2024/06` | `/photos/2024` | ❌ 拒绝（被包含） |
+| `/photos/2024` | `/photos/vacation` | ✅ 允许（平级） |
+| `/photos/2024`（用户A） | `/photos/2024`（用户B） | ✅ 允许（共享 Album，不同 UserAlbums 行） |
+| `/photos/2024`（用户A已有） | `/photos/2024`（用户A重复） | ✅ 复用已有 Album（幂等） |
+
+### 18.3 扫描时的权限边界问题
+
+#### 问题 1：FindAlbumsForUser 不校验每级目录的用户身份
+
+**位置**：`scanner_user.go:45`
+
+```go
+func FindAlbumsForUser(db, user, cache) ([]*ScannerJob, error) {
+    for _, rootAlbum := range user.Albums {
+        // 从 rootAlbum.Path 开始 BFS 遍历
+        // 遍历到的所有子目录全部创建/关联 Album
+        // 过程中没有再次校验 user 是否有权限访问每个子目录
+    }
+}
+```
+
+潜在风险：如果用户 A 拥有 `/photos`，而 `/photos/private` 在文件系统层面只对用户 B 可读（Unix 权限 `0700`），扫描时 `os.ReadDir("/photos/private")` 会失败 → 整个扫描任务报错中止。
+
+#### 问题 2：多用户共享 Album 时的 CleanupMedia 互影响
+
+用户 A 和 B 共享同一个 Album（path_hash 相同，不同 UserAlbums 行）：
+
+```
+T1: 用户A触发扫描 → ScanAlbum(albumId=5)
+T2: 用户B触发扫描 → ScannerQueue.jobOnQueue 检测 albumId=5 正在执行 → 跳过入队
+T3: 用户A的扫描在 CleanupMedia 中删除 albumId=5 的过期 media
+    → 对用户B也生效（因为 media 不按用户隔离）
+```
+
+→ **media 是全局共享的，CleanupMedia 以 album_id 为粒度，删除对所有共享该相册的用户同时生效**。这是合理设计，但需运营知晓。
+
+#### 问题 3：人脸检测不按用户隔离
+
+`ReloadFacesFromDatabase` 加载全库 `image_faces`：
+```go
+func getSamplesFromDatabase(db) (...) {
+    db.Find(&imageFaces)   // 没有 WHERE user_id = X
+}
+```
+
+→ 用户 A 的扫描触发人脸检测后，会把用户 B 的人脸 descriptor 也加载到内存。`RecognizeUnlabeledFaces` 中通过 JOIN `user_albums` 限制用户可见范围，但全局内存不隔离。
+
+#### 问题 4：UserRemoveRootAlbum 的级联清理
+
+`resolvers/user.go:193-244`：
+
+```go
+func UserRemoveRootAlbum(...) {
+    // 1. 删除 user_albums 中 user 的关联（含子相册）
+    // 2. cleanup(tx, albumID, childAlbumIDs):
+    //    如果 album 没有任何 user 关联了
+    //    → DELETE FROM albums → 级联删除所有 media
+    //    → os.RemoveAll(media_cache/<albumId>/)
+}
+```
+
+**边界场景**：
+- 用户 A 和 B 共享相册 → A 移除根相册 → B 仍可正常访问
+- 用户 A 是唯一拥有者 → A 移除根相册 → 相册及其下所有 media 被**硬删**（对所有用户生效）
+
+### 18.4 权限边界总结表
+
+| 场景 | 是否按用户隔离 | 风险 |
+|---|---|---|
+| Album 可见性 | ✅ 是（user_albums） | - |
+| Media 可见性 | ✅ 是（通过 album 归属） | - |
+| Media DB 记录共享 | ❌ 否（同 path 的 media 全局唯一） | 多用户共享同一路径时共用记录 |
+| CleanupMedia 删除范围 | ❌ 否（按 album_id 全局删） | 用户A的扫描删除对B也生效 |
+| 人脸检测内存 | ❌ 否（全库加载） | 内存不隔离，推理时 JOIN 过滤 |
+| 用户收藏 `user_media_data` | ✅ 是（user_id 主键） | - |
+| 缩略图缓存目录 | ❌ 否（按 albumId/mediaId） | 多用户共享 |
+| Root Path 重叠检测 | ✅ 是（SQL LIKE） | 符号链接可能绕过检测 |
+
+### 18.5 运营建议
+
+1. **多用户共享同一物理目录**：推荐用 `UserAddRootPath` 让多个用户关联同一个 Album，避免重复扫描和重复缓存
+2. **Unix 文件权限**：确保 photoview 进程用户（通常 `UID=1000`）对所有 Root Path 的所有子目录都有 `r-x` 权限，避免扫描中途 `EACCES`
+3. **符号链接攻击面**：`NewRootAlbum` 的重叠检测用字符串 `LIKE` 比较，用户通过 symlink 将 `/public/link → /private/data` 指向已有路径可能绕过。建议在 `ValidRootPath` 中解析所有符号链接后用 `filepath.EvalSymlinks` 比较真实路径
+4. **用户移除相册前提醒**：如果用户是该 Album 的唯一拥有者，UI 应二次确认「该相册将被永久删除，所有用户都无法访问」
+
+---
+
+## 19. 备份恢复场景：DB 与文件系统不一致时的扫描修复路径
+
+### 19.1 Photoview 无原生备份/恢复机制
+
+系统中**不存在**以下功能：
+
+| 功能 | 代码中是否存在 |
+|---|---|
+| `backupDatabase` GraphQL Mutation | ❌ 无 |
+| `restoreDatabase` GraphQL Mutation | ❌ 无 |
+| 自动 DB 快照（每日/每周） | ❌ 无 |
+| 缓存目录快照/版本管理 | ❌ 无 |
+| schema 迁移回滚 | ❌ 仅有向前迁移（`database/migration_exif.go`、`database/migrations/`） |
+
+运营备份完全依赖外部工具（`pg_dump`、`mysqldump`、SQLite 文件拷贝、ZFS snapshot、BorgBackup 等）。
+
+### 19.2 常见不一致场景与修复路径
+
+#### 场景 A：DB 有记录，文件系统无文件（媒体被误删）
+
+```
+恢复前状态：
+  DB:    media 表有 id=123, path="/photos/2024/06/IMG_001.jpg"
+  磁盘:  /photos/2024/06/IMG_001.jpg 不存在
+```
+
+**扫描修复路径**（全自动）：
+
+```
+触发全量扫描
+  → FindAlbumsForUser（相册树正常，因为目录还在）
+  → ScanAlbum(albumId=X)
+    → findMediaForAlbum: os.ReadDir 不包含 IMG_001.jpg
+    → albumMedia = [其它文件]
+    → ...
+    → AfterScanAlbum → CleanupMedia(albumId=X, albumMedia)
+      → 差集 DB - albumMedia = {id=123}
+      → os.RemoveAll(media_cache/X/123/)
+      → DELETE FROM media WHERE id IN (123)
+          级联删除：media_urls / media_exif / image_faces
+      → ReloadFacesFromDatabase
+```
+
+**修复结果**：DB 与文件系统重新一致，但该媒体的人工元数据（收藏、分享、人脸标注）**全部丢失且无法通过扫描恢复**。
+
+#### 场景 B：文件系统有文件，DB 无记录（DB 回滚到旧版本）
+
+```
+恢复前状态：
+  DB:    旧备份，无 id=456 记录
+  磁盘:  /photos/2024/07/IMG_999.jpg 存在
+```
+
+**扫描修复路径**（全自动）：
+
+```
+触发全量扫描
+  → FindAlbumsForUser（目录结构可能需要重建 Album）
+  → ScanAlbum(albumId=Y)
+    → findMediaForAlbum: os.ReadDir 包含 IMG_999.jpg
+    → ScanMedia("/photos/2024/07/IMG_999.jpg")
+      → SELECT path_hash=MD5(...) → 空
+      → INSERT INTO media (path=..., path_hash=..., album_id=Y)
+      → return media, isNew=true
+    → scanMedia（全套处理：缩略图/EXIF/人脸/Blurhash）
+```
+
+**修复结果**：文件被重新入库，但**新的 media.id ≠ 原来的 id=456**，导致：
+- `album.cover_id` 如果原来指向 456 → 现在成为孤儿 CoverID
+- `user_media_data.user_id + media_id=456` 的收藏 → 成为孤儿行（无外键级联）
+- `share_tokens` 中的 media_id=456 → 指向不存在的媒体
+- 人脸检测会重新识别，新的 face_group_id 与旧的不一致
+
+#### 场景 C：DB 与文件系统都有，但路径变了（磁盘目录被重命名）
+
+```
+恢复前状态：
+  DB:    media.path = "/photos/2024_trip/IMG.jpg", path_hash=MD5("/photos/2024_trip/IMG.jpg")
+  磁盘:  目录被改名 → "/photos/2024_trip_renamed/IMG.jpg"
+```
+
+**扫描修复路径**（全自动，但等同删除+重建）：
+
+```
+触发全量扫描
+  → FindAlbumsForUser
+    → "/photos/2024_trip" 不存在 → DeleteOldUserAlbums 级联删除旧 Album + 所有 media
+    → "/photos/2024_trip_renamed" 作为新目录 → 新建 Album，path_hash 不同
+  → ScanAlbum(newAlbumId)
+    → 所有文件 path_hash 不命中 → 全部作为新增，重新处理全套
+```
+
+**修复结果**：所有 Media ID、Album ID 全部重新生成，人工元数据 100% 丢失。
+
+#### 场景 D：DB 回滚了，但缓存目录未同步（缓存孤儿）
+
+```
+恢复前状态：
+  DB:        回滚到 7 天前，media 最大 id = 80000
+  缓存目录:  media_cache/5/80123/  （有 id=80123 的缩略图）
+  磁盘源文件: /photos/... 完整
+```
+
+**扫描修复路径**：
+
+```
+触发全量扫描
+  → ScanMedia 遇到路径 MD5 不命中（因为 DB 是旧的）→ 重新插入，新 id ≈ 80001-80123
+  → CleanupMedia 不会删除 80123（因为 DB 里根本没有 80123，查不到）
+  → 结果：media_cache/5/80123/ 成为永久孤儿目录
+```
+
+**修复**：需要手动执行
+```bash
+# 方案 1：清空缓存，让扫描重新生成
+rm -rf ./media_cache/*
+# 方案 2：只清理孤儿（更精细）
+find ./media_cache -mindepth 2 -maxdepth 2 -type d -exec bash -c '
+    id=$(basename {})
+    # 检查 DB 中是否存在该 media_id
+    psql -c "SELECT 1 FROM media WHERE id = $id" | grep -q 1 || rm -rf {}
+' \;
+```
+
+### 19.3 不一致类型与扫描修复能力总览
+
+| 不一致类型 | 扫描能否自动修复 | 修复后人工元数据保留 | 缓存一致性 |
+|---|---|---|---|
+| DB 有，磁盘无（场景 A） | ✅ 能，CleanupMedia 清理 | ❌ 收藏/分享/标签丢失 | ✅ 同步删除 |
+| 磁盘有，DB 无（场景 B） | ✅ 能，ScanMedia 重新入库 | ❌ 媒体 ID 变化，关联全部失效 | ❌ 旧缓存目录成孤儿 |
+| 路径/文件名改变（场景 C） | ✅ 能，但等于全删全建 | ❌ 完全丢失 | ✅ 旧删新生成 |
+| DB 有，缓存无（缓存被删） | ⚠️ 部分能 | N/A | ⚠️ 仅扫描到的变更媒体会重建缓存；**未变更媒体的缓存不重建** |
+| DB 回滚，缓存未删（场景 D） | ❌ 不能 | ❌ ID 不匹配 | ❌ 孤儿缓存需手动清理 |
+| Album 表乱了（目录结构变了） | ✅ 能，FindAlbumsForUser 重建 | ❌ Album ID 变，CoverID 失效 | ✅ 旧 albumId 目录被删 |
+| 人脸表乱了（image_faces 被删） | ❌ 不能，仅新入库媒体做人脸检测 | N/A | N/A |
+| SiteInfo / User 配置乱了 | ❌ 不能，扫描不涉及 | N/A | N/A |
+
+### 19.4 标准备份恢复流程（推荐运营手册）
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     标准恢复操作流程                              │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 停止服务                                                     │
+│     systemctl stop photoview 或 docker-compose down              │
+│                                                                  │
+│  2. 恢复数据库                                                   │
+│     pg_restore -d photoview photoview_2024-06-01.dump            │
+│     或 mysql -u photoview -p photoview < backup.sql              │
+│                                                                  │
+│  3. （可选）恢复缓存目录                                          │
+│     rsync -a --delete backup/media_cache/ ./media_cache/         │
+│     跳过此步 → 让扫描重新生成（慢但一致性好）                      │
+│                                                                  │
+│  4. 启动服务                                                     │
+│     systemctl start photoview                                    │
+│                                                                  │
+│  5. 触发全量扫描（所有用户）                                       │
+│     调用 GraphQL: mutation { scanAllUsers }                      │
+│     或等待周期性扫描触发                                          │
+│                                                                  │
+│  6. 扫描完成后，执行数据一致性校验                                  │
+│     SELECT COUNT(*) FROM media;                                   │
+│     -- 对比预期文件数量                                            │
+│     find /photos -type f \( -name "*.jpg" ... \) | wc -l         │
+│                                                                  │
+│  7. 清理孤儿 CoverID                                              │
+│     UPDATE albums SET cover_id = NULL                             │
+│     WHERE cover_id NOT IN (SELECT id FROM media);                │
+│                                                                  │
+│  8. 清理孤儿缓存目录                                              │
+│     find ./media_cache -mindepth 2 -maxdepth 2 -type d           │
+│       -exec bash -c '[...]' \;                                   │
+│                                                                  │
+│  9. （可选）人工元数据从旧 DB 单独迁移                              │
+│     INSERT INTO user_media_data SELECT * FROM old_db.user_media  │
+│       ON CONFLICT DO NOTHING;                                    │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 19.5 代码层改进方向
+
+- 引入「修复扫描」模式：不检测删除（跳过 CleanupMedia），仅补全缺失的 media 和缓存
+- `ScanMedia` 中增加「如果 DB 有 path_hash 但 MediaURL 缺失则重新 ProcessMedia」的逻辑（修复场景 D 的部分情况）
+- 提供 `orphanCleanup` GraphQL mutation，一次清理 CoverID 孤儿、空缓存目录、`user_media_data` 孤儿行
+- 提供 `mediaRehash` mutation：当源文件路径批量改名后，基于文件内容哈希匹配旧记录并更新 `path/path_hash`（保留 ID 和元数据）
+
+---
+
+## 20. 设计思考
 
 ### 优点
 
@@ -1258,6 +1746,13 @@ find ./media_cache -type d -empty -delete
 12. **CoverID 孤儿无清理**：`album.cover_id` 指向已删除 media 时不自动置 NULL，仅在读取时兜底，DB 脏数据累积
 13. **无用户主动删除 API**：只能通过从磁盘删文件 + 触发扫描来删除媒体，无直接删除 Mutation
 14. **Sidecar 格式单一**：仅支持 `.xmp`，不支持 JSON sidecar、Lightroom `.lrcat`、Capture One 目录等
+15. **无 GC/内存监控**：无 `runtime.ReadMemStats` 采样和告警，内存泄漏只能靠外部监控发现；人脸检测 + MagickWand 内存峰值不可控
+16. **无磁盘空间监控**：缩略图/视频转码写磁盘前不预检查剩余空间，磁盘写满后 Media 已入库但 MediaURL 缺失，下次扫描不会自动修复
+17. **多用户权限边界不严**：`FindAlbumsForUser` 遍历不校验文件系统层权限（EACCES 会中止整个扫描）；Root Path 重叠检测用字符串 LIKE 可被符号链接绕过
+18. **人脸检测内存不隔离**：`ReloadFacesFromDatabase` 加载全库人脸 descriptor，多用户共用，无按用户的内存隔离
+19. **无原生备份恢复**：无 `backup/restore` mutation，恢复依赖外部工具；扫描仅能修复路径一致性，人工元数据（user_media_data、share_tokens）ID 变化后全部失效
+20. **缓存孤儿无自动清理**：DB 回滚或媒体重生成后，旧 `media_cache/<albumId>/<oldMediaId>/` 目录永久残留，仅能手动脚本清理
+21. **部分处理失败状态无重试**：磁盘空间不足导致 MediaURL 缺失，下次扫描因 `path_hash` 命中不会重新走 `ProcessMedia`，需人工干预
 
 ### 优化方向（潜在）
 
@@ -1278,6 +1773,8 @@ find ./media_cache -type d -empty -delete
 - SMB 大小写折叠处理：`path_hash` 计算前统一转为小写，避免重复扫描
 - 新增媒体 Trash/回收站机制：`Media` 增加 `DeletedAt` 字段，支持软删与一键恢复
 - CoverID 孤儿定期清理：在 `AfterScanAlbum` 中增加 `UPDATE albums SET cover_id = NULL WHERE cover_id NOT IN (SELECT id FROM media)`
+- 磁盘空间预检查：缩略图/转码前用 `unix.Statfs` 检查剩余空间，< 1GB 时暂停并告警
+- 部分处理状态标记：`ProcessMedia` 失败时在 `media` 表记录 `status='partial'`，下次扫描重试失败项
 
 **Sidecar 与元数据**：
 - XMP 变更时重新解析 EXIF（当前仅重编码图片不刷新 DB 字段）
@@ -1285,9 +1782,28 @@ find ./media_cache -type d -empty -delete
 - 解析并持久化 XMP 标签字段：`dc:subject`（关键词）、`xmp:Rating`（评分）、`lr:hierarchicalSubject`（层级标签）
 - 提供批量刷新 EXIF 的 API：按相册/按时间范围重解析元数据而不重编码图片
 
+**资源监控**：
+- 扫描 goroutine 中采样 `runtime.ReadMemStats`，`HeapAlloc` 超过阈值时输出 warn 日志
+- 支持通过环境变量 `GOMEMLIMIT` / `GOGC` 配置文档化并在启动时打印
+- 新增 Prometheus metrics 端点：`photoview_scan_duration_seconds`、`photoview_media_count`、`photoview_cache_bytes`
+- 磁盘空间定期检查（如每扫描 100 个文件检查一次），自动暂停等待人工释放
+
+**多用户与权限**：
+- `FindAlbumsForUser` 中对每个子目录捕获 `EACCES` 并跳过该分支（记录告警），不中止整个扫描
+- `NewRootAlbum` 重叠检测用 `filepath.EvalSymlinks` 解析真实路径后比较，防止符号链接绕过
+- 人脸检测内存按用户隔离：`getSamplesFromDatabase` JOIN `user_albums` 按 user_id 分桶（需权衡内存占用）
+- `UserRemoveRootAlbum` 前返回「你是该相册唯一拥有者，删除将影响 X 个媒体」的提示信息
+
+**备份恢复**：
+- 提供 `orphanCleanup` GraphQL mutation：一次清理 CoverID 孤儿、空缓存目录、`user_media_data` / `share_tokens` 孤儿行
+- 提供 `mediaRehash` mutation：批量改名时基于内容哈希匹配旧记录并更新 `path/path_hash`（保留 ID 和人工元数据）
+- 引入「修复扫描」模式：跳过 `CleanupMedia`（不检测删除），仅补全缺失 media 并重建缺失的 MediaURL
+- 提供 `databaseBackup` mutation：封装 `pg_dump` / `mysqldump` 并下载
+
 **运营友好**：
 - 扫描进度持久化（按文件粒度记录 offset），中断后可恢复
 - 新增 API：按路径范围扫描、按修改时间增量扫描、单张图片强制重扫（刷新 EXIF）
 - 慢扫描告警：单文件处理 > N 秒时输出详细日志（文件大小、耗时分布）
 - 新增 `deleteMedia(id)` GraphQL Mutation：支持用户从 UI 主动删除/恢复单张图片
 - 缓存孤儿清理 cron：定期执行 `find ./media_cache -type d -empty -delete`，并在 `CleanupMedia` 中同步清理空 album 目录
+- 恢复后校验脚本：输出「DB 媒体数 vs 磁盘文件数差异报告」「孤儿 CoverID 数量」「缓存孤儿目录大小」供运营核对
