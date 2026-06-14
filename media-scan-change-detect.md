@@ -413,7 +413,391 @@ ScanAlbum
 
 ---
 
-## 11. 设计思考
+## 11. 海量媒体场景：并发模型与性能估算
+
+### 11.1 并发架构总览
+
+Photoview 的扫描并发分为**两层**：
+
+```
+全局（用户级）                        单相册内（媒体级）
+───────────────────                  ─────────────────
+AddUserToQueue                        ScanAlbum
+  │                                     │
+  ├── FindAlbumsForUser（单线程BFS）     ├── findMediaForAlbum（串行遍历目录）
+  │     └── 对每个Album：入队            ├── for media in albumMedia:
+  │                                          scanMedia（串行处理每个媒体）
+  └── ScannerQueue 分发
+        ├── max_concurrent_tasks = N
+        └── 每个 Album 起一个 goroutine
+              └── ScanAlbum（单线程跑完整个相册）
+```
+
+### 11.2 Worker 配置
+
+**位置**：`api/graphql/models/site_info.go:19-30`
+
+```go
+func DefaultSiteInfo(db *gorm.DB) SiteInfo {
+    defaultConcurrentWorkers := 3
+    if db_drivers.SQLITE.MatchDatabase(db) {
+        defaultConcurrentWorkers = 1   // SQLite 强制单 worker，避免写锁冲突
+    }
+    return SiteInfo{
+        ConcurrentWorkers: defaultConcurrentWorkers,
+        // ...
+    }
+}
+```
+
+| 数据库类型 | 默认并发 worker 数 | 限制原因 |
+|---|---|---|
+| MySQL / PostgreSQL | 3 | 无强制限制，可在 UI 调整 |
+| SQLite | 1 | SQLite 写锁是库级的，多 worker 写会导致 `database is locked` 错误 |
+
+UI 配置入口：`ui/src/Pages/SettingsPage/ScannerConcurrentWorkers.tsx`，后端 Mutation：`setConcurrentWorkers`。
+
+### 11.3 队列调度机制
+
+**位置**：`api/scanner/scanner_queue/queue.go`
+
+```go
+type ScannerQueue struct {
+    idle_chan   chan bool
+    in_progress []ScannerJob   // 正在执行的任务
+    up_next     []ScannerJob   // 待执行队列
+    settings    ScannerQueueSettings {
+        max_concurrent_tasks int  // = ConcurrentWorkers
+    }
+}
+```
+
+**调度逻辑**（`processQueue` 第 136-192 行）：
+1. 从 `up_next` 队头取任务，直到 `in_progress` 达到 `max_concurrent_tasks`
+2. 每个任务启动一个独立 goroutine 执行 `job.Run()` → `ScanAlbum()`
+3. goroutine 完成后从 `in_progress` 移除，通知 `idle_chan` 触发下一轮调度
+
+**关键特征**：
+- 并发粒度是 **相册级**，不是文件级
+- 单个相册内的所有媒体文件**串行处理**（`scanner_album.go:101` 的 `for` 循环）
+- 单相册串行保证了：DB 连接复用、事务隔离简单、缓存命中高
+- 极端场景：一个相册 10 万张图，其他相册空 → 并发度实际只有 1
+
+### 11.4 处理管道的内部并发
+
+`scanMedia` 内部的 12 个任务是**串行执行**的：
+
+```
+scanMedia
+  ├── BeforeProcessMedia（串行过 12 个 task）
+  ├── ProcessMedia（串行过 12 个 task）
+  │     ├── CounterpartFilesTask
+  │     ├── SidecarTask
+  │     ├── ProcessPhotoTask / ProcessVideoTask
+  │     ├── FaceDetectionTask  ← 全局单例，互斥锁保护
+  │     ├── BlurhashTask
+  │     ├── ExifTask           ← 全局互斥锁（exiftool 单实例）
+  │     └── ...
+  └── AfterProcessMedia（串行过 12 个 task）
+```
+
+**天然串行点**：
+1. **EXIF 解析**（`api/scanner/externaltools/exif/exif.go:45`）：
+   ```go
+   var globalMu sync.Mutex
+   func Parse(filepath string) (*models.MediaEXIF, error) {
+       globalMu.Lock()
+       defer globalMu.Unlock()
+       // 单进程 exiftool 实例，所有 worker 串行排队
+   }
+   ```
+2. **人脸检测**：`GlobalFaceDetector` 也是全局单例，推理时串行
+
+### 11.5 吞吐量估算（10 万文件场景）
+
+假设硬件：8 核 CPU / 16GB RAM / SSD 本地存储 / MySQL / ConcurrentWorkers = 4
+
+| 阶段 | 单文件耗时 | 并发度 | 总耗时（10 万文件） | 瓶颈 |
+|---|---|---|---|---|
+| **遍历 + 查重**（Phase 1） | ~0.1 ms | 4（相册级） | **~2.5 秒** | `os.ReadDir` + `SELECT path_hash` |
+| **仅新增**（第一次扫） | | | | |
+| 图片缩略图生成 | ~100 ms | 4 | **~42 分钟** | MagickWand CPU 编解码 |
+| EXIF 提取 | ~20 ms | 1（全局锁） | **~33 分钟** | exiftool 单进程 |
+| 人脸检测 | ~500 ms | 1 | **~13.9 小时** | CNN 推理 CPU 密集 |
+| Blurhash | ~5 ms | 4 | **~2 分钟** | 像素计算 |
+| **全量处理**（10 万张图） | - | - | **~14-15 小时** | 人脸检测 |
+
+**重复扫描**（文件无变化）：
+- 已存在的文件会跳过 `ProcessMedia` 阶段，仅执行 `MediaFound`/`AfterMediaFound` 钩子
+- 耗时：**~10-30 秒**（取决于目录树深度和 DB 速度）
+
+**关键优化参数**：
+| 参数 | 建议值（10 万+） | 影响 |
+|---|---|---|
+| `ConcurrentWorkers` | CPU 核心数 × 0.75 | 太小浪费 CPU，太大 DB 连接耗尽 |
+| 禁用视频转码 | `PHOTOVIEW_DISABLE_VIDEO_ENCODING=1` | 视频转码是最慢环节 |
+| 禁用人脸检测 | `PHOTOVIEW_DISABLE_FACE_DETECTION=1` | 消除最大瓶颈（14h → 1h） |
+| GPU 加速 | 配置 VA-API / NVENC | 视频转码加速 5-10 倍 |
+
+### 11.6 周期性扫描
+
+**位置**：`api/scanner/periodic_scanner/periodic_scanner.go`
+
+- 由 `PeriodicScanInterval`（秒）控制，0 表示禁用
+- 触发逻辑：`time.Ticker` + `select`，到期后调用 `AddAllToQueue()`
+- 如果上一轮扫描尚未完成，新任务会进入 `up_next` 队列等待，不会重复并发
+
+---
+
+## 12. 跨文件系统场景：NFS/SMB 挂载下的行为分析
+
+Photoview **没有针对网络文件系统（NFS/SMB/CIFS）做特殊适配**，所有文件操作直接通过 Go 标准库 `os` 包完成。以下是实际行为分析。
+
+### 12.1 符号链接处理
+
+**位置**：`api/utils/utils.go:68-92`
+
+```go
+func IsDirSymlink(linkPath string) (bool, error) {
+    fileInfo, err := os.Lstat(linkPath)          // 不跟随 symlink
+    if fileInfo.Mode()&os.ModeSymlink == os.ModeSymlink {
+        resolvedPath, err := filepath.EvalSymlinks(linkPath)  // 解析目标
+        if err != nil {
+            return false, fmt.Errorf("cannot resolve symlink... skipping it")
+        }
+        resolvedFile, err := os.Stat(resolvedPath)
+        return resolvedFile.IsDir(), nil
+    }
+    return false, nil
+}
+```
+
+**NFS/SMB 下的风险**：
+- NFS 挂载选项 `nosymfollow` 会导致 `EvalSymlinks` 失败 → 降级为 `isDirSymlink = false`，该目录被跳过
+- SMB 的 DFS 符号链接在某些内核版本上解析失败
+- 解析失败后 **不中断扫描**，仅记录 warn 日志并假装不是目录符号链接
+
+### 12.2 元数据操作的稳定性
+
+| 操作 | 本地 FS | NFS v3 | NFS v4 | SMB 3.x | 备注 |
+|---|---|---|---|---|---|
+| `os.ReadDir` | 微秒级 | 毫秒级/文件 | 毫秒级/文件 | 毫秒级/文件 | 大目录（>1 万文件）可能秒级超时 |
+| `os.Stat` | < 1µs | 1-10ms | 1-10ms | 5-20ms | 受 `actimeo` 属性缓存影响 |
+| `ModTime` 精度 | 纳秒 | 秒级 | 纳秒（依赖服务端） | 100ns | NFS v3 可能导致 EXIF 时间偏差 |
+| `os.Open` 读文件 | 块设备缓存 | 网络传输 + 客户端缓存 | 同左 | 同左 | 大文件（>50MB）可能超时 |
+
+**NFS 特有问题**：
+- **Stale NFS file handle**：服务端重启或 inode 回收后，扫描到一半报错
+- **属性缓存不一致**：`actimeo=60` 时，文件已删但属性缓存还在 → 扫描到 "幽灵文件" → `os.Open` 失败
+- **ETIMEDOUT / EHOSTDOWN**：网络抖动导致单个文件失败
+
+**SMB 特有问题**：
+- **文件锁定语义差异**：Windows 客户端的独占锁在 Linux cifs 客户端上表现为 `EBUSY`
+- **大小写不敏感**：`IMG.jpg` 和 `img.jpg` 在 SMB 上是同一文件，但 path_hash 不同 → 可能重复扫描或死循环
+
+### 12.3 现有容错机制
+
+**位置**：`api/scanner/scanner_album.go:163-166`
+
+```go
+if err != nil {
+    scanner_utils.ScannerError(ctx, "Error scanning media for album (%d): %s\n",
+        ctx.GetAlbum().ID, err)
+    continue  // 单个文件失败，继续下一个
+}
+```
+
+- 单个文件的 `os.Stat` / `os.Open` 失败**不会中止整个相册扫描**
+- 错误被记录到日志，该文件在本次扫描中被跳过
+- 下一次全量扫描时会重试
+
+**未处理的边缘情况**：
+1. NFS 挂载点完全失联 → `os.ReadDir` 整个相册失败 → 该相册所有 media 会被 `CleanupMedia` **误判为删除**
+2. `actimeo` 缓存过期导致同一文件在一次扫描中 `Stat` 两次结果不一致
+3. SMB 大小写折叠导致的 path_hash 冲突
+
+### 12.4 运营建议（针对 NFS/SMB 部署）
+
+1. **NFS 挂载参数**：
+   ```bash
+   mount -t nfs -o vers=4,sec=sys,actimeo=1,noatime,hard,timeo=600,retrans=3 \
+       nfs-server:/photos /media/photos
+   ```
+   - `actimeo=1`：属性缓存 1 秒，减少不一致窗口
+   - `hard`：避免软挂载导致的偶发 I/O 错误
+   - `vers=4`：推荐 NFS v4，锁和属性语义更完善
+
+2. **SMB 挂载参数**：
+   ```bash
+   mount -t cifs -o vers=3.0,username=xxx,password=xxx,uid=1000,gid=1000,file_mode=0644,dir_mode=0755,cache=strict \
+       //smb-server/photos /media/photos
+   ```
+
+3. **避免误删除**：
+   - 网络不稳定时**先暂停周期性扫描**（`PeriodicScanInterval = 0`）
+   - 重要数据建议做**本地缓存副本**再扫描
+
+4. **大目录拆分**：
+   - NFS/SMB 上单目录不要超过 1 万文件
+   - 按年/月分子目录（`2024/06/IMG_xxx.jpg`）
+
+---
+
+## 13. 并发写入场景：扫描与上传的竞态保护
+
+### 13.1 典型竞态场景
+
+```
+用户上传文件                    后台扫描线程
+──────────                    ───────────
+1. 创建 /album/IMG_123.jpg.tmp
+2. 写入数据...
+3. 完成后 rename → IMG_123.jpg    ← 原子操作
+                                4. os.ReadDir 看到 IMG_123.jpg
+                                5. ScanMedia(path_hash) → 未命中，判定为新增
+                                6. os.Stat 获取 ModTime
+                                7. 开始 ProcessMedia
+                                8. MagickWand.ReadImage()
+```
+
+如果第 8 步发生时用户还在写入（rename 还没发生），会读到不完整文件。
+
+### 13.2 现有保护机制
+
+#### 机制 1：空文件跳过
+
+**位置**：`api/scanner/scanner_cache/cache.go:108-127`
+
+```go
+func (c *AlbumScannerCache) IsPathMedia(mediaPath string) bool {
+    // ...
+    // Make sure file isn't empty
+    fileStats, err := os.Stat(mediaPath)
+    if err != nil || fileStats.Size() == 0 {
+        return false   // ← 空文件被当作非媒体跳过
+    }
+    return true
+}
+```
+
+**保护范围**：
+- ✓ 写入刚开始、文件大小为 0 的场景
+- ✗ 写入到一半、大小 > 0 但内容不完整的场景
+- ✗ 上传工具先分配空间再写入（预分配空洞文件）的场景
+
+#### 机制 2：作业去重
+
+**位置**：`api/scanner/scanner_queue/queue.go:253-264`
+
+```go
+func (queue *ScannerQueue) jobOnQueue(job *ScannerJob) (bool, error) {
+    scannerJobs := append(queue.in_progress, queue.up_next...)
+    for _, scannerJob := range scannerJobs {
+        if scannerJob.ctx.GetAlbum().ID == job.ctx.GetAlbum().ID {
+            return true, nil   // 同一相册不会同时入队两次
+        }
+    }
+    return false, nil
+}
+```
+
+**保护范围**：
+- ✓ 防止同一相册被重复扫描
+- ✗ 不涉及文件级并发
+
+#### 机制 3：PathHash 唯一索引
+
+**位置**：`api/graphql/models/media.go:19`
+
+```go
+PathHash string `gorm:"not null;unique"`
+```
+
+**保护范围**：
+- ✓ 防止同一文件路径重复插入（即使两个 goroutine 同时扫描到）
+- ✗ 存在 TOCTOU（Time Of Check, Time Of Use）竞态窗口
+
+```go
+// ScanMedia 中的查-插窗口
+// T1: SELECT WHERE path_hash = X → 空
+// T2: SELECT WHERE path_hash = X → 空（T1 还没插入）
+// T1: INSERT → 成功
+// T2: INSERT → 唯一键冲突错误 → 该文件被跳过但未回滚
+```
+
+#### 机制 4：数据库事务
+
+**位置**：`api/scanner/scanner_task/scanner_task.go:71-75`
+
+```go
+func (c TaskContext) DatabaseTransaction(transFunc func(ctx TaskContext) error, opts ...*sql.TxOptions) error {
+    return c.GetDB().Transaction(func(tx *gorm.DB) error {
+        return transFunc(c.WithDB(tx))
+    }, opts...)
+}
+```
+
+- `ScanMedia`（`scanner_album.go:148`）和 `scanMedia`（`media_scan.go:22`）都在事务内
+- GORM 默认隔离级别：由数据库驱动决定（MySQL 是 `REPEATABLE READ`，PostgreSQL 是 `READ COMMITTED`）
+- 事务只保护 DB 操作的原子性，**不保护文件系统操作**
+
+#### 机制 5：缓存锁
+
+**位置**：`api/scanner/scanner_cache/cache.go:16`
+
+```go
+type AlbumScannerCache struct {
+    mutex sync.Mutex
+    path_contains_photos map[string]bool
+    photo_types          map[string]media_type.MediaType
+    ignore_data          map[string][]string
+}
+```
+
+所有缓存读写都受 `sync.Mutex` 保护，避免并发 map 读写 panic。
+
+### 13.3 未覆盖的竞态窗口
+
+| 场景 | 风险 | 后果 |
+|---|---|---|
+| 写入过程中文件大小 > 0 但内容不完整 | `ReadImage` 读到坏数据 | 缩略图生成失败，该媒体标记为错误 |
+| 扫描期间文件被移动（跨相册 rename） | 旧相册没扫到，新相册也没扫到 | 文件暂时从库中消失，下次扫描恢复 |
+| 扫描期间文件被删除 | `os.Stat` 成功但 `os.Open` 失败 | 单文件处理失败，记录错误 |
+| 两个用户共享同一相册，同时触发扫描 | path_hash 唯一键冲突 | 其中一方失败，文件漏处理 |
+| Sidecar `.xmp` 正在写入时被读取 | 解析到不完整的 XML | EXIF 字段缺失或解析错误 |
+
+### 13.4 运营建议
+
+1. **上传端原子写入**：
+   ```bash
+   # ✗ 不推荐：直接写入目标路径
+   cp local.jpg /media/album/IMG_123.jpg
+
+   # ✓ 推荐：先写临时文件再 rename
+   cp local.jpg /media/album/IMG_123.jpg.upload
+   mv /media/album/IMG_123.jpg.upload /media/album/IMG_123.jpg
+   ```
+   POSIX 中同目录 rename 是原子操作，可避免读到半写文件。
+
+2. **临时文件过滤**：
+   在 `.photoviewignore` 中添加：
+   ```
+   *.upload
+   *.tmp
+   *.part
+   .DS_Store
+   ```
+
+3. **上传与扫描窗口错开**：
+   - 上传集中在 0-6 点，扫描配置在 6-8 点执行
+   - 或上传完成后通过 API 手动触发单用户扫描
+
+4. **Sidecar 写入保护**：
+   Lightroom/ Capture One 导出 XMP 时也遵循 tmp → rename 模式
+
+---
+
+## 14. 设计思考
 
 ### 优点
 
@@ -425,10 +809,32 @@ ScanAlbum
 
 1. **改名感知粗粒度**：不能识别「同文件改名」，导致重复处理与元数据丢失风险
 2. **不支持增量**：每次都要全量遍历目录（虽有缓存，但不涉及变更检测层面）
-3. **并发 rename**：如果扫描期间文件跨目录移动，可能出现「两个都扫到」或「两个都没扫到」的短暂窗口（由 DB 事务保证最终一致，但中间态可能出现重复或短暂丢失）
+3. **并发 rename 窗口**：扫描期间文件跨目录移动，可能出现「两个都扫到」或「两个都没扫到」的短暂窗口
+4. **并发粒度受限**：单相册内串行处理，大相册（10 万+ 文件）会拖慢整体并发度
+5. **EXIF 全局串行**：`exiftool` 单进程+互斥锁，成为多核场景下的性能瓶颈
+6. **NFS/SMB 无适配**：无网络文件系统检测与容错，挂载失联可能导致整相册媒体被误删
+7. **半写文件检测弱**：仅通过 `Size == 0` 跳过，无法处理预分配或部分写入的文件
+8. **TOCTOU 竞态**：`ScanMedia` 的查-插窗口可能导致唯一键冲突，文件处理失败
 
 ### 优化方向（潜在）
 
+**变更识别层**：
 - 引入「文件内容哈希 + 大小 + 修改时间」多重签名，可实现真正的改名/移动检测，保留原 ID 与人工标签
 - 为相册/媒体封面引用添加 `ON DELETE SET NULL` 或清理逻辑，避免悬挂指针
 - 引入 inotify/fsevents 级别的增量扫描，减少全量遍历频率
+
+**并发与性能**：
+- 将单相册串行改为文件级并发（需要 DB 连接池与事务隔离级别的配合）
+- 使用 `exiftool` `-stay_open` 模式或多进程池，消除 EXIF 全局串行瓶颈
+- 人脸检测支持批量推理与 GPU 并发
+
+**可靠性**：
+- NFS/SMB 挂载健康检测：`os.ReadDir` 失败时跳过该相册的 CleanupMedia，避免误删除
+- 增加文件完整性检测：`Size > 0` 后增加 `ModTime` 稳定检查（如 30 秒内未变化）
+- `ScanMedia` 的查-插竞态：改用 `INSERT ... ON CONFLICT DO NOTHING` 加返回判断
+- SMB 大小写折叠处理：`path_hash` 计算前统一转为小写，避免重复扫描
+
+**运营友好**：
+- 扫描进度持久化（按文件粒度记录 offset），中断后可恢复
+- 新增 API：按路径范围扫描、按修改时间增量扫描
+- 慢扫描告警：单文件处理 > N 秒时输出详细日志（文件大小、耗时分布）
