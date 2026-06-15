@@ -1405,3 +1405,436 @@ if db.Migrator().HasColumn(&models.SiteInfo{}, "thumbnail_method") {
 3. **先迁移再启动**：MigrateDatabase 在所有业务逻辑之前运行
 4. **错误处理宽松**：迁移失败只打印日志不中断启动（除 AutoMigrate 外）
 5. **分批处理**：大数据量迁移使用 `FindInBatches`（每批 100 条）避免内存溢出
+
+---
+
+## 十六、用户认证：AccessToken（非 JWT）与中间件链路
+
+### 16.1 关于「JWT」的澄清
+
+Photoview **没有使用 JWT**。所谓的「token」是数据库存储的不透明随机字符串，称为 `AccessToken`。
+
+| 特性 | JWT | Photoview AccessToken |
+|------|-----|----------------------|
+| 格式 | 三段式 Base64 (header.payload.signature) | 24 字符随机字符串 |
+| 状态 | 自包含（无状态） | 需数据库查询验证 |
+| 过期 | 内置 exp 字段 | 数据库 `expire` 列 |
+| 吊销 | 依赖黑名单/短 TTL | 直接删除数据库行 |
+| 算法 | HMAC/RSA 签名 | `crypto/rand` 纯随机 |
+
+**模型定义**（`api/graphql/models/user.go:35-41`）：
+```go
+type AccessToken struct {
+    Model
+    UserID int       `gorm:"not null;index"`
+    Value  string    `gorm:"not null;size:24;index"`
+    Expire time.Time `gorm:"not null;index"`
+}
+```
+
+### 16.2 Token 生成流程
+
+**GenerateAccessToken**（`api/graphql/models/user.go:126-151`）：
+
+```
+GenerateAccessToken(db)
+  ↓
+1. 生成 24 字节随机数: crypto/rand.Read(bytes)
+2. 映射到 62 个字符: 0-9A-Za-z
+   for i, b := range bytes { bytes[i] = CHARACTERS[b%62] }
+3. 过期时间: time.Now() + 14 天
+4. INSERT INTO access_tokens
+5. 返回 AccessToken 对象
+```
+
+### 16.3 登录链路：authorizeUser
+
+`api/graphql/resolvers/user.go:24-54`:
+
+```
+Mutation.authorizeUser(username, password)
+  ↓
+1. models.AuthorizeUser(db, username, password)
+   ├─ SELECT * FROM users WHERE username = ?
+   ├─ 未找到 → ErrorInvalidUserCredentials
+   ├─ user.Password == nil → "user does not have a password"
+   └─ bcrypt.CompareHashAndPassword(storedHash, input)
+       ├─ 不匹配 → ErrorInvalidUserCredentials
+       └─ 匹配 → ✅ 返回 User 对象
+  ↓
+2. 事务内: user.GenerateAccessToken(tx)
+  ↓
+3. 返回 AuthorizeResult { success, status, token }
+```
+
+**密码强度**：bcrypt cost = 12（`bcrypt.GenerateFromPassword(pw, 12)`）。
+
+### 16.4 初始设置向导：InitialSetupWizard
+
+`api/graphql/resolvers/user.go:57-107`:
+
+```
+Mutation.initialSetupWizard(username, password, rootPath)
+  ↓
+1. 检查 site_info.initial_setup == true
+   → false 则报错 "not initial setup"
+  ↓
+2. 事务内:
+   a. UPDATE site_info SET initial_setup = false
+   b. models.RegisterUser() → 创建管理员用户 (admin=true)
+   c. scanner.NewRootAlbum() → 创建根相册，关联用户与目录
+   d. user.GenerateAccessToken() → 生成 token
+  ↓
+3. 返回 AuthorizeResult
+```
+
+这是首次部署时唯一能创建用户的入口，之后 `initial_setup` 被置为 `false`。
+
+### 16.5 HTTP 中间件：auth.Middleware
+
+**注册位置**（`api/server.go:75-76`）：
+```go
+rootRouter.Use(dataloader.Middleware(db))  // ① 先注入 DataLoader
+rootRouter.Use(auth.Middleware(db))        // ② 再认证
+```
+
+**Middleware 逻辑**（`api/graphql/auth/auth.go:31-70`）：
+
+```
+HTTP 请求进入
+  ↓
+1. 读取 Cookie: "auth-token"
+   └─ 不存在 → 跳过，ctx 无 user（匿名）
+  ↓
+2. 从 ctx 获取 DataLoader（依赖上一步 dataloader.Middleware）
+   └─ loaders == nil → 500 Internal Server Error
+  ↓
+3. DataLoader 批量加载: loaders.UserFromAccessToken.Load(cookieValue)
+   ├─ 数据库错误 → 401 "invalid authorization token"
+   └─ user == nil → 401 "Token not found in database"
+  ↓
+4. ctx = AddUserToContext(ctx, user) ← 注入到私有 contextKey
+  ↓
+next.ServeHTTP(w, r)
+```
+
+**关键**：认证中间件不会拒绝无 Cookie 的请求。未认证请求会正常进入路由，由各路由层的 `authenticateMedia()` / `authenticateAlbum()` 或 GraphQL directive 进行实际拦截。
+
+### 16.6 DataLoader：NewUserLoaderByToken
+
+`api/dataloader/userLoader.go:10-71`:
+
+```
+批量 fetch(tokens []string)
+  ↓
+1. SELECT * FROM access_tokens
+   WHERE expire > NOW()
+   AND value IN (token...)
+   ← 过期 token 直接过滤掉
+  ↓
+2. SELECT DISTINCT user_id FROM access_tokens
+   WHERE expire > NOW() AND value IN (...)
+  ↓
+3. SELECT * FROM users WHERE id IN (userIDs)
+  ↓
+4. 构建 result[len(tokens)]，按 token 顺序对应 user
+   ← DataLoader 要求结果顺序与输入顺序严格一致
+```
+
+**批处理参数**：`maxBatch=100, wait=5ms`
+
+### 16.7 WebSocket 认证：AuthWebsocketInit
+
+GraphQL WebSocket 不走 HTTP Cookie，通过 `InitPayload` 传 Bearer token。
+
+`api/graphql/auth/auth.go:92-131`:
+
+```
+WebSocket InitPayload
+  ↓
+1. 读取 initPayload["Authorization"]
+   └─ 不存在 → 返回 nil（匿名连接）
+  ↓
+2. Bearer 格式校验: ^Bearer ([a-zA-Z0-9]{24})$
+   → 不匹配 → 错误
+  ↓
+3. DataLoader 加载 User
+   → 错误 → 断开连接
+   → user == nil → 断开连接
+  ↓
+4. 注入 user 到 ctx
+```
+
+**Bearer 正则**（`api/graphql/auth/auth.go:17`）：
+```go
+var bearerRegex = regexp.MustCompile("^(?i)Bearer ([a-zA-Z0-9]{24})$")
+```
+注意 token 长度严格限制 24 字符，这是与 GenerateAccessToken 生成规则一致的硬校验。
+
+### 16.8 GraphQL Directive 权限拦截
+
+除了 HTTP 中间件，GraphQL 层通过两个 directive 做二次拦截：
+
+**定义**（`api/graphql/directive.go:11-27`）：
+
+```go
+// @isAdmin — 仅管理员
+func IsAdmin(ctx, obj, next) (interface{}, error) {
+    user := auth.UserFromContext(ctx)
+    if user == nil || !user.Admin { return error("user must be admin") }
+    return next(ctx)
+}
+
+// @isAuthorized — 任意登录用户
+func IsAuthorized(ctx, obj, next) (interface{}, error) {
+    user := auth.UserFromContext(ctx)
+    if user == nil { return ErrUnauthorized }
+    return next(ctx)
+}
+```
+
+**在 Schema 中的应用**（示例）：
+```graphql
+extend type Mutation {
+  scanAll: ScannerResult! @isAdmin        # 管理员操作
+  userAddRootPath(...): Album @isAdmin    # 管理员操作
+  changeUserPreferences(...): ... @isAuthorized  # 仅需登录
+  authorizeUser(...): AuthorizeResult!    # 无 directive，登录入口
+}
+
+extend type Query {
+  myUser: User! @isAuthorized              # 仅需登录
+  myAlbums(...): [Album!]! @isAuthorized   # 仅需登录
+  user(...): [User!]! @isAdmin             # 管理员操作
+}
+```
+
+**注意**：`authorizeUser` 和 `initialSetupWizard` 没有任何 directive，是唯一两个允许匿名访问的 Mutation。
+
+### 16.9 完整认证链路对比
+
+| 场景 | 认证方式 | 拦截点 |
+|------|---------|--------|
+| 浏览照片页面 | Cookie `auth-token` | HTTP 中间件 → GraphQL `@isAuthorized` |
+| GraphQL 查询 | Cookie + directive | HTTP 中间件注入 user → directive 校验 |
+| GraphQL 订阅 | WebSocket InitPayload Bearer | `AuthWebsocketInit()` 注入 user |
+| 访问 `/photo/{name}` | Cookie | `authenticateMedia()` 路由层校验 |
+| 访问 `/video/{name}` | Cookie | `authenticateMedia()` 路由层校验 |
+| 相册下载 | Cookie | `authenticateAlbum()` 路由层校验 |
+| 共享链接访问 | URL Query `token` | `shareTokenFromRequest()` 校验 ShareToken |
+
+**关键区别**：HTTP 中间件只负责「如果有 token 就注入 user」，不做任何拒绝。实际的权限拒绝发生在：
+- GraphQL 层：`@isAuthorized` / `@isAdmin` directive（由 gqlgen 框架调用）
+- REST 路由层：`authenticateMedia()` / `authenticateAlbum()`（手动调用）
+
+---
+
+## 十七、照片上传 Pipeline：基于文件系统的扫描式导入
+
+### 17.1 架构设计：无 HTTP 上传接口
+
+Photoview **没有**传统的 `multipart/form-data` 文件上传 API。
+
+**工作模式**：
+
+```
+[ 外部系统 / 人工 ]
+    │
+    │  1. 将照片/视频复制到服务器某个目录（如 /photos/2024）
+    │  （SCP/SMB/NFS/Docker volume mount 等任意方式）
+    │
+    ▼
+[ 服务器文件系统 ]
+    │
+    │  2. 管理员调用 GraphQL: userAddRootPath(userId, rootPath="/photos/2024")
+    │     → 关联用户与目录，创建相册记录
+    │
+    ▼
+[ Scanner 队列 ]
+    │
+    │  3. 手动触发 scanAll / scanUser，或 PeriodicScanner 定时触发
+    │
+    ▼
+[ Scanner Pipeline ]
+    │
+    ├─ findMediaForAlbum()       遍历目录，发现文件
+    ├─ MediaFound 钩子链          IgnorefileTask / CounterpartFilesTask
+    ├─ ScanMedia()                写入 media 表
+    ├─ AfterMediaFound 钩子链     Exif / Sidecar / VideoMetadata / Notification
+    ├─ scanMedia() 处理每张媒体
+    │   ├─ BeforeProcessMedia
+    │   ├─ ProcessMedia          ProcessPhotoTask / ProcessVideoTask
+    │   │                         → 生成 thumbnail / high-res / video-web
+    │   └─ AfterProcessMedia     FaceDetection / Blurhash / Notification
+    └─ AfterScanAlbum            Cleanup / Notification
+    │
+    ▼
+[ 数据库 + 缓存目录 ]
+```
+
+### 17.2 Pipeline 入口一：userAddRootPath
+
+用于**新增根目录**，首次使用或新增目录时调用。
+
+`api/graphql/resolvers/user.go:174-190`:
+
+```
+Mutation.userAddRootPath(id, rootPath) @isAdmin
+  ↓
+1. rootPath = path.Clean(rootPath)  ← 规范化，防止 ../ 穿越
+  ↓
+2. SELECT * FROM users WHERE id = ?
+  ↓
+3. scanner.NewRootAlbum(db, rootPath, user)
+   ├─ 创建 Album 记录（title = 目录名，parent_album_id = NULL）
+   └─ 写入 user_albums 关联表
+  ↓
+4. 返回新创建的 Album 对象（但不立即扫描，扫描需另行触发）
+```
+
+**关键**：`userAddRootPath` 只创建关联，不触发扫描。需要用户手动 `scanAll` / `scanUser`，或等待定时扫描。
+
+### 17.3 Pipeline 入口二：scanAll / scanUser
+
+用于**触发实际扫描**。
+
+`api/graphql/resolvers/scanner.go:22-52`:
+
+```
+Mutation.scanAll() @isAdmin
+  └→ scanner_queue.AddAllToQueue()
+      └→ 遍历所有用户，将其所有根相册加入 ScannerQueue
+
+Mutation.scanUser(userId) @isAdmin
+  └→ SELECT * FROM users WHERE id = ?
+  └→ scanner_queue.AddUserToQueue(user)
+      └→ 将该用户所有根相册加入 ScannerQueue
+```
+
+两者都返回 `ScannerResult { Finished: false }`，表示扫描已排队但未完成（异步执行）。进度通过 WebSocket `Notification` 广播。
+
+### 17.4 Pipeline 入口三：PeriodicScanner（定时自动扫描）
+
+无需手动调用，后台周期性触发。详见第七章。
+
+### 17.5 GraphQL MultipartForm 传输说明
+
+`api/graphql/endpoint/graphql_endpoint.go:39`:
+```go
+graphqlServer.AddTransport(transport.MultipartForm{})
+```
+
+虽然注册了 `MultipartForm` transport（用于 GraphQL multipart request 规范），但**整个代码库没有任何 file upload mutation**。这意味着：
+
+- ✅ 框架层支持解析 multipart 请求
+- ❌ 业务层没有定义 `uploadFile` / `uploadMedia` 等 mutation
+- ❌ 没有任何代码读取上传的文件字节流
+- ❌ 没有文件保存到磁盘的逻辑
+
+这个 transport 的注册更可能是为了**上传图片作为 GraphQL 参数**（如设置自定义 avatar 时），但在当前代码中并未使用。
+
+### 17.6 扫描 Pipeline 内部步骤（从文件到缓存）
+
+```
+文件在磁盘上（如 /photos/2024/IMG_0001.jpg）
+  │
+  ▼
+① findMediaForAlbum: 遍历目录，fs.Stat(file) 检查
+  │
+  ▼
+② MediaFound 钩子:
+   - IgnorefileTask: 匹配 .photoviewignore? → skip
+   - CounterpartFilesTask: JPEG 有同名 RAW? → skip
+  │
+  ▼
+③ ScanMedia(): UPSERT 写入 media 表
+   ├─ 计算 title = 文件名（去扩展名）
+   ├─ 获取 type = photo / video
+   ├─ 计算 date_shot
+   └─ newMedia = true/false ← 区分新建还是已有
+  │
+  ▼
+④ AfterMediaFound 钩子（仅 newMedia 时大部分执行）:
+   - NotificationTask: 广播发现通知
+   - ExifTask: 解析 EXIF → MediaEXIF 表
+   - VideoMetadataTask: ffprobe → VideoMetadata 表
+   - SidecarTask: 查找 .xmp，记录 MD5
+  │
+  ▼
+⑤ BeforeProcessMedia 钩子:
+   - CounterpartFilesTask: 设置 CounterpartPath（RAW 用 JPEG 解码）
+  │
+  ▼
+⑥ ProcessMedia 钩子（核心）:
+   - SidecarTask: sidecar MD5 变化? → 重建 high-res + thumbnail
+   - ProcessPhotoTask:
+     ├─ 若非 Web 兼容 → MagickWand 解码 → 生成 high-res JPEG
+     ├─ 写入 MediaURL (original)
+     └─ 生成 thumbnail (1024px, JPEG 70%)
+   - ProcessVideoTask:
+     ├─ 若非 Web 兼容 → ffmpeg 转码 → video-web (1080p, H264+AAC)
+     ├─ 生成 video-thumbnail (ffmpeg 截取 25% 帧)
+     └─ 写入 MediaURL (original)
+  │
+  ▼
+⑦ AfterProcessMedia 钩子（依赖 ⑥ 已生成缓存文件）:
+   - FaceDetectionTask: 基于 thumbnail 做人脸检测 → FaceGroup / ImageFace
+   - BlurhashTask: 基于 thumbnail 生成 4x3 BlurHash → media.blurhash
+   - NotificationTask: 广播进度
+  │
+  ▼
+⑧ AfterScanAlbum 钩子:
+   - MediaCleanupTask: 删除磁盘上已消失的媒体记录 + 缓存目录
+   - NotificationTask: 广播完成通知
+  │
+  ▼
+完成:
+  - media 表有记录
+  - media_urls 表有所有分辨率记录
+  - media_cache/ 目录有缩略图/转码文件
+  - 前端可通过 Media / MediaURL GraphQL 查询访问
+```
+
+### 17.7 与传统上传 API 的对比
+
+| 特性 | 传统 HTTP Upload | Photoview 扫描式导入 |
+|------|-----------------|---------------------|
+| 写入方式 | 网络字节流 → HTTP → 磁盘 | 人工/外部系统 → 磁盘 |
+| 接口 | POST /api/upload (multipart) | 无上传接口，仅文件系统 |
+| 发现时机 | 上传时立即入库 | 下次扫描时入库 |
+| 适合场景 | 移动端 App、Web 浏览器直传 | 家庭 NAS、桌面照片整理、批量导入 |
+| 延迟 | 低（上传 + 处理） | 高（取决于扫描间隔） |
+| 并发控制 | 后端限流 | ScannerQueue 控制相册并发 |
+| 错误处理 | 同步返回 | 通知 / 日志 |
+| 处理 pipeline | 上传后处理 | 发现时处理 |
+
+### 17.8 用户数据安全隔离
+
+即使多个用户共享同一台服务器，数据通过两层机制隔离：
+
+```
+HTTP 请求
+  │
+  ▼
+auth.Middleware: 从 Cookie 识别 user，注入 ctx
+  │
+  ▼
+GraphQL resolver: auth.UserFromContext(ctx) 获取当前用户
+  │
+  ├─ Query.myAlbums:
+  │    SELECT * FROM albums
+  │    JOIN user_albums ON user_albums.album_id = albums.id
+  │    WHERE user_albums.user_id = 当前用户ID
+  │
+  ├─ Query.Album(id):
+  │    额外检查 album 属于当前用户或被共享
+  │
+  └─ Query.media(id):
+       SELECT media.* FROM media
+       JOIN albums ON albums.id = media.album_id
+       JOIN user_albums ON user_albums.album_id = albums.id
+       WHERE user_albums.user_id = 当前用户ID
+       AND media.id = ?
+```
+
+所有媒体查询都带有 `user_id` 过滤，用户无法看到不属于自己的媒体（除非通过 ShareToken 共享）。
