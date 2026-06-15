@@ -1013,3 +1013,395 @@ authenticateMedia() / authenticateAlbum()
 - 照片和视频路由使用 `authenticateMedia()`，同时支持 Media 和 Album 类型的共享令牌
 - 相册下载路由使用 `authenticateAlbum()`，只支持 Album 类型的共享令牌
 - 所有鉴权在缓存文件访问之前完成，未授权请求不会触发磁盘 IO
+
+---
+
+## 十四、ScannerTasks 子任务注册、接口与触发顺序
+
+### 14.1 任务注册表
+
+所有子任务在 `api/scanner/scanner_tasks/scanner_tasks.go:15-27` 注册为一个有序列表：
+
+```go
+var allTasks []scanner_task.ScannerTask = []scanner_task.ScannerTask{
+    NotificationTask{},             // 1. 通知
+    IgnorefileTask{},               // 2. 忽略文件
+    processing_tasks.CounterpartFilesTask{}, // 3. 配套文件
+    processing_tasks.SidecarTask{},         // 4. Sidecar XMP
+    processing_tasks.ProcessPhotoTask{},    // 5. 照片处理
+    processing_tasks.ProcessVideoTask{},    // 6. 视频处理
+    FaceDetectionTask{},            // 7. 人脸检测
+    BlurhashTask{},                 // 8. BlurHash
+    ExifTask{},                     // 9. EXIF 解析
+    VideoMetadataTask{},            // 10. 视频元数据
+    cleanup_tasks.MediaCleanupTask{},      // 11. 缓存清理
+}
+```
+
+**注册顺序即执行顺序**，每个生命周期钩子按此列表依次调用。
+
+### 14.2 ScannerTask 接口定义
+
+`api/scanner/scanner_task/scanner_task.go:16-36` 定义了 7 个生命周期钩子：
+
+```go
+type ScannerTask interface {
+    BeforeScanAlbum(ctx TaskContext) (TaskContext, error)
+    AfterScanAlbum(ctx TaskContext, changedMedia []*models.Media, albumMedia []*models.Media) error
+    MediaFound(ctx TaskContext, fileInfo fs.FileInfo, mediaPath string) (skip bool, err error)
+    AfterMediaFound(ctx TaskContext, media *models.Media, newMedia bool) error
+    BeforeProcessMedia(ctx TaskContext, mediaData *EncodeMediaData) (TaskContext, error)
+    ProcessMedia(ctx TaskContext, mediaData *EncodeMediaData, mediaCachePath string) ([]*MediaURL, error)
+    AfterProcessMedia(ctx TaskContext, mediaData *EncodeMediaData, updatedURLs []*MediaURL, mediaIndex int, mediaTotal int) error
+}
+```
+
+`ScannerTaskBase`（`api/scanner/scanner_task/scanner_task_base.go`）提供所有钩子的空实现，子任务只需覆盖自己关心的钩子。
+
+### 14.3 生命周期钩子触发时机
+
+```
+ScanAlbum()
+│
+├─ 1. BeforeScanAlbum()           ← 扫描相册前
+│     └─ IgnorefileTask: 编译 .photoviewignore 规则
+│
+├─ 2. findMediaForAlbum()         ← 遍历目录发现媒体
+│     ├─ 对每个文件: MediaFound()
+│     │   ├─ IgnorefileTask:     匹配 .photoviewignore → skip?
+│     │   └─ CounterpartFilesTask: JPEG 有同名 RAW → skip?
+│     │
+│     └─ ScanMedia() 入库后: AfterMediaFound()
+│         ├─ NotificationTask:   广播「发现新媒体」通知（节流 500ms）
+│         ├─ ExifTask:           解析 EXIF 并保存（仅 newMedia）
+│         ├─ VideoMetadataTask:  解析视频元数据（仅 newMedia + 视频类型）
+│         └─ SidecarTask:        查找 .xmp sidecar（仅 newMedia + 照片 + 非Web兼容）
+│
+├─ 3. scanMedia() 对每个媒体:     ← 处理媒体
+│     ├─ BeforeProcessMedia()
+│     │   └─ CounterpartFilesTask: 设置 CounterpartPath
+│     │
+│     ├─ ProcessMedia()          ← 生成缓存文件
+│     │   ├─ SidecarTask:        sidecar 变更 → 重新生成 high-res + thumbnail
+│     │   ├─ ProcessPhotoTask:   生成 thumbnail + high-res + original
+│     │   └─ ProcessVideoTask:   生成 video-web + video-thumbnail + original
+│     │
+│     └─ AfterProcessMedia()
+│         ├─ NotificationTask:   广播处理进度
+│         ├─ FaceDetectionTask:  检测人脸（仅照片 + 有更新）
+│         └─ BlurhashTask:       生成 BlurHash（仅 thumbnail 有更新）
+│
+└─ 4. AfterScanAlbum()            ← 扫描相册后
+      ├─ NotificationTask:        广播「处理完成」通知
+      └─ MediaCleanupTask:        清理已消失的媒体缓存
+```
+
+### 14.4 各子任务详细说明
+
+#### ① NotificationTask — 通知广播
+
+| 钩子 | 行为 |
+|------|------|
+| `AfterMediaFound` | 发现新媒体时广播通知（节流 500ms） |
+| `AfterProcessMedia` | 处理进度通知（百分比） |
+| `AfterScanAlbum` | 扫描完成通知 |
+
+**初始化**：`NewNotificationTask()` 创建带节流器和唯一 albumKey 的实例。
+**注意**：因为注册在列表第一位，`AfterMediaFound` 会在 EXIF/视频元数据解析之前执行。
+
+#### ② IgnorefileTask — 忽略文件过滤
+
+| 钩子 | 行为 |
+|------|------|
+| `BeforeScanAlbum` | 编译 `.photoviewignore` 规则到 TaskContext |
+| `MediaFound` | 匹配文件名，命中则 skip=true |
+
+`.photoviewignore` 语法与 `.gitignore` 一致（使用 `go-gitignore` 库）。
+
+#### ③ CounterpartFilesTask — 配套文件处理
+
+| 钩子 | 行为 |
+|------|------|
+| `MediaFound` | JPEG 有同名 RAW → skip；RAW + 禁用 RAW 处理 → skip |
+| `BeforeProcessMedia` | 为 RAW 文件查找同名 JPEG，设置 `CounterpartPath` |
+
+#### ④ SidecarTask — XMP Sidecar 处理
+
+| 钩子 | 行为 |
+|------|------|
+| `AfterMediaFound` | 新 RAW 文件查找 `.xmp` sidecar，记录路径和 MD5 哈希 |
+| `ProcessMedia` | 检测 sidecar 变更（哈希不同或被删除），触发重新生成 high-res + thumbnail |
+
+**Sidecar 变更检测**：通过 MD5 哈希对比，如果 sidecar 文件新增/修改/删除，重新编码对应的 JPEG。
+**安全措施**：重新编码前将原文件重命名为 `.hold`，失败后恢复。
+
+#### ⑤ ProcessPhotoTask — 照片处理
+
+| 钩子 | 行为 |
+|------|------|
+| `ProcessMedia` | 生成 high-res（非 Web 兼容时）+ original + thumbnail |
+
+（详见第二章「照片处理核心流程」）
+
+#### ⑥ ProcessVideoTask — 视频处理
+
+| 钩子 | 行为 |
+|------|------|
+| `ProcessMedia` | 生成 video-web（非 Web 兼容时）+ video-thumbnail + original |
+
+（详见第九章「视频解码与转码栈」）
+
+#### ⑦ FaceDetectionTask — 人脸检测
+
+| 钩子 | 行为 |
+|------|------|
+| `AfterProcessMedia` | 照片类型 + 有更新 → 调用 `GlobalFaceDetector.DetectFaces()` |
+
+**执行条件**：`len(updatedURLs) > 0` 且 `media.Type == MediaTypePhoto` 且 `GlobalFaceDetector != nil`
+
+**DetectFaces 流程**（`api/scanner/face_detection/face_detector_impl.go:92-128`）：
+```
+1. 加载媒体的 MediaURL，找到 PhotoThumbnail
+2. 获取缩略图磁盘路径
+3. 加锁（mutex.Lock）
+4. face.Recognizer.RecognizeFile(thumbnailPath) → 识别所有人脸
+5. 解锁
+6. 对每个人脸: classifyFace()
+   ├─ classifyDescriptor() → 与已有样本对比，阈值 0.2
+   ├─ 无匹配 → 创建新 FaceGroup
+   └─ 有匹配 → 追加到已有 FaceGroup
+7. 更新内存中的 faceDescriptors / faceGroupIDs / imageFaceIDs
+```
+
+**线程安全**：`faceDetector.mutex` 保护 `Recognizer` 的调用和样本数据更新。Recognizer 本身不是并发安全的。
+
+**禁用方式**：
+- 环境变量：`PHOTOVIEW_DISABLE_FACE_RECOGNITION=1`
+- 编译标签：`-tags no_face_detection`（使用 `face_detector_shim.go`）
+
+#### ⑧ BlurhashTask — BlurHash 生成
+
+| 钩子 | 行为 |
+|------|------|
+| `AfterProcessMedia` | thumbnail 有更新 → 生成 BlurHash 字符串 |
+
+**执行条件**：`updatedURLs` 中包含 `PhotoThumbnail` 或 `VideoThumbnail`，或 `media.Blurhash == nil`
+
+**生成流程**（`api/scanner/scanner_tasks/blurhash_task.go:60-87`）：
+```
+1. 从 MediaURL 获取缩略图路径
+2. Go 标准库 image.Decode() 解码图片
+3. blurhash.Encode(4, 3, imageData) → 生成 4×3 分量的 BlurHash
+4. 保存到 media.Blurhash 字段
+```
+
+**参数**：`componentX=4, componentY=3`，产生约 30 字符的哈希字符串。
+
+#### ⑨ ExifTask — EXIF 元数据解析
+
+| 钩子 | 行为 |
+|------|------|
+| `AfterMediaFound` | 仅 newMedia → 解析 EXIF 并保存到数据库 |
+
+**SaveEXIF 流程**（`api/scanner/scanner_tasks/exif_task.go:32-73`）：
+```
+1. 检查 media.ExifID 是否已存在 → 已有则跳过
+2. exif.Parse(media.Path) → 调用 exiftool 解析
+3. Replace EXIF 关联到 media
+4. 如果 EXIF.DateShot != media.DateShot → 更新 media.DateShot
+```
+
+**exif.Parse()** 使用全局单例 `globalExifParser`，受 `sync.Mutex` 保护（`api/scanner/externaltools/exif/exif.go:43-44`）。
+
+#### ⑩ VideoMetadataTask — 视频元数据解析
+
+| 钩子 | 行为 |
+|------|------|
+| `AfterMediaFound` | 仅 newMedia + 视频类型 → 解析视频元数据 |
+
+**ScanVideoMetadata 流程**（`api/scanner/scanner_tasks/video_metadata_task.go:35-84`）：
+```
+1. ffprobe.ProbeURL() → 读取视频流信息
+2. 提取: 分辨率、时长、编码、帧率、码率、色彩配置、音频信息
+3. 创建 VideoMetadata 记录
+4. 保存到数据库（media.VideoMetadata 关联）
+```
+
+#### ⑪ MediaCleanupTask — 缓存清理
+
+| 钩子 | 行为 |
+|------|------|
+| `AfterScanAlbum` | 清理已消失媒体的数据库记录和缓存文件 |
+
+（详见第十二章「媒体缓存清理与磁盘空间回收」）
+
+### 14.5 任务间的数据依赖
+
+```
+MediaFound 阶段:
+  IgnorefileTask.skip ──→ 决定是否继续
+  CounterpartFilesTask.skip ──→ 决定是否继续
+    ↓ (不 skip 才进入后续)
+
+AfterMediaFound 阶段:
+  ExifTask ──→ 更新 media.DateShot（影响排序）
+  VideoMetadataTask ──→ 写入 media.VideoMetadata
+  SidecarTask ──→ 写入 media.SideCarPath / SideCarHash
+
+BeforeProcessMedia 阶段:
+  CounterpartFilesTask ──→ 设置 mediaData.CounterpartPath
+
+ProcessMedia 阶段:
+  SidecarTask ──→ sidecar 变更时重建 high-res + thumbnail
+  ProcessPhotoTask ──→ 使用 CounterpartPath 决定解码源
+  ProcessVideoTask ──→ 使用 VideoMetadata 确定截帧位置
+
+AfterProcessMedia 阶段:
+  FaceDetectionTask ──→ 依赖 thumbnail 已生成
+  BlurhashTask ──→ 依赖 thumbnail 已生成
+```
+
+**关键依赖**：
+- FaceDetection 和 BlurHash **必须**在 ProcessPhoto/ProcessVideo 之后执行（因为依赖缩略图文件）
+- ExifTask 在 AfterMediaFound 阶段执行，早于 ProcessMedia，但只读不写缓存文件
+- SidecarTask 跨越两个阶段：AfterMediaFound 记录信息，ProcessMedia 检测变更触发重建
+
+---
+
+## 十五、DB Schema 升级流程
+
+### 15.1 迁移入口
+
+`api/server.go:51-53`:
+```go
+if err := database.MigrateDatabase(db); err != nil {
+    log.Panicf("Could not migrate database: %s\n", err)
+}
+```
+
+每次服务启动时执行 `MigrateDatabase()`，在 `SetupDatabase()` 连接成功后、业务逻辑开始前运行。
+
+### 15.2 MigrateDatabase 调用链
+
+`api/database/database.go:173-205`:
+
+```
+MigrateDatabase(db)
+  │
+  ├─ 1. db.SetupJoinTable(&User{}, "Albums", &UserAlbums{})
+  │     设置 user_albums 为多对多连接表
+  │
+  ├─ 2. db.AutoMigrate(database_models...)
+  │     自动同步所有模型到数据库 schema
+  │
+  ├─ 3. 删除废弃列: media.date_imported（v2.1.0）
+  │     if HasColumn("date_imported") → DropColumn
+  │
+  ├─ 4. 迁移 EXIF 字段类型（v2.3.0）
+  │     migrateExifFields(db)
+  │     ├─ exposure: string "1/100" → float64 0.01
+  │     └─ flash: string "Fired" → int 1
+  │
+  ├─ 5. 修正无效 GPS 数据
+  │     migrations.MigrateForExifGPSCorrection(db)
+  │     └─ 清除 |经纬度| > 90 的无效记录
+  │
+  └─ 6. 删除废弃列: site_info.thumbnail_method（v2.5.0）
+        if HasColumn("thumbnail_method") → DropColumn
+```
+
+### 15.3 AutoMigrate 模型注册表
+
+`api/database/database.go:154-171` 定义了所有需要自动迁移的模型：
+
+```go
+var database_models []interface{} = []interface{}{
+    &models.User{},
+    &models.AccessToken{},
+    &models.SiteInfo{},
+    &models.Media{},
+    &models.MediaURL{},
+    &models.Album{},
+    &models.MediaEXIF{},
+    &models.VideoMetadata{},
+    &models.ShareToken{},
+    &models.UserMediaData{},
+    &models.UserAlbums{},
+    &models.UserPreferences{},
+    &models.FaceGroup{},
+    &models.ImageFace{},
+}
+```
+
+GORM 的 `AutoMigrate` 会：
+- 创建不存在的表
+- 添加不存在的列
+- 修改列类型（如果 GORM tag 变更）
+- **不会**删除列或修改列名
+
+### 15.4 版本迁移详解
+
+#### v2.1.0 — 删除 date_imported
+
+```go
+if db.Migrator().HasColumn(&models.Media{}, "date_imported") {
+    db.Migrator().DropColumn(&models.Media{}, "date_imported")
+}
+```
+
+旧的 `date_imported` 被 `Media.CreatedAt`（GORM 内置）替代。
+
+#### v2.3.0 — EXIF 字段类型转换
+
+**exposure 字段**（`api/database/migration_exif.go:105-158`）：
+```
+1. 清空空字符串: UPDATE media_exif SET exposure = NULL WHERE exposure = ''
+2. 批量转换 "1/100" → 0.01:
+   SELECT WHERE exposure LIKE '%/%'
+   → 按 100 条分批处理
+   → 解析分子/分母 → 计算小数
+   → Save 回数据库
+3. AutoMigrate → 修改列类型为 double
+```
+
+**flash 字段**（`api/database/migration_exif.go:160-214`）：
+```
+1. 检查 information_schema.columns.data_type
+   → 如果已是 bigint → 跳过
+2. 清空空字符串: UPDATE media_exif SET flash = NULL WHERE flash = ''
+3. 批量转换 "Fired" → 1:
+   → 使用 flashDescriptions 映射表（0x0~0x5F）
+   → 按 100 条分批处理
+   → Save 回数据库
+```
+
+#### GPS 修正（`api/database/migrations/exif_invalid_gps.go`）：
+```go
+tx.Model(&models.MediaEXIF{}).
+    Where("ABS(gps_longitude) > ?", 90).
+    Or("ABS(gps_latitude) > ?", 90).
+    Updates(map[string]interface{}{
+        "gps_latitude":  nil,
+        "gps_longitude": nil,
+    })
+```
+
+直接将无效 GPS（经度 > 90°或纬度 > 90°）置为 NULL。
+
+#### v2.5.0 — 删除 thumbnail_method
+
+```go
+if db.Migrator().HasColumn(&models.SiteInfo{}, "thumbnail_method") {
+    db.Migrator().DropColumn(&models.SiteInfo{}, "thumbnail_method")
+}
+```
+
+缩略图降采样方法选项被移除，统一使用 ImageMagick 默认算法。
+
+### 15.5 迁移特点
+
+1. **无版本号追踪**：不像 Flyway/goose 那样有 migration 版本表，而是通过 `HasColumn()` 和 `ColumnTypes()` 检测当前 schema 状态
+2. **幂等设计**：每次启动都执行，已迁移的步骤自动跳过
+3. **先迁移再启动**：MigrateDatabase 在所有业务逻辑之前运行
+4. **错误处理宽松**：迁移失败只打印日志不中断启动（除 AutoMigrate 外）
+5. **分批处理**：大数据量迁移使用 `FindInBatches`（每批 100 条）避免内存溢出
