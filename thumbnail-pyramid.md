@@ -702,3 +702,314 @@ func setupGracefulShutdown(svr *http.Server) {
 | Worker 初始化 | `api/scanner/media_encoding/executable_worker/executable_worker.go` | 17-29 |
 | exif 初始化 | `api/scanner/externaltools/exif/exif.go` | 15-41 |
 | 优雅关闭 | `api/server.go` | 140-159 |
+| **缓存清理** | | |
+| 媒体清理函数 | `api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go` | 17-65 |
+| 相册清理函数 | `api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go` | 68-136 |
+| 清理任务入口 | `api/scanner/scanner_tasks/cleanup_tasks/media_cleanup_task.go` | 9-21 |
+| 定期扫描调度器 | `api/scanner/periodic_scanner/periodic_scanner.go` | 144-174 |
+| **权限与共享** | | |
+| 媒体鉴权函数 | `api/routes/authenticate_routes.go` | 19-46 |
+| 相册鉴权函数 | `api/routes/authenticate_routes.go` | 48-69 |
+| 共享令牌校验 | `api/routes/authenticate_routes.go` | 71-155 |
+| 用户认证中间件 | `api/graphql/auth/auth.go` | 31-69 |
+| 用户-相册归属 | `api/graphql/models/user.go` | 167-180 |
+| 相册父子关系 | `api/graphql/models/album.go` | 59-81 |
+| 共享令牌模型 | `api/graphql/models/share_token.go` | 7-18 |
+| 共享令牌创建 | `api/graphql/models/actions/share_token_actions.go` | 15-103 |
+
+---
+
+## 十二、媒体缓存清理与磁盘空间回收
+
+### 12.1 清理机制概览
+
+Photoview **没有基于磁盘配额或缓存大小的主动 GC**。清理逻辑完全由**扫描事件驱动**：当扫描器发现文件系统上的文件/目录已不存在时，才删除对应的数据库记录和缓存文件。
+
+```
+扫描事件触发
+  ↓
+AfterScanAlbum 钩子
+  ↓
+CleanupMedia()    → 删除已消失媒体 + 对应缓存目录
+DeleteOldUserAlbums() → 删除已消失相册 + 对应缓存目录
+```
+
+### 12.2 媒体级清理：CleanupMedia
+
+**触发时机**：每次扫描完一个相册后，由 `MediaCleanupTask.AfterScanAlbum()` 调用。
+
+`api/scanner/scanner_tasks/cleanup_tasks/media_cleanup_task.go:13-21`:
+```go
+func (t MediaCleanupTask) AfterScanAlbum(ctx TaskContext, changedMedia []*models.Media,
+    albumMedia []*models.Media) error {
+    cleanupErrors := CleanupMedia(ctx.GetDB(), ctx.GetAlbum().ID, albumMedia)
+    // ...
+}
+```
+
+**清理逻辑**（`api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go:17-65`）：
+```
+1. 查询数据库: SELECT * FROM media WHERE album_id = ? AND id NOT IN (本次扫描到的ID列表)
+   ↓
+2. 对每条「不在磁盘上」的媒体记录:
+   a. 删除缓存目录: os.RemoveAll(media_cache/{album_id}/{media_id})
+   b. 收集 mediaID
+   ↓
+3. 批量删除数据库: DELETE FROM media WHERE id IN (待删除ID列表)
+   ↓
+4. 如果有人脸检测器，重新加载人脸数据
+```
+
+**关键点**：
+- 缓存清理粒度是**单个媒体目录**（`{album_id}/{media_id}/`），会删除该目录下所有分辨率的缓存文件
+- 数据库删除使用批量操作，不是逐条删除
+- 缓存文件删除失败不会中断流程，只记录错误
+
+### 12.3 相册级清理：DeleteOldUserAlbums
+
+**触发时机**：在 `FindAlbumsForUser()` 末尾调用（`api/scanner/scanner_user.go:222`）。
+
+`api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go:68-136`:
+```
+1. 查询数据库: 找到用户关联但本次未扫描到的相册
+   (通过 user_albums JOIN albums, WHERE album_id NOT IN (本次扫描到的相册ID))
+   ↓
+2. 对每个待删除相册:
+   删除缓存目录: os.RemoveAll(media_cache/{album_id}/)
+   ↓
+3. 事务内:
+   a. DELETE FROM user_albums WHERE album_id IN (待删除相册ID)
+   b. DELETE FROM albums WHERE id IN (待删除相册ID)
+   ↓
+4. 重新加载人脸数据
+```
+
+**关键点**：
+- 相册级清理会删除**整个相册缓存目录**（包含该相册下所有媒体的缓存）
+- 先删缓存，再删数据库关联（user_albums），最后删相册记录
+- 操作在事务内执行，保证数据库一致性
+- 但缓存删除不在事务内——如果数据库回滚，已删除的缓存文件不会恢复
+
+### 12.4 定期扫描调度器
+
+**PeriodicScanner**（`api/scanner/periodic_scanner/periodic_scanner.go`）是唯一可自动触发清理的后台机制。
+
+**工作方式**：
+```
+定时器触发（间隔由 site_info.periodic_scan_interval 控制）
+  ↓
+AddAllToQueue() → 将所有用户的根相册加入扫描队列
+  ↓
+ScannerQueue 执行扫描
+  ↓
+每个相册扫描完成后 → CleanupMedia() → 清理已消失的媒体
+每个用户扫描完成后 → DeleteOldUserAlbums() → 清理已消失的相册
+```
+
+**配置**：
+- `site_info.periodic_scan_interval`：扫描间隔（秒），0 表示禁用
+- 可在 UI 中动态调整，调用 `ChangePeriodicScanInterval()`
+- 间隔改变后立即生效（通过 `ticker_changed` 通道通知）
+
+**数据结构**：
+```go
+type periodicScanner struct {
+    ticker         *time.Ticker     // 定时器
+    tickerLocker   sync.Mutex       // 保护 ticker
+    ticker_changed chan bool        // 间隔变更通知
+    done           chan struct{}     // 关闭信号
+    db             *gorm.DB
+    scannerQueue   ScannerQueue     // 依赖扫描队列
+}
+```
+
+### 12.5 关于缓存大小限制
+
+**Photoview 当前没有实现基于磁盘配额的缓存大小限制。**
+
+代码中不存在以下功能：
+- ❌ 缓存总大小上限
+- ❌ LRU 驱逐策略
+- ❌ 按文件大小清理
+- ❌ 缓存过期时间（TTL）
+
+缓存的唯一回收途径是**源文件从磁盘消失后，下次扫描时被清理**。这意味着：
+
+1. **缓存只会增长**：只要源文件存在，缓存文件不会被主动删除
+2. **唯一的清理窗口**：修改 `PHOTOVIEW_MEDIA_CACHE` 环境变量指向的路径对应的磁盘空间时需要外部监控
+3. `MediaURL.FileSize` 字段记录了每个缓存文件的大小，但仅用于前端展示，不参与任何驱逐决策
+
+---
+
+## 十三、缓存命中路径上的权限校验
+
+### 13.1 完整请求处理链路
+
+以照片访问为例（`api/routes/photos.go:15-81`），权限校验在缓存查找**之前**执行：
+
+```
+GET /photo/{media_name}
+  ↓
+① 数据库查询 MediaURL + JOIN Media
+  ↓
+② authenticateMedia() 权限校验 ← 在此拦截
+  ↓  通过
+③ 计算 CachedPath
+  ↓
+④ os.Stat(cachedPath) 检查磁盘
+  ├─ 存在 → ServeFile
+  └─ 不存在 → ProcessSingleMedia → ServeFile
+```
+
+**顺序关键**：权限校验（②）在缓存路径计算（③）和磁盘 IO（④）之前。未授权的请求不会触发任何磁盘操作或重新编码。
+
+### 13.2 authenticateMedia 详细流程
+
+`api/routes/authenticate_routes.go:19-46`:
+
+```
+authenticateMedia(media, db, request)
+  ↓
+从 Context 获取 user（由 auth 中间件注入）
+  ├─ user != nil（已登录用户）
+  │   ↓
+  │   查询 Album: db.First(&album, media.AlbumID)
+  │   ↓
+  │   user.OwnsAlbum(db, &album)
+  │   ├─ true  → ✅ 放行
+  │   └─ false → ❌ 403 Forbidden
+  │
+  └─ user == nil（未登录，匿名访问）
+      ↓
+      shareTokenFromRequest(db, r, &media.ID, &albumID)
+      ├─ 校验通过 → ✅ 放行
+      └─ 校验失败 → ❌ 403 Forbidden
+```
+
+### 13.3 已登录用户权限校验：OwnsAlbum
+
+`api/graphql/models/user.go:167-180`:
+
+```go
+func (user *User) OwnsAlbum(db *gorm.DB, album *Album) (bool, error) {
+    filter := func(query *gorm.DB) *gorm.DB {
+        return query.Where(
+            "EXISTS (SELECT 1 FROM user_albums WHERE user_albums.user_id = ? AND user_albums.album_id = id LIMIT 1)",
+            user.ID)
+    }
+    ownedParents, _ := album.GetParents(db, filter)
+    return len(ownedParents) > 0, nil
+}
+```
+
+**逻辑**：用户只要拥有媒体所属相册的**任意祖先相册**，就视为有权限。
+
+**递归向上查找**（`api/graphql/models/album.go:59-81`）：
+```sql
+WITH recursive super_albums AS (
+    SELECT * FROM albums AS leaf WHERE id = ?
+    UNION ALL
+    SELECT parent.* FROM albums AS parent
+    JOIN super_albums ON parent.id = super_albums.parent_album_id
+)
+SELECT * FROM super_albums
+WHERE EXISTS (SELECT 1 FROM user_albums
+              WHERE user_albums.user_id = ? AND user_albums.album_id = id)
+```
+
+**举例**：
+```
+用户拥有相册 /Vacation（ID=5）
+  └── 子相册 /Vacation/Beach（ID=10）
+       └── 媒体 photo.jpg（album_id=10）
+
+访问 photo.jpg 时：
+  OwnsAlbum 查找 album_id=10 的所有父级
+  发现 ID=5 在 user_albums 中 → ✅ 有权限
+```
+
+### 13.4 匿名用户权限校验：ShareToken
+
+`api/routes/authenticate_routes.go:71-155`:
+
+```
+shareTokenFromRequest(db, request, mediaID, albumID)
+  ↓
+① 从 URL 参数获取 token: r.URL.Query().Get("token")
+  └─ 空值 → ❌ 403 "share token not provided"
+  ↓
+② 数据库查找 ShareToken: WHERE value = ?
+  └─ 未找到 → ❌ 403 "invalid share token"
+  ↓
+③ 检查过期: shareToken.Expire != nil && now.After(expire)
+  └─ 已过期 → ❌ 403 "invalid share token"
+  ↓
+④ 检查密码（如果有）:
+   从 Cookie 读取: share-token-pw-{token_value}
+   bcrypt.CompareHashAndPassword 校验
+  └─ 不匹配 → ❌ 403 "share token password invalid"
+  ↓
+⑤ 校验范围:
+   ├─ Album ShareToken: albumID 必须匹配，或 albumID 是 shareToken.AlbumID 的子相册
+   │   （递归 SQL 查找子相册）
+   └─ Media ShareToken: mediaID 必须完全匹配
+  ↓
+✅ 校验通过
+```
+
+**ShareToken 模型**（`api/graphql/models/share_token.go`）：
+
+| 字段 | 类型 | 说明 |
+|-----|------|------|
+| `Value` | string | 令牌值（24位随机字符串） |
+| `OwnerID` | int | 创建者用户 ID |
+| `Expire` | *time.Time | 过期时间（nil 永不过期） |
+| `Password` | *string | 访问密码的 bcrypt 哈希（nil 无密码） |
+| `AlbumID` | *int | 关联相册 ID（Album 类型的共享） |
+| `MediaID` | *int | 关联媒体 ID（Media 类型的共享） |
+
+**Album 共享的子相册访问**：
+当共享令牌关联的是父相册时，子相册下的媒体也可以访问。通过递归 CTE 查询验证：
+
+```sql
+WITH recursive child_albums AS (
+    SELECT * FROM albums WHERE parent_album_id = ?
+    UNION ALL
+    SELECT child.* FROM albums child
+    JOIN child_albums parent ON parent.id = child.parent_album_id
+)
+SELECT COUNT(id) FROM child_albums WHERE id = ?
+```
+
+### 13.5 认证中间件注入链
+
+```
+HTTP 请求进入
+  ↓
+auth.Middleware(db)（全局中间件）
+  ├─ 读取 Cookie: auth-token
+  ├─ DataLoader 查找用户: UserFromAccessToken.Load(cookieValue)
+  ├─ 用户存在 → AddUserToContext(ctx, user)
+  └─ 用户不存在 → ctx 中无 user（后续按匿名处理）
+  ↓
+路由处理函数
+  ↓
+auth.UserFromContext(ctx) → 获取 user（可能为 nil）
+  ↓
+authenticateMedia() / authenticateAlbum()
+```
+
+**关键**：认证中间件不会拒绝未认证的请求，它只是尽力将 user 注入 Context。权限拒绝发生在路由层的 `authenticateMedia()` / `authenticateAlbum()` 中。
+
+### 13.6 三种资源的鉴权差异
+
+| 资源 | 路由 | 鉴权函数 | 共享令牌支持 |
+|------|------|---------|------------|
+| 照片 | `/photo/{name}` | `authenticateMedia()` | ✅ Media + Album 令牌 |
+| 视频 | `/video/{name}` | `authenticateMedia()` | ✅ Media + Album 令牌 |
+| 相册下载 | `/download/album/{id}/{purpose}` | `authenticateAlbum()` | ✅ 仅 Album 令牌 |
+
+**注意**：
+- 照片和视频路由使用 `authenticateMedia()`，同时支持 Media 和 Album 类型的共享令牌
+- 相册下载路由使用 `authenticateAlbum()`，只支持 Album 类型的共享令牌
+- 所有鉴权在缓存文件访问之前完成，未授权请求不会触发磁盘 IO
