@@ -205,6 +205,78 @@ var values struct {
 2. `TimeZone`：以分钟为单位的整数，×60 转秒
 3. `GPSDateTime`：GPS 时间天然 UTC，与本地时间做差得到偏移
 
+##### mtime 时区漂移的兜底字段
+
+**对应代码段**：
+
+```go
+// scanner/externaltools/exiftool/values.go:L66-95
+// — 时间 7 级兜底链
+func (t TimeAll) TimeInLocal() time.Time {
+    for _, dateP := range []*string{
+        t.SubSecDateTimeOriginal,  // 1: 带亚秒的原始拍摄时间
+        t.SubSecCreateDate,      // 2: 带亚秒的创建时间
+        t.DateTimeOriginal,        // 3: 原始拍摄时间（无亚秒）
+        t.CreateDate,           // 4: 创建时间
+        t.TrackCreateDate,     // 5: 音轨创建时间（视频）
+        t.MediaCreateDate,      // 6: 媒体创建时间（视频）
+        t.FileModifyDate,  // 7: 文件系统 mtime（最终兜底）
+    } {
+        if dateP == nil {
+            continue
+        }
+        date := *dateP
+        if zoneIndex := strings.IndexAny(date, "+-Z"); zoneIndex >= 0 {
+            date = date[:zoneIndex]   // L85: 剥离时区后缀
+        }
+        if date, err := time.ParseInLocation(layout, date, time.UTC); err == nil {
+            return date   // 命中返回
+        }
+    }
+    return time.Time{}   // L94: 7 层全部失败 → 零值 time.Time{}
+}
+
+// values.go:L97-137
+// — 时区偏移的 4 级兜底链
+func (t TimeAll) OffsetSecs(local time.Time) (int, bool) {
+    for _, offsetP := range []*string{
+        t.OffsetTimeOriginal,   // 1: 原始偏移 "+08:00"
+        t.OffsetTime,           // 2: 通用偏移
+    } {
+        if offsetP == nil { continue }
+        if t, err := time.Parse("-07:00", *offsetP); err == nil {
+            _, offsetSecs := t.Zone()
+            return offsetSecs, true
+        }
+    }
+    if t.TimeZone != nil {
+        return *t.TimeZone * 60, true    // 3: TimeZone 是分钟整数
+    }
+    // 4: 兜底：GPSDateTime（天然 UTC）与本地时间做差
+    if t.GPSDateTime == nil { return 0, false }
+    gpsDate, err := time.Parse(layoutWithTimezone, *t.GPSDateTime)
+    if err != nil { return 0, false }
+    offset := int(local.Sub(gpsDate.UTC()).Seconds())
+    return offset, true
+}
+```
+
+**mtime 时区漂移的典型场景矩阵**：
+
+| 场景 | 命中的时间源优先级 | 命中的时区偏移优先级 | 结果 | 代码依据 |
+|------|------------------|-------------------|------|---------|
+| 现代手机/相机（写了 OffsetTimeOriginal | 1~6 任意 | 1: OffsetTimeOriginal | 正常，显示本地时区时间 | `values.go:L99-111` |
+| 旧相机（无 OffsetTime） | 1~6 任意 | 4: GPSDateTime 或全部失败 → 0, false | DateShot 存 EXIF 字面量，UI 渲染时按本地时区重解释，可能偏差 N 小时 | `values.go:L98-137` |
+| 跨时区旅行，GPS 正常写入 GPSDateTime | 1~6 任意 | 4: GPSDateTime 反推偏移 | 自动修正时区，显示正确本地时间 | `values.go:L118-135` |
+| 完全无 EXIF（扫描件、截图、旧导出图） | 7: FileModifyDate（文件系统 mtime） | 全部失败 → 0, false | 用文件 mtime，时区丢失 | `values.go:L76` + L94 |
+| NTFS → EXT4 跨 OS 拷贝 | 7: FileModifyDate | 全部失败 | mtime 的时区语义取决于拷贝工具是否做了转换 | `values.go:L76` |
+| 7 层全部解析全部失败（罕见） | 无（返回 time.Time{} 零值） | 不执行 | media.DateShot 由 scanner_media 层再兜底（文件 os.Stat().ModTime()） | `scanner/scanner_media.go DateShot 初始化 |
+
+**关键边界**：
+- `FileModifyDate` 是 exiftool 读 `os.FileInfo().ModTime()`，不是 Go 侧自己 stat，经过 exiftool 的时区处理
+- `TimeInLocal()` 用 `time.UTC` 位置解析，**DateShot 存的是"EXIF 字面量，OffsetSecs 不保证有值
+- 极端兜底：`scanner_media.go` 在 `ScanMedia()` 新建 media 时先用 `os.Stat` 的 ModTime` 赋初值，EXIF 解析成功后再覆盖（§6.2 双写机制）
+
 #### GPS — 坐标 (`values.go:L10-44`)
 
 `IsValid()` 校验：
@@ -540,6 +612,57 @@ T5: J4 完成 → in_progress = [J5 J6]   (2 个)
 - `Throttle`（`utils/throttle.go`）是**前端通知节流**（500ms 间隔），不是任务限流——避免每个文件处理完都发 WebSocket 把前端刷爆
 - 进程级限流只有 `max_concurrent_tasks` 这一个开关
 
+#### 8.3.2.1 长任务硬退出窗口的代码位置
+
+当收到 SIGINT/SIGTERM（如 `docker stop`、`systemctl stop`、Ctrl+C）时，长任务退出有**两阶段硬时间窗口**：
+
+**对应代码段**：
+
+```go
+// server.go:L140-160 — setupGracefulShutdown
+func setupGracefulShutdown(svr *http.Server) {
+    c := make(chan os.Signal, 1)
+    signal.Notify(c, os.Interrupt, syscall.SIGTERM)  // 只响应这两个信号
+
+    go func() {
+        <-c
+        log.Println("Shutting down Photoview...")
+
+        // ┌─ 阶段 1：扫描器优雅关闭（无硬超时，靠内部 ctx 传播）─────┐
+        periodic_scanner.ShutdownPeriodicScanner()   // 停止周期性调度
+        scanner_queue.CloseScannerQueue()            // 关闭队列入口
+
+        // ┌─ 阶段 2：HTTP server 硬超时 1 分钟 ──────────────────┐
+        ctx, cancel := context.WithTimeout(context.Background(), time.Minute)  // L147: 1 分钟硬窗口
+        defer cancel()
+
+        if err := svr.Shutdown(ctx); err != nil {    // L154: 超过 1min → Shutdown 返回 error
+            log.Printf("Server shutdown error: %s", err)
+            // ❗ 注意：Shutdown 返回 error 后，main goroutine 会从
+            // ListenAndServe() 解除阻塞并退出进程
+            // → 正在跑的 worker goroutine 被 runtime.Goexit 杀死
+            // → CGO 调用（imagick、dlib face detection）中的 C 代码可能泄漏
+        } else {
+            log.Println("Shutdown complete")
+        }
+    }()
+}
+```
+
+**两阶段时间窗口边界**：
+
+| 阶段 | 触发条件 | 超时时间 | 行为 | 代码位置 |
+|------|---------|---------|------|---------|
+| 阶段 0（隐式） | 收到信号前 | 无限期 | scanner worker 正常处理当前文件，无取消 | — |
+| 阶段 1 | `CloseScannerQueue()` 调用后 | **无硬超时**，但每个 Task 会检查 `ctx.Done()` | up_next 队列中的任务不再启动；已运行 Task 在下一次 `ctx.Done()` 检查点退出（通常文件级） | `scanner_queue/queue.go CloseScannerQueue()` |
+| 阶段 2 | `svr.Shutdown(ctx)` 调用后 | **1 分钟硬上限** | 等待所有 HTTP 连接关闭；若 1min 仍未返回（正在跑的 worker 卡在 CGO 中）→ Shutdown error，进程整体退出 | `server.go:L147` 60s |
+| 阶段 3（最硬） | 容器 runtime / systemd | 通常额外 10s | SIGKILL 强杀进程，C 内存、CGO 状态一律丢弃 | Docker/systemd 配置 |
+
+**关键边界**：
+- `CloseScannerQueue()` 的关闭只影响**队列调度层**——不接受新任务，但不主动杀已运行的 goroutine
+- 真正的**硬杀死机制是整个进程退出**（阶段 2 的 1min 超时后或阶段 3），这是 Go runtime 级别的 goroutine 销毁
+- 正在 `imagick.ReadImage()` 或 `dlib` C 代码中的 goroutine **不会响应 `ctx.Done()`**——只能靠整个进程被 SIGKILL 来中断，此时会触发 §11.5 场景 2 的全局泄露
+
 ---
 
 #### 8.3.3 同文件 EXIF 修改后 hash 仍不变的边界
@@ -754,6 +877,83 @@ if highResURL == nil {
 | `media.date_shot` | **不回写**。只有 `newMedia=true` 时 EXIF 解析才可能更新 `DateShot`（`exif_task.go:L66-71`） | `exif_task.go:L19-21` |
 
 **唯一的强制重扫路径**：通过 GraphQL 调用 `ProcessSingleMedia`（`scanner_media.go:L77-93`），该函数绕过 `newMedia` 判断直接走完整 Task 管道。但此 API 不会自动触发，需手动调用。
+
+##### partial-invalidate 与全清在 admin 后台的共存路径
+
+Photoview **没有独立的 admin 后台 UI**（只有 GraphQL API），缓存失效通过以下两条路径共存：
+
+**路径 A — 自动 partial-invalidate（扫描时触发）**
+
+```
+扫描流程（scanner_user.go）
+  ├─ CleanupMedia(db, albumId, albumMedia)   // cleanup_tasks/cleanup_media.go:L17-65
+  │   ├─ SELECT * FROM media WHERE album_id=? AND NOT id IN (当前磁盘存在的)
+  │   ├─ 对每个已删除媒体: os.RemoveAll(cachePath)          ← 部分清除（只清不存在的）
+  │   └─ DELETE FROM media WHERE id IN (已删除IDs)
+  │
+  └─ DeleteOldUserAlbums(db, scannedAlbums, user)  // cleanup_media.go:L68-136
+      ├─ SELECT albums NOT IN (当前磁盘存在的)
+      ├─ 对每个已删除 album: os.RemoveAll(cacheAlbumPath)    ← 部分清除（只清不存在的）
+      └─ DELETE FROM user_albums, albums WHERE id IN (已删除IDs)
+```
+
+**路径 B — 手动全清（用户删目录触发）**
+
+```
+用户操作：删除用户相册目录（GraphQL Mutation: deleteUserAlbumPath）
+  → user.go resolver:
+     ├─ 事务内删除 DB 记录（user_albums、album、media、media_exif、media_url）
+     ├─ clearCacheAndReloadFaces(db, deletedAlbumIDs)     // user.util.go:L36-54
+     │   ├─ 对每个 deletedAlbumID:
+     │   │   os.RemoveAll(path.Join(MediaCachePath(), albumID))  ← 全清（整个目录树）
+     │   └─ face_detection.ReloadFacesFromDatabase(db)
+     └─ 完成后目录下所有缓存（缩略图/高清图/face数据）全部删除
+```
+
+**对应代码段**：
+
+```go
+// graphql/resolvers/user.util.go:L36-54 — 全清路径
+func clearCacheAndReloadFaces(db *gorm.DB, deletedAlbumIDs []int) error {
+    if deletedAlbumIDs != nil {
+        for _, id := range deletedAlbumIDs {
+            cacheAlbumPath := path.Join(utils.MediaCachePath(), strconv.Itoa(id))
+            if err := os.RemoveAll(cacheAlbumPath); err != nil {  // 全清：删除整个 album 缓存目录
+                return err
+            }
+        }
+        if face_detection.GlobalFaceDetector != nil {
+            if err := face_detection.GlobalFaceDetector.ReloadFacesFromDatabase(db); err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+
+// scanner/scanner_tasks/cleanup_tasks/cleanup_media.go:L17-65 — partial-invalidate 路径
+func CleanupMedia(db *gorm.DB, albumId int, albumMedia []*models.Media) []error {
+    // 只删除磁盘已不存在的 media 对应的缓存
+    query := db.Where("album_id = ?", albumId)
+    if len(albumMedia) > 0 {
+        query = query.Where("NOT id IN (?)", albumMediaIds)
+    }
+    // 找到 DB 有但磁盘没有的 → 删缓存 + 删 DB 记录
+}
+```
+
+**两种路径的共存矩阵**：
+
+| 操作 | partial-invalidate（自动） | 全清（手动触发） | 代码位置 |
+|------|--------------------------|----------------|---------|
+| 删除单张图片文件 | ✅ 下次扫描时 CleanupMedia 清除该 media 缓存 | — | `cleanup_media.go:L17-65` |
+| 删除整个目录 | ✅ 下次扫描时 DeleteOldUserAlbums 清除 | ✅ GraphQL deleteUserAlbumPath 立即全清 | `cleanup_media.go:L68-136` + `user.util.go:L36-54` |
+| 替换文件内容（同路径） | ❌ 不触发（PathHash 不变） | ❌ 不触发 | — |
+| 修改 Sidecar XMP | ✅ 自动检测 SideCarHash 变化 → 重新编码 | — | `sidecar_task.go:L68-125` |
+| 修改 EXIF（内嵌） | ❌ 不触发 | ❌ 不触发（除非手动 ProcessSingleMedia） | — |
+| 用户删除相册路径 | — | ✅ 立即全清 album 缓存目录 | `user.util.go:L36-54` |
+
+**注意**：两种路径是**幂等的**——全清后再扫描时，partial-invalidate 自然发现无记录可清；partial-invalidate 后再全清，`os.RemoveAll` 对不存在的目录返回 nil（幂等）。
 
 ---
 
@@ -1040,6 +1240,79 @@ func MigrateForExifGPSCorrection(db *gorm.DB) error {
 
 **结论**：GPS 缺失 = 地图上不可见，仅此而已。所有其他功能（相册、时间线、搜索、分享）完全不受影响。
 
+#### 10.5.1 移动端 GPS fallback 显示位置的字段名
+
+前端 UI 层对 GPS 的展示有**三层映射**，从 DB 到 UI 经历两次字段名变换：
+
+**对应代码段**：
+
+```go
+// 第 1 层：DB 列名 → GORM Model 字段名
+// models/media_exif.go:L23-24
+type MediaEXIF struct {
+    // ...
+    GPSLatitude  *float64   // DB: gps_latitude
+    GPSLongitude *float64   // DB: gps_longitude
+}
+
+// 第 2 层：GORM Model → GraphQL Schema 字段名
+// graphql/resolvers/media.graphql:L23-28, L57-58
+type Coordinates {
+    "GPS latitude in degrees"
+    latitude: Float!       // 从 GPSLatitude 映射
+    "GPS longitude in degrees"
+    longitude: Float!      // 从 GPSLongitude 映射
+}
+
+type MediaEXIF {
+    // ...
+    "GPS coordinates of where the image was taken"
+    coordinates: Coordinates   // 聚合字段（不是 latitude/longitude 直接暴露）
+}
+
+// models/media_exif.go:L35-44 — Coordinates() 方法做 nil→nil 转换
+func (exif *MediaEXIF) Coordinates() *Coordinates {
+    if exif.GPSLatitude == nil || exif.GPSLongitude == nil {
+        return nil          // GPS 缺失时返回 nil（不是零值对象）
+    }
+    return &Coordinates{
+        Latitude:  *exif.GPSLatitude,
+        Longitude: *exif.GPSLongitude,
+    }
+}
+```
+
+```tsx
+// 第 3 层：GraphQL → React UI 字段名
+// ui/src/components/sidebar/MediaSidebar/MediaSidebarExif.tsx:L73-77
+const coords = media.exif.coordinates    // GraphQL 的 coordinates 字段
+if (!isNil(coords)) {
+    exif.coordinates =                   // UI 侧也叫 coordinates
+        `${Math.round(coords.latitude * 1000000) / 1000000}, ${
+           Math.round(coords.longitude * 1000000) / 1000000}`
+    // 格式化为 "39.9042, 116.4074" 字符串
+}
+
+// MediaSidebarExif.tsx:L156 — UI 显示名
+coordinates: t('sidebar.media.exif.name.coordinates', 'Coordinates'),
+```
+
+**三层字段名对照表**：
+
+| 层级 | 字段名 | 类型 | GPS 缺失时的值 | 代码位置 |
+|------|--------|------|--------------|---------|
+| DB 列 | `gps_latitude` / `gps_longitude` | `*float64` (nullable) | `NULL` | `models/media_exif.go:L23-24` |
+| GORM Model | `GPSLatitude` / `GPSLongitude` | `*float64` | `nil` | 同上 |
+| GraphQL Schema | `coordinates` | `Coordinates` (nullable) | `nil`（整个对象为空） | `media.graphql:L57-58` |
+| GraphQL resolver | `Coordinates()` 方法 | `*Coordinates` | `nil` | `media_exif.go:L35-44` |
+| React 组件 | `media.exif.coordinates` | `{latitude, longitude}` | `undefined`（isNil 过滤掉） | `MediaSidebarExif.tsx:L73-77` |
+| UI 显示键 | `coordinates` | `string` ("39.9042, 116.4074") | 不渲染（被 exifKeys 过滤掉） | `MediaSidebarExif.tsx:L156` |
+
+**关键 fallback 行为**：
+- **没有 fallback 到其他位置源**：GPS 坐标只来自 EXIF 中的 `GPSLatitude`/`GPSLongitude`，不存在"用 IP 定位"、"用 WiFi 定位"等替代源
+- **移动端（响应式）行为一致**：`MediaSidebarExif.tsx` 组件在桌面和移动端渲染同一个 `coordinates` 字段，无区分
+- **地图视图 vs 侧边栏的区别**：侧边栏显示 `coordinates` 字符串（需要 `media.exif` 非空且 `coordinates` 非空）；地图视图用 `MyMediaGeoJSON` resolver 直接 SQL 查 `gps_latitude IS NOT NULL`，不经过 GraphQL `Coordinates()` 方法
+
 ---
 
 ## 十一、内存占用上限和大文件分片读取
@@ -1198,6 +1471,43 @@ func (t VideoMetadataTask) AfterMediaFound(...) error {
 ```
 
 **副作用提醒**：超时时间越大，"损坏文件卡住 worker"的概率也越大——如果有一个 ffprobe 读坏文件死循环，超时前该 worker 被占满无法处理其他任务。所以不要盲目调到 300s 以上。
+
+#### 11.4.2 不同 codec 的 ffprobe 超时偏差
+
+ffprobe 对不同编解码器的元数据解析路径差异很大，导致同一超时值在不同 codec 下的"安全裕度"完全不同：
+
+**对应代码段**：
+
+```go
+// scanner/externaltools/ffprobe/... — ffprobe 调用入口
+// exec.CommandContext(ctx, "ffprobe", "-print_format", "json", "-show_format", "-show_streams", mediaPath)
+// ctx 超时 = MediaProbeTimeout()，对所有 codec 一视同仁
+// ❗ 没有按 codec/vcodec 选择不同超时的逻辑
+```
+
+**各 codec 的解析特征与超时偏差**：
+
+| 编解码器 | 容器 | moov/索引特征 | ffprobe 解析路径 | 同等文件大小下的相对耗时 | 5s 超时安全裕度 |
+|---------|------|-------------|-----------------|----------------------|--------------|
+| H.264 (AVC) | MP4 (faststart) | moov 在文件头 | 读前几 KB | 基准 1× | ✅ 极安全（<200ms） |
+| H.264 (AVC) | MP4 (非 faststart) | moov 在文件尾 | seek 到尾部 | ~5× 基准 | ⚠️ 中等（1~3s） |
+| H.265 (HEVC) | MP4 | moov 在头/尾 | 同 H.264，但 HEVC 解码参数集更复杂 | ~1.2× H.264 | ✅ 安全 |
+| H.265 (HEVC) | MKV/WebM | EBML 级联索引 | 顺序扫描 Cue 树 | ~3~5× MP4 | ⚠️ 中等 |
+| VP9 | WebM | Cue 在尾部 | seek + 扫描 | ~2~4× MP4 | ⚠️ 中等 |
+| AV1 | MP4/MKV | ISOBMFF 或 EBML | AV1 OBU 解析更重 | ~1.5~3× H.264 | ⚠️ 中等 |
+| ProRes | MOV | atoms 分散，单帧大 | 需遍历更多 atoms | ~10~50× H.264 | ❌ 不安全（4K 10s+） |
+| DNxHR/DNxHD | MXF/MOV | KLV 结构，索引庞大 | 需解析完整 KLV 头 | ~8~30× H.264 | ❌ 不安全 |
+| XAVC / XAVC-S | MP4/MXF | SONY 私有扩展 + 标准 atoms | 标准 + 私有 tag 双重解析 | ~3~10× H.264 | ⚠️~❌ |
+| BRAW | BRAW (CinemaDNG 变体) | Blackmagic 私有容器 | 需要 BRAW SDK 或 ffprobe 实验性支持 | ~20~100× H.264 | ❌ 极不安全 |
+| R3D | RECODE (RED) | RED 私有容器 | ffprobe 支持有限 | ~10~50× H.264 | ❌ 不安全 |
+
+**关键发现**：
+- **5s 默认值只对消费级 codec（H.264/H.265/VP9 + faststart MP4）安全**
+- **专业级 codec（ProRes/DNxHR/BRAW/R3D）在 5s 内大概率超时**
+- Photoview 代码中**没有按 codec 区分超时的逻辑**——`MediaProbeTimeout()` 是全局单一值
+- ffprobe 也不提供"先快速检测 codec 再决定解析深度"的 API
+
+**建议**：如果库中有专业级 codec，根据上表最大 codec 的耗时档位配置 `PHOTOVIEW_MEDIA_PROBE_TIMEOUT`，而非按文件大小。一个 500MB 的 ProRes 文件比 5GB 的 H.264 文件更容易超时。
 
 ---
 
@@ -1359,6 +1669,130 @@ RSS
   for: 3h
   labels:
     severity: critical
+```
+
+#### 11.5.2 cgo 侧泄露的工具链：valgrind 与 leaks
+
+Go runtime 的 pprof 无法直接看到 CGO 分配的 C 内存，需要使用操作系统级原生工具。
+
+**对应代码段**（构建配置决定是否可调试）：
+
+```bash
+# scripts/set_compiler_env.sh:L28 — 编译时 CGO 必须开启
+CGO_ENABLED="1"
+
+# Dockerfile:L59 — 容器构建也强制 CGO
+ENV CGO_ENABLED=1
+
+# README.md:L386 — macOS 构建需要特殊 C 编译器标志
+export CGO_CFLAGS_ALLOW=-Xpreprocessor
+```
+
+**工具链 A — valgrind（Linux）**
+
+```bash
+# 运行方式：直接在 valgrind 下启动 Photoview
+valgrind --leak-check=full \
+         --show-leak-kinds=all \
+         --track-origins=yes \
+         --suppressions=go.supp \
+         ./photoview
+
+# 输出示例（当触发 §11.5 场景 1 泄露时）：
+# ==12345== 288,000,000 bytes in 1 blocks are definitely lost in loss record 1 of 1
+# ==12345==    at 0x4C2FB0F: malloc (in /usr/lib/valgrind/vgpreload_memcheck-amd64-linux.so)
+# ==12345==    by 0x1A3B4C5: MagickNewImage (in /usr/lib/x86_64-linux-gnu/libMagickCore-7.Q16.so)
+# ==12345==    by 0x1A3B500: NewMagickWand (in /usr/lib/x86_64-linux-gnu/libMagickWand-7.Q16.so)
+# ==12345==    by 0xABCDE: _cgo_123456 (magickwand.go:102)  ← createWandFromFile
+
+# 注意事项：
+# 1. valgrind 会把 Go runtime 的内部内存管理当成"泄露"（误报率极高）
+# 2. 必须用 suppression 文件过滤 Go runtime 的噪音
+# 3. 性能下降 20~50×，不适合线上，只适合开发/测试环境
+# 4. 只能看到 C 层调用栈，Go 层调用栈需结合 runtime.Callers 手动关联
+```
+
+**Go runtime 误报抑制文件** (`go.supp`)：
+```
+# 过滤 Go runtime 自身的"泄露"
+{
+   go_runtime_leak
+   Memcheck:Leak
+   match-leak-kinds: all
+   fun:runtime.*
+}
+```
+
+**工具链 B — leaks（macOS）**
+
+```bash
+# macOS 自带的 leaks 工具，可 attach 到运行中的进程
+leaks <pid>
+
+# 输出示例：
+# Process 12345: 3 zones, 288MB total
+# 3 leaks for 288,000,000 bytes (100.0%)
+# Leak: 288,000,000 bytes
+#   Call stack: [malloc → MagickNewImage → NewMagickWand → _cgo_XXX → createWandFromFile]
+
+# 优势：无需重启进程，可反复 attach 检查
+# 劣势：macOS 环境下 CGO 编译需要额外配置（CGO_CFLAGS_ALLOW）
+```
+
+**工具链 C — AddressSanitizer (ASan)**
+
+```bash
+# 编译时注入 ASan（需要重新编译 C 依赖和 Go 程序）
+CGO_CFLAGS="-fsanitize=address -g" \
+CGO_LDFLAGS="-fsanitize=address" \
+go build -o photoview .
+
+# 运行后，ASan 会在 C 内存泄露时立即报告：
+# ==12345==ERROR: LeakSanitizer: detected memory leaks
+# Direct leak of 288 byte(s) in 1 object(s) allocated from:
+#     #0 malloc .../asan_malloc_linux.cc:146
+#     #1 MagickNewImage .../libMagickCore-7.Q16.so
+#     #2 _cgo_XXX magickwand.go:102
+
+# 优势：精确定位到 C 源文件行号，误报少
+# 劣势：需要重新编译所有 C 依赖（ImageMagick、dlib 等），且 Go 1.21+ 才完善支持
+```
+
+**工具链 D — runtime/metrics（Go 1.21+，纯 Go 侧）**
+
+```go
+// 代码中可添加的诊断片段（需改代码）
+import "runtime/metrics"
+
+func readCGOMemoryEstimate() int64 {
+    const name = "/cgo/go-to-c-calls:calls"  // Go→C 调用次数
+    sample := []metrics.Sample{{Name: name}}
+    metrics.Read(sample)
+    // 注意：Go 没有直接暴露 CGO 分配的内存量
+    // 只能通过 /cgo/go-to-c-calls 计数间接判断
+    // 真正的 C 内存量仍然只能从 OS 级指标获取
+    return 0 // 无法直接获取
+}
+```
+
+**各工具链对比**：
+
+| 工具 | 平台 | 精度 | 性能影响 | 是否需改代码 | 是否需重编译 | 适用场景 |
+|------|------|------|---------|------------|------------|---------|
+| valgrind --leak-check | Linux | 高（定位到 C 函数） | 20~50× 慢 | ❌ 不需要 | ❌ 不需要 | 开发环境复现泄露 |
+| leaks | macOS | 中（定位到 C 函数） | <2× 慢 | ❌ 不需要 | ❌ 不需要 | macOS 开发环境快速检查 |
+| AddressSanitizer (ASan) | Linux/macOS | 最高（定位到 C 源文件行） | 2~3× 慢 | ❌ 不需要 | ✅ 需要 | 精确定位泄露代码行 |
+| runtime/metrics | 跨平台 | 低（只有调用次数） | 无 | ✅ 需要加代码 | ❌ 不需要 | 生产环境间接判断 |
+| pprof + RSS 差值 | 跨平台 | 低（只能确认"有泄露"） | 无 | ❌ 不需要 | ❌ 不需要 | 线上排查第一轮 |
+
+**针对 §11.5 场景 1（createWandFromFile 泄露）的推荐排查流程**：
+
+```
+1. 线上发现：RSS 线性增长 → pprof 确认 Go 堆正常 → 确认是 C 内存泄露
+2. 本地复现：准备一批损坏图片文件 → valgrind 启动 → 触发扫描 → 观察 leak report
+3. 精确定位：ASan 重编译 → 同上触发 → 确认 magickwand.go:102 NewMagickWand() 后 ReadImage 失败路径
+4. 修复：在 ReadImage 失败分支加 defer wand.Destroy() 或 return 前 Destroy
+5. 验证：valgrind / leaks 再次运行 → 确认泄露消失
 ```
 
 ---
