@@ -421,6 +421,44 @@ server.go:56 Initialize
 
 运行时并发数修改：`ChangeScannerConcurrentWorkers()`（`queue.go:L92-98`）支持热更新，新值在下一次 `processQueue` 时生效。
 
+#### 8.3.1 max_concurrent_tasks 动态调整的生效时序
+
+完整的调用链与时序：
+
+```
+用户在前端修改并发数
+  │
+  ▼
+GraphQL Mutation: setScannerConcurrentWorkers (resolvers/scanner.go:L81-108)
+  ├─ 校验 workers >= 1, SQLite 时必须 == 1
+  ├─ UPDATE site_info SET concurrent_workers = ?   ← 写 DB
+  ├─ SELECT * FROM site_info                        ← 重新读取确认
+  └─ scanner_queue.ChangeScannerConcurrentWorkers(N)
+       │
+       ├─ mutex.Lock()
+       ├─ settings.max_concurrent_tasks = N        ← 仅改内存字段
+       └─ mutex.Unlock()
+       │
+       ▼  生效点：下一次 processQueue 被唤醒时
+processQueue (queue.go:L136-192)
+  ├─ mutex.Lock()
+  ├─ maxJobs := queue.settings.max_concurrent_tasks   ← 读取最新值
+  └─ for len(in_progress) < maxJobs && len(up_next) > 0:
+         启动新 goroutine
+```
+
+**生效边界说明**：
+
+| 场景 | 行为 |
+|------|------|
+| 调大 N（如 3→6） | 正在运行的 3 个 job 不受影响；后续 `processQueue` 唤醒时最多再启动 3 个补到 6 |
+| 调小 N（如 6→3） | 正在运行的 6 个 job **不会被终止**，继续跑完；之后 `processQueue` 不再启动新 job，直到 `in_progress` 降到 3 以下 |
+| 运行中瞬时值 | 若 `in_progress` 已超过新 maxJobs（调小时），新 maxJobs 仅作为调度上限，不强制回收已启动 goroutine |
+
+**关键代码**：
+- `processQueue` 在 `queue.go:L139` 读取 `maxJobs`，每次唤醒都会重读，所以改动是即时生效到调度逻辑的
+- 正在运行的 goroutine（`queue.go:L149-166`）没有取消机制，只能跑完自然退出
+
 ---
 
 ## 九、缓存命中与失效
@@ -512,6 +550,56 @@ if highResURL == nil {
 
 ---
 
+#### 9.3.1 同目录改名重传的假更新边界
+
+`PathHash = MD5(media.Path)` 机制（`models/media.go:L39-44`）在以下场景会产生"假命中"：
+
+```
+场景 A — 原地替换文件（路径不变，内容变了）：
+  /album/IMG_0001.CR2  (旧的)   → MD5 = hash("/album/IMG_0001.CR2") = H1
+  用户删除旧文件，拷入同名新文件
+  /album/IMG_0001.CR2  (新的)   → MD5 = hash("/album/IMG_0001.CR2") = H1
+
+  结果：ScanMedia() 查 DB 命中 H1 → newMedia=false → 所有 AfterMediaFound Task
+       （包括 ExifTask、SidecarTask、ProcessPhotoTask）全部跳过。
+       缩略图/高清图/EXIF 全部停留在旧版本。
+```
+
+```
+场景 B — 同目录改名（内容不变，路径变了）：
+  /album/IMG_0001.CR2              → MD5 = H1
+  用户 mv IMG_0001.CR2 Vacation_001.CR2
+  /album/Vacation_001.CR2          → MD5 = H2
+
+  结果：ScanMedia() 查不到 H2 → 被当作新媒体完整重新扫描一遍（冗余处理），
+       同时旧 H1 对应的 media 记录留在 DB，CleanupMedia 下次扫描时清理。
+```
+
+**设计权衡**：
+- 只对路径做 hash，不对内容做 hash（避免扫描时读几 MB/几十 MB 文件内容）
+- 换内容不换路径 = 漏更新（假阴性命中）
+- 换路径不换内容 = 重复处理（假阳性未命中）
+
+**绕过方式（唯一的"内容变更感知"机制）**：只有 Sidecar XMP 文件有 `SideCarHash`（内容 MD5）——`sidecar_task.go:L72-83` 检测到 `.xmp` 文件内容变化时，会强制重新编码缩略图和高清图。原始 RAW/JPEG 的内容变更没有同类机制。
+
+---
+
+#### 9.3.2 缓存命中后的字段修改回写失效
+
+缓存命中分两段：DB 记录命中 + 磁盘文件命中。不同字段的修改回写策略不同：
+
+| 字段/模块 | 缓存命中（DB有+磁盘有）时的回写策略 | 代码位置 |
+|-----------|-----------------------------------|---------|
+| `MediaEXIF` (所有 EXIF 字段) | **不回写**。`ExifTask.AfterMediaFound` 对 `!newMedia` 直接 return（`exif_task.go:L19-22`），EXIF 内容变更永远不会被重新解析 | `exif_task.go:L20` |
+| `MediaURL` 缩略图/高清图（内容） | **不回写**。`ProcessPhotoTask.ProcessMedia` 查到 DB 有记录且 `os.Stat` 存在就 return，不检查原始文件 mtime/内容哈希 | `process_photo_task.go:L31-46, L69-82, L110-123` |
+| `MediaURL` 缩略图/高清图（尺寸/文件大小） | **部分回写**。仅 Sidecar 变更时（SideCarHash 变了），`generateSaveHighResJPEG` 会用 `tx.Save(mediaURL)` 更新 width/height/file_size | `processing_functions.go:L30-53` |
+| `SideCarPath` / `SideCarHash` | **回写**。SidecarTask.ProcessMedia 每次都重新 hash XMP 比对，变了就 `Save(media)` 并重新编码 | `sidecar_task.go:L68-125` |
+| `media.date_shot` | **不回写**。只有 `newMedia=true` 时 EXIF 解析才可能更新 `DateShot`（`exif_task.go:L66-71`） | `exif_task.go:L19-21` |
+
+**唯一的强制重扫路径**：通过 GraphQL 调用 `ProcessSingleMedia`（`scanner_media.go:L77-93`），该函数绕过 `newMedia` 判断直接走完整 Task 管道。但此 API 不会自动触发，需手动调用。
+
+---
+
 ## 十、损坏文件回退路径
 
 ### 10.1 七重前置过滤
@@ -585,6 +673,58 @@ SaveEXIF(tx, media)
 │
 └─ 后续写 DB 操作
 ```
+
+### 10.4 半解析半失败的字段保留策略
+
+当文件"部分损坏"——exiftool 能返回部分字段但其他字段缺失或异常——时，各层的保留策略不同：
+
+#### 10.4.1 EXIF 字段级：nil 值丢弃策略
+
+`PhotoMeta` / `TimeAll` / `GPS` 所有字段均为指针类型（`*string`、`*int64`、`*float64`、`*time.Time`）。exiftool 的 JSON 输出对不存在的字段**不输出 key**，`encoding/json` 解码时保持该字段为 `nil`。
+
+| 场景 | 保留策略 | 代码实现 |
+|------|---------|---------|
+| 字段缺失 | 留 `nil`，不写 DB | `values.go` 所有字段为指针 |
+| 数值 NaN / ±Inf | `PhotoMeta.SanitizeFloats()` 置 `nil` | `values.go:L153-167` |
+| GPS 越界（纬度>90 等） | `GPS.IsValid()` 不通过，整体丢弃 | `values.go:L17-35` |
+| 时间字符串解析失败 | `TimeInLocal()` 试下一个优先级字段，全失败则返回零值 time.Time{} → DateShot 不赋值 | `values.go:L67-95` |
+| 时区偏移解析失败 | 试下一个优先级策略，全失败则 OffsetSecShot 不赋值 | `values.go:L98-137` |
+
+**结果**：`MediaEXIF` 写入 DB 时，合法字段正常入库，非法/缺失字段为 `NULL`——这是一种"部分成功"模式，而不是整体失败。
+
+#### 10.4.2 流程级：全有或全无
+
+但更高层的事务边界使得"部分成功"其实是"全有或全无"：
+
+```
+┌─ DatabaseTransaction (media_scan.go:L22-33) ───────────────┐
+│                                                             │
+│  ScanMedia()          → INSERT media                        │
+│  AfterMediaFound()    → 逐个 Task:                           │
+│    ExifTask           → INSERT media_exif                   │
+│    SidecarTask        → UPDATE media (sidecar hash/path)    │
+│    ...                                                        │
+│                                                             │
+│  ProcessMedia()       → INSERT media_url (缩略图等)          │
+│  AfterProcessMedia()  → ...                                  │
+│                                                             │
+│  任何一步 err != nil → ROLLBACK，所有上面的写入全部撤销     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**冲突点**：
+- EXIF 层面是字段级的软失败（nil = 跳过该字段）
+- 但 DatabaseTransaction 层面是文件级的硬失败（任何 Task 返回 error = 整张图所有 DB 记录回滚）
+- 两者之间的衔接：`ExifTask.AfterMediaFound` **吞掉了 SaveEXIF 的错误**（只打 log.Warn，不 return err），所以 EXIF 解析失败不会触发整个文件的 Rollback
+
+**最终保留矩阵**：
+
+| 失败位置 | 结果 |
+|---------|------|
+| EXIF 某字段缺失/非法 | 该字段为 NULL，其他 EXIF 字段正常入库 |
+| EXIF 整体解析失败（exiftool 崩溃/文件损坏） | 整条 media_exif 不创建，media 记录保留（因为 ExifTask 吞了错误），缩略图/高清图等后续 Task 正常执行 |
+| 缩略图生成失败 | 整个事务回滚，包括已写入的 media 和 media_exif 记录 |
+| Sidecar hash 写入失败 | 整个事务回滚 |
 
 ---
 
@@ -661,6 +801,67 @@ type EncodeMediaData struct {
 | 任务取消 | `context.Done()` 检查贯穿所有 Task 钩子 | `scanner_tasks.go:L39-43, L61-64` 等 |
 
 每个 Task 执行前都会检查 `ctx.Done()`，支持用户在前端取消扫描任务。
+
+### 11.4 ffprobe 5s 超时按视频规模的分级建议
+
+`PHOTOVIEW_MEDIA_PROBE_TIMEOUT`（`utils/environment_variables.go:L87-95`）默认 5 秒是针对"视频元数据读取"（不是转码），ffprobe 通常只需读取文件头的 moov atom 即可获得时长/分辨率/码率等信息。
+
+但实际耗时受以下因素影响，需要分级调整：
+
+| 视频规模 | 典型场景 | 建议超时 | 原因 |
+|---------|---------|---------|------|
+| 短视频（<1 分钟，手机拍摄） | MP4/H.264，moov 在文件头 | 3-5s（默认） | 读头部几 KB，几乎瞬时 |
+| 中视频（1-30 分钟） | 相机拍摄 MOV/MP4 | 5-15s | 文件大时 moov 可能在尾部，ffprobe 需 seek |
+| 长视频（>30 分钟，电影级） | MKV/AVI，多个音轨字幕 | 15-60s | 容器解析复杂，多轨遍历 |
+| RAW 视频 / 高码率（>100Mbps） | ProRes, DNxHR, BRAW | 30-120s | 单帧体积大，解析元数据也需要解部分码流 |
+| 远程 / 网络挂载（NFS/SMB） | 任何规模 | 以上 ×2~×5 | 网络延迟 + seek 放大 |
+
+**超时后的行为**：ffprobe 进程被 `exec.CommandContext` 的 cancel 杀死（`scanner/externaltools/ffprobe/...`），`VideoMetadataTask.AfterMediaFound` 返回 error → 整个文件事务回滚（参见 10.4.2 流程级全有或全无），该视频在下一次扫描时会被重试。
+
+**注意**：超时是**单文件级**的，不会影响整体扫描队列——超时的那个文件被 `ScannerError` 记录后 `continue` 处理下一个。
+
+### 11.5 imagick.Destroy 未调用的泄露场景
+
+`imagick.MagickWand` 封装的是 ImageMagick C 库资源，**不经过 Go GC**，必须显式 `Destroy()` 释放。
+
+#### 已正确实现的场景（都有 defer）
+
+| 函数 | Destroy 位置 |
+|------|-------------|
+| `EncodeJpeg` | `magickwand.go:L40` `defer wand.Destroy()` |
+| `GenerateThumbnail` | `magickwand.go:L62` `defer wand.Destroy()` |
+| `IdentifyDimension` | `magickwand.go:L89` `defer wand.Destroy()` |
+| Benchmark 测试 | `perf_test.go:L55` `defer mw.Destroy()` |
+
+#### 会导致泄露的场景
+
+**场景 1：`createWandFromFile` 中 ReadImage 失败**（`magickwand.go:L97-106`）
+
+```go
+func (cli *MagickWand) createWandFromFile(inputPath string) (*imagick.MagickWand, error) {
+    wand := imagick.NewMagickWand()    // ← C 资源已分配
+
+    if err := wand.ReadImage(inputPath); err != nil {
+        return nil, fmt.Errorf(...)    // ← BUG: wand 没 Destroy 就 return
+    }
+    return wand, nil
+}
+```
+
+调用方的 `defer wand.Destroy()` 只有拿到 wand 才会执行，但 ReadImage 失败时 wand 已经被 NewMagickWand() 分配却**从未被 Destroy**。每次损坏文件触发这个路径就泄露一个 MagickWand（几十 MB 到几百 MB 级的 C 堆内存，取决于图片尺寸）。
+
+**场景 2：Terminate() 未调用导致进程退出时泄露**
+
+`MagickWand.Terminate()`（`magickwand.go:L26-29`）调用 `imagick.Terminate()` 释放 ImageMagick 全局状态。如果服务进程不是通过正常的 `server.go` cleanup 路径退出（如 SIGKILL、panic 未恢复），全局初始化的 MagickWand 单例不被 Terminate。
+
+#### 泄露量级估算
+
+| 图片类型 | 单张 Decode 后内存（C 堆） | 并发 | 泄露 100 次后 |
+|---------|--------------------------|------|--------------|
+| 24MP JPG（6000×4000） | ~288MB（RGBA 8bit） | 3 workers | ~28GB |
+| 45MP RAW（8256×5504） | ~1.6GB（RGBA 16bit） | 3 workers | ~160GB |
+
+这些内存在 Go runtime 视角是"外部 C 内存"，`runtime.ReadMemStats` 的 `Sys` 不包含，Go GC 完全看不到——只能通过 OS 级 `RSS` 观察到持续增长。
 
 ---
 
