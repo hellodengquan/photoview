@@ -1180,16 +1180,514 @@ func (t NotificationTask) AfterScanAlbum(...) error {
 
 ---
 
-## 十四、已知问题与改进方向
+## 十五、深度细节分析（续）
 
-基于以上分析，视频转码管线目前存在以下可改进点：
+### 15.1 时钟回拨下 last_scan_time 兜底
 
-1. **FFmpeg 子进程无法被中断**：改用 `exec.CommandContext` 传入 context，让取消信号能真正杀掉子进程
-2. **缺少部分写入保护**：视频转码可以参考 sidecar 的做法，先写 `.tmp` 文件，成功后 rename，避免断电留下残次文件
-3. **孤儿缓存文件**：转码失败或中断时，带随机 token 的不完整文件不会被清理，应在启动时或定期扫描清理
-4. **文件内容变更检测**：仅靠 `path_hash` 无法检测文件替换，可以加入文件大小 + mtime 或内容 hash 校验
-5. **并发转码重复劳动**：可以加一个媒体级的 in-flight map，同一个媒体同时只跑一次转码
-6. **磁盘空间检查**：转码前预估所需空间，不足时告警或降级
-7. **硬件加速可用性探测**：设置了硬件加速但不可用时，自动 fallback 到软编码
-8. **孤儿缓存清理任务**：增加一个清理步骤，删除 DB 中没有对应 MediaURL 记录的缓存文件
+**结论：没有 `last_scan_time` 字段，也没有时钟回拨保护。周期性扫描基于 `time.Ticker`，时钟回拨会导致 ticker 不准，但不会崩溃。**
+
+#### 没有 last_scan_time
+
+搜索 `last_scan`、`lastScan`、`scan_time` 等关键词，整个代码库**完全没有**记录上次扫描时间的字段或逻辑。扫描不是"增量时间窗"模式（只处理上次扫描后变更的文件），而是每次都完整遍历。
+
+#### 周期性扫描实现
+
+**文件**：`api/scanner/periodic_scanner/periodic_scanner.go`
+
+```go
+type periodicScanner struct {
+    ticker         *time.Ticker
+    tickerLocker   sync.Mutex
+    ticker_changed chan bool
+    done           chan struct{}
+    ...
+}
+
+func (ps *periodicScanner) scanIntervalRunner() {
+    var scanTicker <-chan time.Time
+    // line 99-120
+    ps.tickerLocker.Lock()
+    if ps.ticker != nil {
+        scanTicker = ps.ticker.C
+    }
+    ps.tickerLocker.Unlock()
+
+    for {
+        select {
+        case <-scanTicker:
+            log.Println("Starting periodic scan")
+            ps.scannerQueue.AddAllToQueue()  // 触发全量扫描
+        case <-ps.ticker_changed:
+            // 配置变更，重建 ticker
+        case <-ps.done:
+            return
+        }
+    }
+}
+```
+
+#### 时钟回拨的影响
+
+`time.Ticker` 基于单调时钟（monotonic clock），在 Go 1.9+ 中不受系统时间回拨影响。但 `time.Now()` 用于其他时间计算时如果用到了墙上时钟（wall clock），可能出现问题。
+
+**实际风险**：
+- 如果系统时间被向后拨了 1 小时，已设置的 `time.Ticker` 会继续按原间隔 tick（因为用的是单调时钟）
+- 但如果扫描间隔配置是 "每天凌晨 3 点" 这类基于绝对时间的调度（当前不是），就会有问题
+- 当前 Photoview 是简单的 "每隔 N 秒扫一次"，时钟回拨不会导致扫描停止
+
+#### 没有的保护
+
+- ❌ 没有记录上次扫描时间的 DB 字段
+- ❌ 没有 `last_scan > now` 的时钟回拨检测和修正
+- ❌ 没有基于时间窗的增量扫描（只扫上次扫描后变更的文件）
+
+---
+
+### 15.2 FFmpeg 超时后子进程清理
+
+**结论：完全没有。FFmpeg 子进程没有超时，没有 context，也没有清理孤儿进程的机制。**
+
+#### 现状确认
+
+**文件**：`api/scanner/media_encoding/executable_worker/ffmpeg_cli.go:89-93`
+
+```go
+func (cli *FfmpegCli) EncodeMp4(inputPath string, outputPath string) error {
+    args := [...]
+    cmd := exec.Command(cli.path, args...)  // ← exec.Command，不带 context
+    return cmd.Run()                         // ← 无限期阻塞
+}
+```
+
+#### 会发生什么
+
+| 场景 | 后果 |
+|------|------|
+| 视频损坏导致 ffmpeg 挂起 | Go 代码永久阻塞，goroutine 泄漏，占用一个 worker 槽位 |
+| HTTP 请求取消，Go 代码不等了但进程还在跑 | 子进程变成孤儿继续跑，直到完成或失败，占用 CPU 和磁盘 IO |
+| 程序退出（Ctrl+C / 容器重启）而 ffmpeg 还在跑 | 子进程被 init 进程接管，继续后台运行，直到完成 |
+| ffmpeg 死循环（罕见） | 进程永远存在，需要手动 `kill` |
+
+#### 对比：ffprobe 有超时
+
+**文件**：`api/scanner/scanner_tasks/processing_tasks/process_video_task.go:206-216`
+
+```go
+func ReadVideoMetadata(videoPath string) (*ffprobe.ProbeData, error) {
+    ctx, cancelFn := context.WithTimeout(context.Background(), utils.MediaProbeTimeout())
+    defer cancelFn()
+    data, err := ffprobe.ProbeURL(ctx, videoPath)  // ← 带 5 秒超时
+    ...
+}
+```
+
+#### 改进需要做什么
+
+```go
+// 应该改成这样：
+func (cli *FfmpegCli) EncodeMp4(ctx context.Context, inputPath string, outputPath string) error {
+    // 加超时（比如 4 小时，防止无限期挂起）
+    ctx, cancel := context.WithTimeout(ctx, 4*time.Hour)
+    defer cancel()
+
+    cmd := exec.CommandContext(ctx, cli.path, args...)  // ← 用 CommandContext
+    return cmd.Run()
+}
+```
+
+`CommandContext` 会在 context 取消时调用 `cmd.Process.Kill()` 真正杀掉子进程。
+
+---
+
+### 15.3 `.cache` 子目录残留处理
+
+**结论：有隐藏文件过滤，但没有专门的 `.cache` 目录清理逻辑。**
+
+#### 隐藏文件过滤
+
+**文件**：`api/scanner/scanner_cache/cache.go:108-114` → `IsPathMedia()`
+
+```go
+func (c *AlbumScannerCache) IsPathMedia(mediaPath string) bool {
+    // Ignore hidden files
+    if path.Base(mediaPath)[0:1] == "." {  // ← 文件名以 . 开头就跳过
+        return false
+    }
+    ...
+}
+```
+
+这意味着：
+- `.cache/` 目录本身不会被当成媒体（因为是目录）
+- `.cache/` 目录下的文件也不会被当成媒体（因为目录被跳过，不会递归进去）
+- 但如果 `.cache/` 目录就在相册根目录下，目录遍历时会被 `os.ReadDir` 读到，然后被 `IsDir()` 跳过
+
+#### `.photoview_ignore` 支持
+
+**文件**：`api/scanner/scanner_tasks/ignorefile_task.go`
+
+支持 `.photoview_ignore` 文件列出要忽略的模式，但 `.cache` 不是默认忽略项，需要用户手动配置。
+
+#### 残留问题
+
+- ❌ 缓存目录 `media_cache/` 本身不会被扫描（因为它是独立配置的，不在相册根目录内）
+- ❌ 但如果用户在相册目录内手动创建了 `.cache/` 目录放东西，不会被扫描
+- ❌ 没有定期清理空目录或孤儿缓存目录的逻辑
+- ❌ 转码失败留下的带随机 token 的残次文件（见 13.3）不会被自动清理
+
+#### 对比：`.thumbnail/` 等目录
+
+其他软件常见的缩略图目录如 `.thumbnails/`、`@eaDir/`（Synology）、`.DS_Store` 等**都没有特殊处理**，统一走"点开头就跳过"的规则。
+
+---
+
+### 15.4 SHA256 大文件性能
+
+**结论：根本没有 SHA256。只有 MD5，且只用于字符串哈希（路径）和小文件内容哈希（sidecar XMP）。**
+
+#### MD5 的两处使用
+
+**使用 1：路径哈希（完全不读文件内容）**
+
+**文件**：`api/graphql/models/utils.go:42-46`
+
+```go
+func MD5Hash(value string) string {
+    hash := md5.Sum([]byte(value))  // ← 只哈希字符串，跟文件内容无关
+    return hex.EncodeToString(hash[:])
+}
+```
+
+用于：
+- `Media.PathHash` = `MD5Hash(media.Path)` （`models/media.go:41`）
+- `Album.PathHash` = `MD5Hash(album.Path)` （`scanner_user.go:132`）
+
+**使用 2：sidecar XMP 文件内容哈希（小文件）**
+
+**文件**：`api/scanner/scanner_tasks/processing_tasks/sidecar_task.go:151-158`
+
+```go
+func processSidecarFile(...) error {
+    f, _ := os.Open(sidecarPath)
+    defer f.Close()
+    h := md5.New()
+    if _, err := io.Copy(h, f); err != nil {  // ← 读整个文件算 MD5
+        log.Printf("ERROR: %s", err)
+    }
+    hash := hex.EncodeToString(h.Sum(nil))
+    if media.SidecarHash == nil || *media.SidecarHash != hash {
+        // sidecar 变了，重新处理图片
+        ...
+    }
+}
+```
+
+#### 性能分析
+
+| 场景 | 算法 | 数据量 | 性能 |
+|------|------|--------|------|
+| 媒体去重 | MD5 | 路径字符串（~100字节） | 极快，O(1)，不碰磁盘 |
+| Sidecar 变更检测 | MD5 | XMP 文件（通常 < 1MB） | 快，小文件全读没问题 |
+| 视频内容变更检测 | - | - | 完全没做 |
+
+#### 为什么不用 SHA256
+
+- 对于路径哈希，防碰撞不是主要目标，MD5 足够快
+- 对于 sidecar 哈希，只是检测变更，不是防篡改，MD5 足够
+- 视频大文件如果做内容哈希，无论 MD5 还是 SHA256 都很慢（读几十 GB），所以干脆没做
+
+> **注意**：这里存在一个设计权衡——不做内容哈希意味着无法检测文件替换（同路径不同内容），但换来的是每次扫描不需要读几十 GB 的视频文件，性能提升巨大。对于"只读媒体库"场景，这个权衡是合理的。
+
+---
+
+### 15.5 AMD AMF 硬件加速支持
+
+**结论：目前不支持 AMD AMF。只支持 Intel QSV、VA-API、NVIDIA NVENC。**
+
+#### 当前支持的硬件加速
+
+**文件**：`api/scanner/media_encoding/executable_worker/ffmpeg_cli.go:13-19`
+
+```go
+const defaultCodec = "h264"
+
+var hwAccToCodec = map[string]string{
+    "qsv":   defaultCodec + "_qsv",     // h264_qsv   - Intel Quick Sync Video
+    "vaapi": defaultCodec + "_vaapi",   // h264_vaapi - Video Acceleration API
+    "nvenc": defaultCodec + "_nvenc",   // h264_nvenc - NVIDIA NVENC
+}
+```
+
+#### AMD 用户的选择
+
+| 方案 | 说明 |
+|------|------|
+| **VA-API** | AMD 显卡在 Linux 上可以用 mesa 的 VA-API 驱动（`mesa-va-drivers` / `amdgpu`），设为 `vaapi` 即可。这是 AMD 用户的首选。 |
+| **AMF 编码器** | FFmpeg 中有 `h264_amf` 编码器（AMD Advanced Media Framework），但当前没有映射。可以通过彩蛋功能使用：`PHOTOVIEW_VIDEO_HARDWARE_ACCELERATION=_h264_amf`（见 13.5 彩蛋说明） |
+| **软编码** | 留空或其他值，默认 `h264` (libx264) 软编码 |
+
+#### 彩蛋功能的验证
+
+**文件**：`api/scanner/media_encoding/executable_worker/ffmpeg_cli.go:57-62`
+
+```go
+codec, ok := hwAccToCodec[hwAcc]
+if !ok {
+    if strings.HasPrefix(hwAcc, "_") {
+        codec = hwAcc[1:]  // ← 下划线开头，直接当编码器名
+    } else {
+        codec = defaultCodec
+    }
+}
+```
+
+所以 AMD 用户想用 AMF 的话：
+```bash
+PHOTOVIEW_VIDEO_HARDWARE_ACCELERATION=_h264_amf
+```
+
+#### AMF 支持的改进
+
+如果要正式支持，只需加一行：
+```go
+var hwAccToCodec = map[string]string{
+    "qsv":   defaultCodec + "_qsv",
+    "vaapi": defaultCodec + "_vaapi",
+    "nvenc": defaultCodec + "_nvenc",
+    "amf":   defaultCodec + "_amf",     // ← 加这行
+}
+```
+
+但需要注意：
+- AMF 只在 Windows 和 Linux 上可用，macOS 不支持
+- 需要 ffmpeg 编译时启用 `--enable-amf`
+- 没有可用性检测，设置了不可用会直接报错
+
+---
+
+### 15.6 Mutex 细粒度死锁分析
+
+**结论：目前是 5 把全局大锁，设计简单但有死锁风险和性能瓶颈。**
+
+#### 5 把全局 Mutex 位置
+
+| 锁 | 位置 | 保护的数据 | 粒度 |
+|----|------|------------|------|
+| `notificationLock` | `api/graphql/notification/Notification.go:30` | `notificationListeners` 全局 slice | 全局大锁，所有用户共享 |
+| `global_scanner_queue.mutex` | `api/scanner/scanner_queue/queue.go:48` | `in_progress`、`up_next` 队列 | 全局大锁，所有用户共享 |
+| `mainPeriodicScannerLocker` | `api/scanner/periodic_scanner/periodic_scanner.go:34` | `mainPeriodicScanner` 单例 | 全局大锁，初始化用一次 |
+| `testCachePathLocker` | `api/utils/media_cache.go:43` | `testCachePath` 测试变量 | 测试用，RWMutex |
+| `ps.tickerLocker` | `api/scanner/periodic_scanner/periodic_scanner.go:26` | `ps.ticker` | 单实例内部锁 |
+
+另外还有每相册扫描实例的：
+- `AlbumScannerCache.mutex`（`cache.go:16`） - 每个扫描任务一个，保护本地 map
+
+#### 死锁风险分析
+
+**风险 1：`notificationLock` 阻塞式发送 + 大锁 = 死锁**
+
+**文件**：`api/graphql/notification/Notification.go:76-82`
+
+```go
+func BroadcastNotification(notification *models.Notification) {
+    notificationLock.Lock()
+    defer notificationLock.Unlock()
+
+    for _, listener := range notificationListeners {
+        listener.channel <- notification  // ← 阻塞式发送！
+    }
+}
+```
+
+channel 是无缓冲的（`make(chan *models.Notification, 1)` 有缓冲 1，但还是可能阻塞）。如果某个前端 WebSocket 消费慢了：
+1. Goroutine A 拿着 `notificationLock`，阻塞在 `listener.channel <-`
+2. Goroutine B 想调 `RegisterListener` 或 `DeregisterListener`，需要 `notificationLock.Lock()`，被阻塞
+3. Goroutine C 想调 `BroadcastNotification`，也被阻塞
+4. 整个通知系统完全挂死
+
+**风险 2：锁顺序不一致**
+
+目前的调用链：
+- `scanner_queue.processQueue()` 拿 `mutex` → 调 `ScanAlbum` → 调 `notification.BroadcastNotification` 拿 `notificationLock`
+- 没有反方向的调用，暂时不会死锁
+
+但未来如果有通知回调里操作扫描队列，就会形成 `notificationLock` → `mutex` 的反序，产生死锁。
+
+**风险 3：粗粒度锁的性能瓶颈**
+
+- `notificationLock`：1000 个用户在线，每次通知要遍历 1000 个 listener，期间没人能注册/注销
+- `global_scanner_queue.mutex`：所有用户的扫描任务都在一个队列里，加任务、取任务、完成任务都要抢这一把锁
+
+#### 改进方向
+
+1. `BroadcastNotification` 改为非阻塞发送或给 channel 足够的缓冲
+2. 通知按用户分组，每个用户自己的锁
+3. 扫描队列按用户/相册分片，减少锁竞争
+
+---
+
+### 15.7 NFS 文件系统差异处理
+
+**结论：只有符号链接处理，没有针对 NFS 的特殊优化或兼容性处理。**
+
+#### 已有的文件系统相关逻辑
+
+**符号链接处理**
+
+**文件**：`api/utils/utils.go:68-92` → `IsDirSymlink()`
+
+```go
+func IsDirSymlink(linkPath string) (bool, error) {
+    fileInfo, err := os.Lstat(linkPath)  // ← Lstat 不跟随符号链接
+    if err != nil {
+        return false, err
+    }
+    if fileInfo.Mode()&os.ModeSymlink == os.ModeSymlink {
+        resolvedPath, _ := filepath.EvalSymlinks(linkPath)  // ← 解析符号链接
+        resolvedFile, _ := os.Stat(resolvedPath)            // ← Stat 跟随
+        return resolvedFile.IsDir(), nil
+    }
+    return false, nil
+}
+```
+
+使用位置：
+- `scanner_user.go:206` - 扫描用户相册时
+- `scanner_user.go:264` - 递归扫描子目录时
+- `scanner_album.go:129` - 扫描单个相册时
+
+#### NFS 特有的问题，Photoview 都没处理
+
+| NFS 问题 | 影响 | Photoview 是否处理 |
+|----------|------|-------------------|
+| **不一致的 `os.Stat` 结果** | NFS 客户端缓存可能导致刚写的文件 `os.Stat` 查不到 | ❌ 没有，直接假设 `os.Stat` 是一致的 |
+| **`os.Rename` 跨设备失败** | NFS 挂载点和本地磁盘之间 `rename` 会返回 EXDEV 错误 | ❌ 没有，`sidecar_task.go` 里的 `.hold` rename 逻辑假设在同一文件系统 |
+| **文件句柄泄漏** | NFS 服务端重启会导致已打开的文件句柄失效（ESTALE） | ❌ 没有重试逻辑，打开失败就报错退出 |
+| **弱一致性的 `os.ReadDir`** | NFS 目录列表可能不一致，刚创建的文件可能列不出来 | ❌ 没有，假设 `os.ReadDir` 是准确的 |
+| **`mtime` 精度** | 某些 NFS 实现只有秒级 mtime 精度 | ❌ 不依赖 mtime，所以无所谓 |
+| **锁的语义** | NFS 的文件锁（`fcntl(F_SETLK)`）语义特殊 | ❌ 没有用文件锁，用的是 Go 内存锁 |
+
+#### 一个具体的 bug 场景
+
+如果 `media_cache` 目录在 NFS 上，而源视频在本地磁盘（或另一个 NFS 挂载点）：
+
+1. 转码过程中 NFS 服务端重启
+2. `os.Stat(webVideoPath)` 返回 `ESTALE` 错误
+3. 转码失败，错误日志记录
+4. 下次扫描时，DB 中没有 MediaURL 记录，会重新转码
+5. 但之前转了一半的文件可能因为 `ESTALE` 删不掉，变成孤儿
+
+这不是严重问题（最终会重转），但会产生孤儿文件浪费空间。
+
+#### 对 NFS 用户的建议
+
+- 尽量把 `media_cache` 放在本地 SSD 上（转码需要高 IO）
+- 如果必须用 NFS，确保 NFS 客户端挂载参数用 `hard`（默认）而不是 `soft`
+- 定期清理孤儿缓存文件
+
+---
+
+### 15.8 WebSocket 断开重连机制
+
+**结论：服务端没有断线重连状态保持，完全靠前端重连后重新订阅。**
+
+#### 服务端实现
+
+**文件**：`api/graphql/resolvers/notification.go:18-34`
+
+```go
+func (r *subscriptionResolver) Notification(ctx context.Context) (<-chan *models.Notification, error) {
+    user := auth.UserFromContext(ctx)
+    ...
+    notificationChannel := make(chan *models.Notification, 1)  // 缓冲 1
+    listenerID := notification.RegisterListener(user, notificationChannel)
+
+    go func() {
+        <-ctx.Done()                     // ← 连接断开时触发
+        notification.DeregisterListener(listenerID)  // ← 直接注销，不保存状态
+    }()
+
+    return notificationChannel, nil
+}
+```
+
+#### WebSocket 保活
+
+**文件**：`api/graphql/endpoint/graphql_endpoint.go:31-35`
+
+```go
+graphqlServer.AddTransport(transport.Websocket{
+    KeepAlivePingInterval: 10 * time.Second,  // ← 每 10 秒发 ping
+    Upgrader:              server.WebsocketUpgrader(...),
+    InitFunc:              auth.AuthWebsocketInit(),
+})
+```
+
+gqlgen 内置的 websocket transport 会：
+- 每 10 秒向客户端发 ping
+- 客户端应该回 pong
+- 收不到 pong 会认为连接已断开，取消 context
+
+#### 断开重连的实际行为
+
+```
+  前端                          后端
+    │                             │
+    │───── 订阅 Notification ────▶│
+    │                             │  注册 listener #123
+    │◀──── 进度通知 1 ────────────│
+    │◀──── 进度通知 2 ────────────│
+    │   (网络闪断)                 │
+    │                             │  <-ctx.Done()->  DeregisterListener(#123)
+    │                             │  listener 被删了，没保存任何状态
+    │                             │
+    │───── 重连，重新订阅 ───────▶│
+    │                             │  注册新 listener #124
+    │◀──── 新的进度通知 ──────────│
+    │                             │
+```
+
+**关键问题**：重连后是新的 listener，**之前断线期间的通知全部丢失**。前端只会收到重连后的新通知。
+
+#### 对视频转码的影响
+
+- 视频转码是后台任务，转码完成的进度通知如果恰好发生在断线窗口内，前端就收不到
+- 但前端可以刷新页面手动检查（因为 DB 里已经有记录了）
+- 没有"转码完成"的持久化事件队列，断线就丢了
+
+#### 改进方向
+
+1. 给通知加递增序列号，前端重连时可以请求"从序号 N 开始补发"
+2. 或者在前端维护已处理媒体的本地缓存，重连后拉取最新状态 diff
+3. 增加缓冲 channel 大小（当前只有 1），减少阻塞概率
+
+---
+
+## 十六、已知问题与改进方向（汇总）
+
+基于以上所有分析，视频转码管线目前存在以下可改进点，按优先级排序：
+
+### 高优先级
+
+1. **FFmpeg 子进程无法被中断**（13.2 / 15.2）：改用 `exec.CommandContext` 传入 context + 超时，让取消信号能真正杀掉子进程，防止 goroutine 和子进程泄漏
+2. **通知系统阻塞式发送死锁**（15.6）：`BroadcastNotification` 中 `listener.channel <-` 是阻塞发送，拿着全局大锁遍历所有 listener，单个慢消费者会挂死整个通知系统
+3. **孤儿缓存文件**（13.3）：转码失败/中断/断电时，带随机 token 的不完整文件不会被清理，永久占用磁盘空间
+4. **并发转码重复劳动**（13.6）：后台扫描 + HTTP 请求补转码可能同时跑两个 ffmpeg 转同一个视频，浪费资源
+
+### 中优先级
+
+5. **缺少部分写入保护**（13.3）：视频转码可以参考 sidecar 的做法，先写 `.tmp` 文件，成功后 rename，避免断电留下残次文件
+6. **文件内容变更检测**（13.4 / 15.4）：仅靠 `path_hash` 无法检测文件替换，可以加入 `文件大小 + mtime` 的快速校验
+7. **磁盘空间检查**（13.7）：转码前预估所需空间，不足时告警或降级，避免一个个文件失败
+8. **硬件加速可用性探测**（13.5 / 15.5）：设置了硬件加速但不可用时，自动 fallback 到软编码，而不是直接报错
+
+### 低优先级
+
+9. **FFmpeg 转码超时**（15.2）：给 ffmpeg 转码加一个合理的超时（如 4 小时），防止损坏视频导致永久挂起
+10. **断线通知补发**（15.8）：WebSocket 重连后丢失的通知可以通过序列号机制补发
+11. **孤儿缓存清理任务**（13.3）：增加一个清理步骤，删除 DB 中没有对应 MediaURL 记录的缓存文件
+12. **正式支持 AMD AMF**（15.5）：在 `hwAccToCodec` map 中增加 `"amf": "h264_amf"`
+13. **时钟回拨保护**（15.1）：如果未来要做基于时间窗的增量扫描，需要考虑时钟回拨问题
+14. **NFS 兼容性**（15.7）：对于 `ESTALE` 等 NFS 特有错误增加重试逻辑
+15. **Mutex 细粒度化**（15.6）：全局大锁改为按用户/按相册分片，减少锁竞争
 
