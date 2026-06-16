@@ -1663,15 +1663,557 @@ gqlgen 内置的 websocket transport 会：
 
 ---
 
-## 十六、已知问题与改进方向（汇总）
+## 十七、深度细节分析（再续）
+
+### 17.1 重启后 monotonic clock 兜底失效
+
+**结论：monotonic clock 在进程重启后自然失效，但 Photoview 的周期性扫描不依赖 monotonic clock 的持久性，所以重启后失效不是问题。**
+
+#### Go 的 monotonic clock 特性
+
+Go 的 `time.Ticker` 和 `time.Now()` 使用单调时钟（monotonic clock）只在**同一进程内有效**：
+- 进程运行中：系统时间回拨不影响 ticker（用单调时钟不受影响）
+- 进程重启后：单调时钟从零重新计数，之前的计时全部丢失
+
+#### Photoview 的周期性扫描实现
+
+**文件**：`api/scanner/periodic_scanner/periodic_scanner.go:24-31`
+
+```go
+type periodicScanner struct {
+    ticker         *time.Ticker    // ← 基于 monotonic clock
+    tickerLocker   sync.Mutex
+    ticker_changed chan bool
+    done           chan struct{}
+    ...
+}
+```
+
+#### 重启后的实际行为
+
+```
+进程启动时：
+  ├─ InitializePeriodicScanner()
+  │    ├─ 从 DB 读 PeriodicScanInterval
+  │    └─ 创建新的 time.NewTicker(interval) ← 从零开始计时
+  │
+  └─ (比如 interval = 1 小时
+     └─ 重启后 1 小时才会触发第一次扫描
+```
+
+**问题**：如果设置的是"每 24 小时扫一次"，每次重启后都要等 24 小时才会触发第一次扫描，而不是"距离上次扫描 24 小时后"。
+
+#### 与"兜底失效的真实影响
+
+| 场景 | 后果 |
+|------|------|
+| 设置 1 小时间隔，频繁重启 | 永远扫不到（每次重启都重新等 1 小时） |
+| 设置 24 小时间隔，每天重启一次 | 每天都要等重启后 24 小时才扫，实际间隔远超 24 小时 |
+| 容器滚动更新 | 下次扫描时间推迟 |
+
+#### 对比：有 `last_scan_time` 方案的缺失
+
+**完全没有 `last_scan_time` 字段（见 15.1），所以也没有"启动时检查距离上次扫描多久了，够间隔到了就立即扫"的逻辑。每次启动都是从零开始等。
+
+#### 优雅关闭 vs 暴力关闭
+
+**优雅关闭**（SIGTERM / Ctrl+C）：
+
+**文件**：`api/server.go:140-160`
+
+```go
+func setupGracefulShutdown(svr *http.Server) {
+    signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+    go func() {
+        <-c
+        ctx, cancel := context.WithTimeout(context.Background(), time.Minute) // 1 分钟超时
+        defer cancel()
+        periodic_scanner.ShutdownPeriodicScanner()  // 停 ticker
+        scanner_queue.CloseScannerQueue()        // 关队列
+        svr.Shutdown(ctx)                        // 关 HTTP
+    }()
+}
+```
+
+优雅关闭时：
+1. 停 periodic scanner 的 ticker 会 `Stop()`
+2. scanner queue 会等所有 in-progress 任务完成（但 ffmpeg 子进程不会被杀
+3. 1 分钟后强制退出
+
+**暴力关闭**（SIGKILL / kill -9 / 断电）：
+- 什么清理都没有，直接退出
+- 正在运行的 ffmpeg 子进程变成孤儿，被 init 进程接管继续跑
+
+---
+
+### 17.2 僵尸 ffmpeg 进程检测
+
+**结论：完全没有检测和清理机制。进程崩溃或被强制退出时，正在运行的 ffmpeg 子进程会变成孤儿继续跑。**
+
+#### 子进程生命周期
+
+```
+正常情况：
+  Go 进程
+    ├─ exec.Command("ffmpeg", ...)
+    │   └─ ffmpeg 子进程
+    └─ cmd.Run() 等待子进程退出
+
+异常情况（Go 进程被 kill -9）：
+  init 进程 (PID 1)
+    └─ ffmpeg 子进程 (变成孤儿，继续跑直到完成）
+```
+
+#### 哪些场景会产生僵尸/孤儿进程
+
+| 场景 | 是否产生孤儿进程 |
+|------|------------|
+| 正常转码完成 | ❌ 不会，cmd.Wait() 正常回收 |
+| 优雅关闭 (SIGTERM) | ❌ 不会，等 1 分钟让任务完成 |
+| 优雅关闭但 1 分钟内没跑完 | ✅ 会，1 分钟超时后主进程退出，ffmpeg 变成孤儿 |
+| 强制 kill -9 | ✅ 会，直接退出，子进程没人管 |
+| 容器 OOM kill | ✅ 会 |
+| 断电 | ✅ 会 |
+
+#### 为什么不会变僵尸 vs 孤儿
+
+注意区分两个概念：
+- **僵尸进程**（zombie）：子进程已退出，但父进程没 `wait`，PID 还占着
+- **孤儿进程**（orphan）：父进程死了，子进程还在跑，被 init 接管
+
+Photoview 的情况是**孤儿进程**（ffmpeg 还在继续转码），不是僵尸进程。
+
+#### 检测方法（当前完全没做
+
+检测孤儿 ffmpeg 进程的方法：
+
+1. **PID 文件记录法：启动 ffmpeg 后把 PID 写到文件里，启动时检查 PID 是否还活着
+2. **进程名匹配法：启动时遍历 `/proc` 找 `ffmpeg -i ... photoview_cache/...` 模式的进程
+3. **cgroup 法：（Docker 环境）把所有子进程放到同一个 cgroup，退出时整个 cgroup 杀
+
+Photoview 一种都没做。
+
+#### 对比：exiftool 有长驻进程管理
+
+**文件**：`api/scanner/externaltools/exiftool/exiftool.go:50`
+
+```go
+cmd := exec.Command(path, "-stay_open", "True", "-@", "-")
+// 长驻进程，通过 stdin/stdout 通信
+```
+
+exiftool 是一个长驻进程反复用，有 `Close()` 方法优雅关闭。但 ffmpeg 是每次启动一个新进程，用完就丢。
+
+---
+
+### 17.3 运行时 .cache 增量清理
+
+**结论：没有增量清理。只有全量清理（删整个 mediaID 目录）有，增量清理（删目录内的孤儿文件）没有。**
+
+#### 现有的清理逻辑
+
+**清理 1：源文件删除后清理整个缓存目录**
+
+**文件**：`api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go:17-65`
+
+```go
+func CleanupMedia(db *gorm.DB, albumId int, albumMedia []*models.Media) []error {
+    // 找出 DB 中有但磁盘上没有的媒体
+    query := db.Where("album_id = ?", albumId)
+    if len(albumMedia) > 0 {
+        query = query.Where("NOT id IN (?)", albumMediaIds)
+    }
+    query.Find(&mediaList)
+
+    for _, media := range mediaList {
+        // 整个缓存目录删掉
+        cachePath := path.Join(utils.MediaCachePath(), strconv.Itoa(albumId), strconv.Itoa(media.ID))
+        os.RemoveAll(cachePath)  // ← 整个目录全删
+    }
+
+    // DB 里的媒体记录也删掉
+    db.Where("id IN (?)", mediaIDs).Delete(models.Media{})
+}
+```
+
+触发时机：每次相册扫描完后，`MediaCleanupTask.AfterScanAlbum()` 调用。
+
+**清理 2：相册删除后清理整个相册缓存目录**
+
+**文件**：`api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go:67-136`
+
+```go
+func DeleteOldUserAlbums(...) []error {
+    // 找出 DB 中有但磁盘上没有的相册
+    // 每个相册的缓存目录整个删掉
+    cachePath := path.Join(utils.MediaCachePath(), strconv.Itoa(album.ID))
+    os.RemoveAll(cachePath)
+}
+```
+
+#### 没有的增量清理
+
+- ❌ 没有"DB 有 MediaURL 记录但磁盘文件丢失 → 这种情况视频缩略图有磁盘检查并重生成（见 13.3），但不会清理其他孤儿文件
+
+- ❌ 没有"磁盘有文件但 DB 中没有对应 MediaURL 记录 → 孤儿文件永远占空间
+
+- ❌ 没有"旧格式缓存文件清理（比如之前版本生成的旧格式文件名）
+
+- ❌ 没有按访问时间清理（LRU）
+
+- ❌ 没有按大小限制清理（超过多少 G）
+
+#### 缓存目录结构
+
+```
+media_cache/
+  └─ {albumID}/
+      └─ {mediaID}/
+          ├─ web_video_movie_abc123.mp4    ← Purpose: video-web
+          ├─ video_thumb_movie_def456.jpg    ← Purpose: video-thumbnail
+          ├─ web_video_movie_old789.mp4     ← 孤儿！DB 里没记录（转码失败留下的，永远不会被清
+          └─ thumbnail.jpg                   ← Purpose: photo-thumbnail（图片的）
+```
+
+孤儿文件产生的原因：
+1. 转码到一半失败/中断 → 文件名带随机 token，下次重转用新 token，旧的变孤儿
+2. 旧版本软件生成的旧格式文件名
+3. 手动改了 purpose 配置变了，旧文件还在
+
+---
+
+### 17.4 SHA256 streaming 并发限制
+
+**结论：完全没有 SHA256，也没有 streaming 哈希，也没有并发限制。**
+
+#### 现有的哈希使用情况
+
+| 用途 | 算法 | 数据量 | 是否 streaming | 是否有并发限制 |
+|------|------|--------|----------------|--------------|
+| 路径去重 | MD5 | 路径字符串 (~100B) | ❌ 直接 `md5.Sum()` 一次性 | - |
+| Sidecar 变更检测 | MD5 | XMP 文件 (<1MB) | ❌ `io.Copy(h, f) 流式，但文件小 | ❌ 没有，全局一把锁串行（`globalMu` 互斥） |
+| 视频内容哈希 | - | - | - | - |
+| 图片内容哈希 | - | - | - | - |
+
+#### Sidecar 的 MD5 是流式的
+
+**文件**：`api/scanner/scanner_tasks/processing_tasks/sidecar_task.go:151-158`
+
+```go
+f, _ := os.Open(sidecarPath)
+defer f.Close()
+h := md5.New()
+if _, err := io.Copy(h, f); err != nil {  // ← io.Copy 是流式的，边读边算
+    log.Printf("ERROR: %s", err)
+}
+hash := hex.EncodeToString(h.Sum(nil))
+```
+
+但 sidecar 文件很小（XMP 一般几十 KB 到几 MB，流不流式无所谓。
+
+#### 为什么没有视频内容哈希
+
+设计取舍：
+1. 视频文件大（几 GB 到几十 GB）
+2. 读一遍算哈希很慢（磁盘 IO 瓶颈
+3. 每次扫描都算的话，扫描速度会从 O(N) 变成 O(N * 文件大小)
+4. Photoview 定位是"只读浏览媒体库"，假设源文件不会变
+
+如果真要做的话，折中方案是"文件大小 + mtime"快速校验，只有大小和 mtime 都没变就认为没改了，才去算内容哈希。
+
+#### 并发限制
+
+也没有并发限制。FFmpeg 转码的并发由 scanner queue 的 `max_concurrent_tasks` 控制，但那是**任务级**的并发控制，不是**哈希计算**的并发控制。
+
+---
+
+### 17.5 Intel QSV 硬件加速
+
+**结论：支持，但只是简单地换了个编码器名，没有任何 QSV 特有的优化（如帧格式转换、设备管理）都没有。
+
+#### QSV 支持现状
+
+**文件**：`api/scanner/media_encoding/executable_worker/ffmpeg_cli.go:13-19`
+
+```go
+var hwAccToCodec = map[string]string{
+    "qsv":   defaultCodec + "_qsv",     // h264_qsv
+    ...
+}
+```
+
+就这么简单。设置为 "qsv" → 编码器名换成 `h264_qsv`。
+
+#### QSV 完整用法的标准做法
+
+通常 ffmpeg QSV 完整的硬件加速流水线：
+
+```bash
+# 最简单的用法（就是 Photoview 现在的做法）：
+ffmpeg -i input.mp4 -c:v h264_qsv output.mp4
+# 这种方式：解码器还是软解 → CPU 解码 → GPU 编码
+
+# 完整硬件流水线（性能更好）：
+ffmpeg -hwaccel qsv -hwaccel_output_format qsv -i input.mp4 \
+  -c:v h264_qsv output.mp4
+# 这种方式：GPU 解码 → GPU 编码 → 零拷贝
+```
+
+Photoview 的做法是第一种：
+- ✅ 编码用硬件（h264_qsv）
+- ❌ 解码还是软件（默认）
+- ❌ 没有 `-hwaccel qsv` 硬件解码
+- ❌ 没有 `-hwaccel_output_format qsv` 帧格式
+- ❌ 没有设备选择（`-qsv_device`）
+
+相当于 GPU 和 CPU 之间还是要做一次内存拷贝，性能不如全硬件流水线快。
+
+#### QSV 的其他限制
+
+- **Linux**：
+  - Intel Gen 5+ 的核显
+  - 驱动：`intel-media-va-driver / intel-media-driver
+
+- **Windows**：也支持
+  用 Intel Media SDK / oneVPL
+
+- **macOS**：不支持 QSV（macOS 用 VideoToolbox）
+
+#### 可用性检测
+
+**没有可用性检测**。设置了 `qsv` 但机器没有 Intel 核显 / 没装驱动，ffmpeg 直接报错，转码失败。不会 fallback 软编。
+
+对比一下 exiftool 和 ffprobe 在初始化时会检测：
+
+```go
+// exiftool 初始化检测
+path, err := exec.LookPath("exiftool")
+if err != nil {
+    return nil, err  // 找不到就返回错误
+}
+```
+
+但 ffmpeg QSV 没有 "编码器不可用 → 转码时才知道。
+
+---
+
+### 17.6 运行时死锁检测
+
+**结论：完全没有。没有使用任何死锁检测库，也没有 watchdog 监控。
+
+#### 依赖中没有死锁检测库
+
+`go.mod` 里搜索不到 `go-deadlock` 之类的：
+
+```go
+// go.mod 里没有任何死锁检测相关
+```
+
+Go 标准也没有死锁检测
+
+Go 运行时只有：
+
+- `-race` 竞态检测（测试用
+- 没有内置死锁检测器
+
+#### 可能的死锁点（已在 15.6 分析过）
+
+1. **`notificationLock` 阻塞式发送**
+
+最可能死锁：
+```go
+notificationLock.Lock()
+defer notificationLock.Unlock()
+for _, listener := range notificationListeners {
+    listener.channel <- notification  // ← 这里可能永远阻塞
+}
+```
+
+某个 listener 的 channel 满了，发送阻塞，拿着全局大锁不释放，其他人都拿不到锁。
+
+2. **锁顺序不一致**（目前没问题，但未来有风险）
+
+当前调用链：
+```
+scanner_queue.mutex → ScanAlbum → notificationLock
+```
+
+如果将来如果有通知回调里操作扫描队列，就会死锁
+
+3. **数据库事务 + 锁**
+
+DB 事务和 Go mutex 混合使用的场景也要小心顺序。
+
+#### 测试里的死锁检测
+
+测试里有提到 "Test passes if no deadlock occurs" 这种注释：
+
+**文件**：`api/scanner/periodic_scanner/periodic_scanner_test.go:262
+
+```go
+// Test passes if no deadlock occurs
+```
+
+但这只是"跑一下看看会不会卡死，没有自动检测。
+
+#### 怎么检测死锁
+
+常用的 Go 死锁检测方案：
+
+1. **`go-deadlock`**：替换 `sync.Mutex` 为 `deadlock.Mutex`，运行时检测死锁
+2. **`goleak`**：检测 goroutine 泄漏（测试用
+3. **pprof**：`http://localhost:6060/debug/pprof/goroutine?debug=2 看 goroutine 栈
+
+Photoview 一种都没集成。
+
+---
+
+### 17.7 SMB 文件系统兼容
+
+**结论：和 NFS 一样，没有针对 SMB/CIFS 的特殊处理。
+
+#### SMB vs NFS 共性问题
+
+| 问题 | SMB 影响 | Photoview 是否处理 |
+|------|--------|-------------------|
+| 缓存一致性 | 刚写的文件可能读不到（客户端缓存） | ❌ 没有 |
+| `os.Rename 跨设备失败 | rename 不同挂载点之间 rename 失败 | ❌ 没有 |
+| 文件锁语义 | SMB 的文件锁和本地不一样 | ❌ 没有用文件锁 |
+| mtime 精度 | 可能只有秒级 | ❌ 不依赖 mtime |
+| 断开重连 | 网络闪断可能导致 IO 错误 | ❌ 没有重试 |
+
+#### SMB 特有的问题
+
+1. **SMB1/SMB2/SMB3 协议差异
+
+不同版本协议的行为不一样。
+
+2. **文件名大小写**
+
+Windows SMB 服务器大小写不敏感的，Linux 客户端大小写敏感。如果源文件在 SMB 共享上，可能出现 `Photo.jpg 和 `photo.jpg 被当成同一个文件？
+
+Photoview 的 `path_hash` 是区分大小写的（MD5 区分大小写），所以会当成不同的文件。
+
+3. **权限模型**
+
+Windows 的权限模型和 Unix 不一样，`os.Chmod` 可能不支持。
+
+Photoview 不 `os.Chmod（没用到。
+
+#### 实际影响最大的问题
+
+对视频转码的影响
+
+```
+源视频在 SMB 共享上：
+  ├─ 读源文件 → SMB 读 → ffmpeg 解码
+     ├─ 网络闪断 → ffmpeg 读到一半失败
+     └─ 转码失败
+
+缓存输出在 SMB 共享上：
+  ├─ ffmpeg 写 → SMB 写
+     ├─ 网络闪断 → 写失败，写了一半的文件
+     └─ 下次扫描重新转码（因为 DB 没记录
+
+和 NFS 类似。
+
+#### 对比：符号链接 SMB 的处理
+
+有通用符号链接处理了（`IsDirSymlink`），但那是通用的，不是 SMB 特有的。
+
+---
+
+### 17.8 WebSocket 断网长时间后状态恢复
+
+**结论：服务端完全无状态保持，断多久都直接删 listener，重连重新注册，期间的通知全丢。
+
+#### 当前实现
+
+**文件**：`api/graphql/resolvers/notification.go:18-34
+
+```go
+func (r *subscriptionResolver) Notification(ctx context.Context) (<-chan *models.Notification, error) {
+    user := auth.UserFromContext(ctx)
+    ...
+    notificationChannel := make(chan *models.Notification, 1)  // 缓冲 1
+    listenerID := notification.RegisterListener(user, notificationChannel)
+
+    go func() {
+        <-ctx.Done()                     // 连接断开
+        notification.DeregisterListener(listenerID)  // 直接注销
+    }()
+
+    return notificationChannel, nil
+}
+```
+
+#### 断网场景分析
+
+**短时间断网（几秒）：
+
+```
+前端断网 → ping 超时 → 检测到断开 → ctx.Done() → DeregisterListener
+  ↓
+前端重连 → 新的 listener 重新注册 → 新 channel
+
+断期间的通知：全丢了
+```
+
+**长时间断网（几分钟/小时）：
+
+一样的，只是断的时间更长，丢的通知更多。
+
+#### 没有的状态
+
+- ：
+
+1. **消息队列（message queue）：把消息存起来，重连后补发
+2. **序列号**：每条通知有序号，重连时说"我上次收到 N 号，从 N+1 开始发
+3. **状态同步**：重连后拉取完整状态对比 diff
+
+一种都没做。
+
+#### gqlgen 层的保活
+
+**文件**：`api/graphql/endpoint/graphql_endpoint.go:31-35`
+
+```go
+graphqlServer.AddTransport(transport.Websocket{
+    KeepAlivePingInterval: 10 * time.Second,  // 每 10 秒发 ping
+    ...
+})
+```
+
+gqlgen 内置的 websocket transport 每 10 秒发 ping，客户端要回 pong。不回就认为断开。
+
+所以断网后最多 10 秒左右就会检测到断开。
+
+#### 视频转码进度的丢失场景
+
+一个视频转码需要 5 分钟：
+
+```
+0: 开始转码
+1: 转码 20% → 通知 20
+2: 断网了
+3: 转码 50% → 通知发不出去（阻塞或者丢了
+4: 转码 100% → 通知也丢了
+5: 用户重连 → 啥通知一个通知都没收到，以为还没开始转
+```
+
+但实际上转码完了，DB 里有记录，刷新页面就能看到。
+
+---
+
+## 十八、已知问题与改进方向（完整汇总）
 
 基于以上所有分析，视频转码管线目前存在以下可改进点，按优先级排序：
 
 ### 高优先级
 
-1. **FFmpeg 子进程无法被中断**（13.2 / 15.2）：改用 `exec.CommandContext` 传入 context + 超时，让取消信号能真正杀掉子进程，防止 goroutine 和子进程泄漏
-2. **通知系统阻塞式发送死锁**（15.6）：`BroadcastNotification` 中 `listener.channel <-` 是阻塞发送，拿着全局大锁遍历所有 listener，单个慢消费者会挂死整个通知系统
-3. **孤儿缓存文件**（13.3）：转码失败/中断/断电时，带随机 token 的不完整文件不会被清理，永久占用磁盘空间
+1. **FFmpeg 子进程无法被中断**（13.2 / 15.2 / 17.2）：改用 `exec.CommandContext` 传入 context + 超时，让取消信号能真正杀掉子进程，防止 goroutine 和子进程泄漏
+2. **通知系统阻塞式发送死锁**（15.6 / 17.6）：`BroadcastNotification` 中 `listener.channel <-` 是阻塞发送，拿着全局大锁遍历所有 listener，单个慢消费者会挂死整个通知系统
+3. **孤儿缓存文件**（13.3 / 17.3）：转码失败/中断/断电时，带随机 token 的不完整文件不会被清理，永久占用磁盘空间
 4. **并发转码重复劳动**（13.6）：后台扫描 + HTTP 请求补转码可能同时跑两个 ffmpeg 转同一个视频，浪费资源
 
 ### 中优先级
@@ -1679,15 +2221,22 @@ gqlgen 内置的 websocket transport 会：
 5. **缺少部分写入保护**（13.3）：视频转码可以参考 sidecar 的做法，先写 `.tmp` 文件，成功后 rename，避免断电留下残次文件
 6. **文件内容变更检测**（13.4 / 15.4）：仅靠 `path_hash` 无法检测文件替换，可以加入 `文件大小 + mtime` 的快速校验
 7. **磁盘空间检查**（13.7）：转码前预估所需空间，不足时告警或降级，避免一个个文件失败
-8. **硬件加速可用性探测**（13.5 / 15.5）：设置了硬件加速但不可用时，自动 fallback 到软编码，而不是直接报错
+8. **硬件加速可用性探测**（13.5 / 15.5 / 17.5）：设置了硬件加速但不可用时，自动 fallback 到软编码，而不是直接报错
+9. **重启后立即触发首次扫描**（17.1）：启动时检查配置的间隔，而不是等一整 interval 才第一次扫
+10. **僵尸 ffmpeg 进程清理**（17.2）：启动时检测并清理上一次运行留下的孤儿 ffmpeg 进程
+11. **增量缓存清理**（17.3）：定期扫描缓存目录，清理 DB 中没有对应 MediaURL 记录的孤儿文件
 
 ### 低优先级
 
-9. **FFmpeg 转码超时**（15.2）：给 ffmpeg 转码加一个合理的超时（如 4 小时），防止损坏视频导致永久挂起
-10. **断线通知补发**（15.8）：WebSocket 重连后丢失的通知可以通过序列号机制补发
-11. **孤儿缓存清理任务**（13.3）：增加一个清理步骤，删除 DB 中没有对应 MediaURL 记录的缓存文件
-12. **正式支持 AMD AMF**（15.5）：在 `hwAccToCodec` map 中增加 `"amf": "h264_amf"`
-13. **时钟回拨保护**（15.1）：如果未来要做基于时间窗的增量扫描，需要考虑时钟回拨问题
-14. **NFS 兼容性**（15.7）：对于 `ESTALE` 等 NFS 特有错误增加重试逻辑
-15. **Mutex 细粒度化**（15.6）：全局大锁改为按用户/按相册分片，减少锁竞争
+12. **FFmpeg 转码超时**（15.2）：给 ffmpeg 转码加一个合理的超时（如 4 小时），防止损坏视频导致永久挂起
+13. **断线通知补发**（15.8 / 17.8）：WebSocket 重连后丢失的通知可以通过序列号机制补发
+14. **正式支持 AMD AMF**（15.5）：在 `hwAccToCodec` map 中增加 `"amf": "h264_amf"`
+15. **时钟回拨保护**（15.1）：如果未来要做基于时间窗的增量扫描，需要考虑时钟回拨问题
+16. **NFS / SMB 兼容性**（15.7 / 17.7）：对于 `ESTALE` 等网络文件系统特有错误增加重试逻辑
+17. **Mutex 细粒度化**（15.6）：全局大锁改为按用户/按相册分片，减少锁竞争
+18. **QSV 全硬件流水线**（17.5）：增加 `-hwaccel qsv -hwaccel_output_format qsv` 参数，实现零拷贝全硬件编解码
+19. **运行时死锁检测**（17.6）：集成 go-deadlock 或 pprof，开发环境启用
+20. **SHA256 内容哈希**（15.4 / 17.4）：如果需要检测文件内容变更，加入 SHA256 内容哈希（配合大小+mtime
+
+
 
