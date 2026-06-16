@@ -2238,5 +2238,618 @@ gqlgen 内置的 websocket transport 每 10 秒发 ping，客户端要回 pong�
 19. **运行时死锁检测**（17.6）：集成 go-deadlock 或 pprof，开发环境启用
 20. **SHA256 内容哈希**（15.4 / 17.4）：如果需要检测文件内容变更，加入 SHA256 内容哈希（配合大小+mtime
 
+---
+
+## 十九、深度细节分析（四）
+
+### 19.1 时区切换下时钟兜底
+
+**结论：EXIF 时间解析存在时区丢失问题，但服务端时间逻辑不受时区切换影响。**
+
+#### EXIF 时间解析
+
+**文件**：`api/scanner/externaltools/exiftool/values.go:63-95`
+
+```go
+const layout = "2006:01:02 15:04:05.999"
+const layoutWithTimezone = "2006:01:02 15:04:05.999Z07:00"
+
+func (t TimeAll) TimeInLocal() time.Time {
+    for _, dateP := range []*string{
+        t.SubSecDateTimeOriginal,
+        t.SubSecCreateDate,
+        t.DateTimeOriginal,
+        t.CreateDate,
+        t.TrackCreateDate,
+        t.MediaCreateDate,
+        t.FileModifyDate,
+    } {
+        if dateP == nil {
+            continue
+        }
+
+        date := *dateP
+
+        // Ignore timezone  ← 注意这行：主动丢弃时区信息
+        if zoneIndex := strings.IndexAny(date, "+-Z"); zoneIndex >= 0 {
+            date = date[:zoneIndex]
+        }
+
+        if date, err := time.ParseInLocation(layout, date, time.UTC); err == nil {
+            return date  // ← 按 UTC 解析，丢掉了原始时区
+        }
+    }
+
+    return time.Time{}
+}
+```
+
+**关键发现**：
+1. `TimeInLocal()` 主动丢弃 EXIF 中的时区信息（`+08:00`、`Z` 等）
+2. 然后按 UTC 解析剩余的时间字符串
+3. 这意味着一个在北京时间 14:00 拍的照片，EXIF 记录 `2025:01:01 14:00:00+08:00`
+4. 丢弃时区后变成 `2025:01:01 14:00:00`，按 UTC 解析，实际是 UTC 14:00
+5. 但真实 UTC 时间应该是 06:00（14:00 - 8h）
+6. **结果：照片拍摄时间被记录为比实际 UTC 时间早了 8 小时**
+
+#### OffsetSecs 的补救
+
+**文件**：`api/scanner/externaltools/exiftool/values.go:98-137`
+
+```go
+func (t TimeAll) OffsetSecs(local time.Time) (int, bool) {
+    // 1. 优先用 OffsetTimeOriginal / OffsetTime（EXIF 2.3.1+ 的标准时区标签）
+    for _, offsetP := range []*string{
+        t.OffsetTimeOriginal,
+        t.OffsetTime,
+    } {
+        if offsetP != nil {
+            if t, err := time.Parse("-07:00", *offsetP); err == nil {
+                _, offsetSecs := t.Zone()
+                return offsetSecs, true
+            }
+        }
+    }
+
+    // 2. 其次用 TimeZone 字段（单位：分钟）
+    if t.TimeZone != nil {
+        return *t.TimeZone * 60, true
+    }
+
+    // 3. 最后用 GPS 时间推算偏移
+    if t.GPSDateTime != nil {
+        gpsDate, _ := time.Parse(layoutWithTimezone, *t.GPSDateTime)
+        gpsDate = gpsDate.UTC()
+        offset := int(local.Sub(gpsDate).Seconds())
+        return offset, true
+    }
+
+    return 0, false
+}
+```
+
+三层时区回退策略：EXIF 时区标签 → TimeZone 字段 → GPS 时间推算。
+
+#### 时区切换的影响
+
+| 场景 | 影响 |
+|------|------|
+| 服务器时区从 UTC 切换到 UTC+8 | `TimeInLocal()` 不受影响（硬编码 UTC），但 `OffsetSecs()` 的 `local.Sub(gpsDate)` 结果不变（两个 `time.Time` 比较不受时区影响） |
+| Docker 容器默认 UTC | 与代码假设一致，没问题 |
+| EXIF 没有时区信息且没 GPS | `OffsetSecs` 返回 `(0, false)`，前端无法知道真实时区，拍摄时间可能是"当地时间当 UTC" |
+| 系统时间被改了时区 | `time.Ticker` 基于 monotonic clock 不受影响（见 17.1） |
+
+#### 兜底缺失
+
+- ❌ 没有"检测到时区偏移异常时发出警告"的逻辑
+- ❌ 没有"服务器时区与 EXIF 时区不一致时提示用户"的机制
+- ❌ `OffsetSecs` 返回 `(0, false)` 时，前端只是不显示时区，不会报错
+
+---
+
+### 19.2 快速 fork-exec 风暴的 reaping 策略
+
+**结论：没有 reaping 策略。大量视频同时转码时，短时间内会 fork 大量子进程，全靠操作系统调度。**
+
+#### 子进程创建模式
+
+Photoview 中有三类外部进程：
+
+| 进程 | 创建方式 | 生命周期 | 并发控制 |
+|------|----------|----------|----------|
+| **ffmpeg** (转码) | `exec.Command().Run()` | 一次性，用完退出 | 受 `max_concurrent_tasks` 间接控制 |
+| **ffmpeg** (截帧) | `exec.Command().Run()` | 一次性，用完退出 | 同上 |
+| **exiftool** | `exec.Command().Start()` | 长驻进程，stdin/stdout 通信 | 单例，不支持并发（代码注释明确说了） |
+
+**文件**：`api/scanner/externaltools/exiftool/exiftool.go:15`
+
+```go
+// Exiftool launches an external `exiftool` process to query photos' exif info.
+// It doesn't support concurrency usage.  ← 不支持并发
+type Exiftool struct { ... }
+```
+
+#### fork-exec 风暴场景
+
+`max_concurrent_tasks` 默认值是可配置的（从 DB `site_info.ConcurrentWorkers` 读），最小为 1，SQLite 下强制为 1：
+
+**文件**：`api/graphql/resolvers/scanner.go:83-89`
+
+```go
+func (r *mutationResolver) SetScannerConcurrentWorkers(ctx context.Context, workers int) (int, error) {
+    if workers < 1 {
+        return 0, errors.New("concurrent workers must at least be 1")
+    }
+    if workers > 1 && drivers.DatabaseDriverFromEnv() == drivers.SQLITE {
+        return 0, errors.New("multiple workers not supported for SQLite databases")
+    }
+    ...
+}
+```
+
+假设设为 4 个 worker，每个相册里 100 个视频，每个视频要调 2 次 ffmpeg（1 次转码 + 1 次截帧）：
+
+```
+4 workers × 每个视频 2 次 ffmpeg = 最多 8 个 ffmpeg 子进程同时存在
+```
+
+**不算风暴**，但问题是：
+
+1. **每个 worker 串行处理**：一个 worker 处理完一个视频（转码 + 截帧）才处理下一个，不是一次性 fork 一堆
+2. **没有 batch 优化**：每次 ffmpeg 都是独立进程，没有 ffmpeg 滤镜图合并多个输入
+3. **exiftool 是瓶颈**：它是单例长驻进程且不支持并发，如果每个媒体都要 exiftool 查 EXIF，它会是串行瓶颈
+
+#### 没有 reaping 的后果
+
+```
+进程 A 正在转码（ffmpeg 子进程 PID 12345）
+进程 A 又启动了截帧（ffmpeg 子进程 PID 12346）
+
+如果进程 A 被杀：
+  ├─ PID 12345 变成孤儿 → init 接管 → 继续跑 → 最终退出 → init 回收
+  └─ PID 12346 变成孤儿 → 同上
+
+没有 SIGCHLD 处理，没有 waitpid 循环。
+Go 的 os/exec 包内部会调用 cmd.Wait() 回收子进程，但前提是父进程还活着。
+```
+
+Go 的 `os/exec` 包内部已经处理了子进程回收（通过 `cmd.Wait()` 调用 `wait4`/`waitid`），不会产生僵尸进程——前提是父进程调了 `Wait()`。当前代码用的是 `cmd.Run()` = `Start()` + `Wait()`，正常情况下不会有僵尸。
+
+---
+
+### 19.3 cgroup 隔离下 cache 清理
+
+**结论：Dockerfile 没有配置 cgroup 感知的缓存清理，容器被 OOM kill 时缓存目录不会被自动清理。**
+
+#### Dockerfile 分析
+
+**文件**：`Dockerfile:155-177`
+
+```dockerfile
+ENV PHOTOVIEW_MEDIA_CACHE=/home/photoview/media-cache
+...
+USER photoview
+ENTRYPOINT ["/app/photoview"]
+```
+
+缓存目录在 `/home/photoview/media-cache`，容器内。
+
+#### cgroup 相关的缺失
+
+| 功能 | 是否有 | 说明 |
+|------|--------|------|
+| 缓存大小限制 | ❌ | 没有配置 `memory.limit_in_bytes` 或 cgroup v2 等效 |
+| OOM 时清理缓存 | ❌ | 没有 OOM handler，被 kill 就退出了 |
+| 磁盘配额 | ❌ | 没有配置 cgroup v2 的 `io.max` 或磁盘配额 |
+| 优雅退出时清理 | ❌ | `SIGTERM` 时只等 1 分钟就退出，不清理缓存 |
+| 缓存目录 tmpfs | ❌ | 没有把缓存放在 tmpfs（容器重启自动清空） |
+| 缓存目录 volume | ✅ | 可以用 Docker volume 挂载，但用户要自己配 |
+
+#### 容器重启的缓存状态
+
+```
+容器重启后：
+  ├─ 如果 PHOTOVIEW_MEDIA_CACHE 是 volume mount → 缓存还在
+  │   └─ DB 还在 → MediaURL 记录还在 → 缓存命中 ✅
+  │
+  ├─ 如果 PHOTOVIEW_MEDIA_CACHE 是容器内路径 → 缓存丢了
+  │   └─ DB 还在 → MediaURL 记录还在 → 磁盘文件没了 → 404
+  │       └─ 但 process_video_task.go:174 有重生成逻辑：
+  │           if _, err := os.Stat(thumbImagePath); os.IsNotExist(err) {
+  │               // 重新生成缩略图
+  │           }
+  │       └─ 注意：这只检查了缩略图，没检查转码后的视频文件
+  │
+  └─ 如果 DB 也丢了（SQLite 在容器内） → 全部重来
+```
+
+#### 缓存文件磁盘泄漏
+
+在 cgroup 隔离下，如果容器磁盘配额有限（如 10G），缓存不断增长最终会满：
+
+1. 转码产生的 `.mp4` 文件（每个可能几百 MB）
+2. 孤儿缓存文件（转码失败/中断后没人清理）
+3. 没有基于大小的 LRU 清理
+
+容器被 OOM kill 或磁盘满了，只是杀掉进程，不清理缓存。下次启动又继续往满了的磁盘写。
+
+---
+
+### 19.4 semaphore 优先级反转
+
+**结论：没有 semaphore，用的是 Mutex + channel。没有优先级概念，不存在优先级反转问题，但存在"低优先级任务阻塞高优先级任务"的等价问题。**
+
+#### 并发控制机制
+
+Photoview 使用的并发控制：
+
+| 机制 | 位置 | 保护对象 |
+|------|------|----------|
+| `sync.Mutex` | `scanner_queue/queue.go:48` | 任务队列 |
+| `sync.Mutex` | `notification/Notification.go:30` | 通知 listener 列表 |
+| `sync.Mutex` | `periodic_scanner.go:34` | 全局 scanner 单例 |
+| `chan bool (buffer 1)` | `scanner_queue/queue.go:49` | 通知 worker 有活干 |
+| `make(chan *models.Notification, 1)` | `resolvers/notification.go:27` | 通知 channel |
+| DB `ConcurrentWorkers` | `queue.go:68` | 最大并发任务数 |
+
+#### "优先级反转"的等价问题
+
+虽然没有严格意义的优先级反转（没有优先级概念），但存在**功能等价的问题**：
+
+**问题 1：全局队列阻塞**
+
+```
+用户 A 有 1000 个视频（低优先级：大相册慢扫）
+用户 B 有 10 个视频（高优先级：小相册快扫）
+
+队列是全局的，先来先服务：
+  ├─ 用户 A 的 4 个 worker 全占满（每个跑 1 小时）
+  └─ 用户 B 的任务排在 up_next 里等（可能等 4 小时）
+
+没有"小任务优先"或"用户公平调度"的机制。
+```
+
+**问题 2：exiftool 串行瓶颈**
+
+```go
+// It doesn't support concurrency usage.
+type Exiftool struct { ... }
+```
+
+exiftool 是单例，所有 worker 都要排队用。一个慢查询会阻塞其他 worker：
+
+```
+Worker 1: exiftool 查询中（大图，慢）← 持有 exiftool
+Worker 2: 等 exiftool...               ← 被阻塞
+Worker 3: 等 exiftool...               ← 被阻塞
+Worker 4: 等 exiftool...               ← 被阻塞
+```
+
+这就是典型的"优先级反转"——Worker 1 在做低价值的 EXIF 查询，Worker 2/3/4 可能已经拿到了 EXIF 数据只想做转码，但因为 exiftool 不可用而排队。
+
+**问题 3：`notificationLock` 全局阻塞**（已在 15.6 分析）
+
+低优先级的"扫描进度通知"发送时拿着全局锁，会阻塞高优先级的"注册新 listener"操作。
+
+---
+
+### 19.5 QSV 回退 CPU 路径
+
+**结论：没有回退。QSV 不可用时直接报错退出，不会 fallback 到 h264 软编码。**
+
+#### 错误传播路径
+
+```
+1. ffmpeg -c:v h264_qsv 启动
+2. QSV 不可用（没有核显/没装驱动/在容器里没映射 /dev/dri）
+3. ffmpeg 输出错误到 stderr，返回非零退出码
+4. cmd.Run() 返回 error
+5. EncodeMp4() 返回 fmt.Errorf("encoding video ... error: %w", err)
+6. ProcessMedia() 返回错误
+7. scanMedia() 记录日志，继续处理下一个文件
+8. 下一个文件也用 h264_qsv，也失败，也跳过
+9. 所有视频全部失败
+```
+
+#### 没有回退的代码证据
+
+**文件**：`api/scanner/media_encoding/executable_worker/ffmpeg_cli.go:74-96`
+
+```go
+func (cli *FfmpegCli) EncodeMp4(inputPath string, outputPath string) error {
+    if cli.err != nil {
+        return fmt.Errorf("encoding video %q error: ffmpeg: %w", inputPath, cli.err)
+    }
+
+    args := []string{
+        "-i", inputPath,
+        "-vcodec", cli.videoCodec,  // ← 固定用初始化时选的编码器
+        "-acodec", "aac",
+        ...
+    }
+
+    cmd := exec.Command(cli.path, args...)
+
+    if err := cmd.Run(); err != nil {
+        return fmt.Errorf("encoding video with %q %v error: %w", cli.path, args, err)
+        // ← 直接返回错误，没有尝试用 defaultCodec 重试
+    }
+
+    return nil
+}
+```
+
+`cli.videoCodec` 在初始化时就固定了，运行时不改变，失败也不回退。
+
+#### 对比：MagickWand 的 IsInstalled 模式
+
+**文件**：`api/scanner/media_encoding/executable_worker/magickwand.go:31-32`
+
+```go
+func (cli *MagickWand) IsInstalled() bool {
+    return cli != nil && cli.initialized
+}
+```
+
+MagickWand 有 `IsInstalled()` 检查，不可用时可以走 ffmpeg 的 JPEG 编码作为 fallback。但 ffmpeg 没有"编码器不可用"的 fallback。
+
+#### 改进方案
+
+```go
+func (cli *FfmpegCli) EncodeMp4(inputPath string, outputPath string) error {
+    if cli.err != nil {
+        return fmt.Errorf("encoding video %q error: ffmpeg: %w", inputPath, cli.err)
+    }
+
+    err := cli.encodeWithCodec(cli.videoCodec, inputPath, outputPath)
+    if err != nil && cli.videoCodec != defaultCodec {
+        log.Warn(nil, "Hardware encoder failed, falling back to software encoding",
+            "failed_codec", cli.videoCodec, "fallback_codec", defaultCodec)
+        err = cli.encodeWithCodec(defaultCodec, inputPath, outputPath)
+    }
+
+    return err
+}
+```
+
+#### Docker 容器中的 QSV 问题
+
+**文件**：`Dockerfile:176`
+
+```dockerfile
+USER photoview
+ENTRYPOINT ["/app/photoview"]
+```
+
+Docker 容器默认不映射 `/dev/dri`（Intel GPU 设备），所以容器内 QSV 不可用。要启用需要：
+
+```bash
+docker run --device /dev/dri:/dev/dri ...
+```
+
+但如果设了 `PHOTOVIEW_VIDEO_HARDWARE_ACCELERATION=qsv` 又没映射设备，所有视频转码都会失败，且不回退。
+
+---
+
+### 19.6 TSAN 生产开销
+
+**结论：没有在生产环境启用 TSAN/race detector。`go.mod` 和 Dockerfile 中都没有 `-race` 编译标志。**
+
+#### 搜索结果
+
+在 `go.mod`、`Dockerfile`、构建脚本中搜索 `-race`、`TSAN`、`thread sanitizer`：
+
+- `go.mod`：无
+- `Dockerfile`：`go build -v -o photoview .`（没有 `-race`）
+- 测试代码：无 `-race` 标志
+
+**文件**：`Dockerfile:101-103`
+
+```dockerfile
+RUN set -a && source /env && set +a \
+    && go env \
+    && go build -v -o photoview .
+# ↑ 没有 -race 标志
+```
+
+#### TSAN 的开销
+
+| 指标 | 正常编译 | `-race` 编译 |
+|------|----------|-------------|
+| 内存开销 | 1x | 5-10x |
+| CPU 开销 | 1x | 5-20x |
+| 二进制大小 | ~30MB | ~100MB+ |
+| 执行速度 | 正常 | 慢 5-20 倍 |
+
+**绝对不能在生产开启**。TSAN 只在开发和测试时使用。
+
+#### 已知的竞态风险
+
+虽然没开 TSAN，但从代码结构可以推断出竞态风险点：
+
+1. **`notificationListeners` slice 的 append**：`RegisterListener` 在锁内 append，`DeregisterListener` 在锁内删除，`BroadcastNotification` 在锁内遍历——这三个操作都在 `notificationLock` 保护下，**没有竞态**，但有死锁风险
+
+2. **`global_scanner_queue` 的 goroutine**：worker goroutine 修改 `in_progress` slice 在 `queue.mutex` 保护下，**没有竞态**
+
+3. **`AlbumScannerCache` 的本地 map**：每个相册扫描任务一个实例，单 goroutine 使用，**没有竞态**
+
+4. **DB 操作**：GORM 本身是并发安全的（驱动层有锁），**没有竞态**
+
+5. **潜在的竞态**：`nextNotificationId` 全局变量在 `RegisterListener` 中递增，但在 `notificationLock` 保护下，**没有竞态**
+
+> 结论：Photoview 的并发模型相对简单（全局大锁），竞态风险低，但死锁风险高。开 `-race` 跑测试是个好实践，但当前没做。
+
+---
+
+### 19.7 SMB 锁升级
+
+**结论：Photoview 不使用文件锁，所以不存在 SMB 锁升级问题。但 SMB 的 byte-range lock 语义差异可能在 ffmpeg 层面造成影响。**
+
+#### Photoview 使用的"锁"
+
+| 锁类型 | 位置 | 作用 |
+|--------|------|------|
+| Go `sync.Mutex` | 内存中 | 保护内存数据结构 |
+| Go `sync.RWMutex` | 内存中 | 保护 `testCachePath` |
+| GORM 事务 | 数据库 | 保护 DB 操作 |
+| ❌ 文件锁 | 无 | 不使用 |
+
+没有任何 `flock()`、`fcntl(F_SETLK)`、`LockFileEx()` 调用。
+
+#### SMB 锁升级问题（背景知识）
+
+SMB 的锁升级（lock upgrade）指从共享锁升级到排他锁。在 POSIX 系统上，`fcntl` 支持锁升级；在 SMB 协议上，锁升级行为取决于 SMB 版本和实现：
+
+| SMB 版本 | 锁升级支持 | 说明 |
+|----------|-----------|------|
+| SMB1 | 有但行为怪异 | byte-range lock，升级可能死锁 |
+| SMB2/3 | 有 | 更规范，但 Windows 和 Linux 客户端行为可能不同 |
+
+**Photoview 不用文件锁，所以完全不受影响。**
+
+#### ffmpeg 内部的文件锁
+
+ffmpeg 在写输出文件时可能会对文件加锁（取决于输出格式和平台），但这是 ffmpeg 内部行为，Photoview 不控制。
+
+如果 ffmpeg 的输出文件在 SMB 共享上，ffmpeg 内部的写操作可能受 SMB 锁语义影响，但这超出了 Photoview 的控制范围。
+
+#### 可能的间接影响
+
+如果多个 Photoview 实例（如 Docker 集群）同时写同一个 SMB 共享的缓存目录：
+
+```
+实例 A 转码视频 1 → 写 /smb_cache/1/web_video_xxx.mp4
+实例 B 转码视频 2 → 写 /smb_cache/2/web_video_yyy.mp4
+```
+
+因为文件名带随机 token，不会写同一个文件。但 `os.MkdirAll` 创建目录时，SMB 的目录操作可能不是原子的。不过当前代码不检查 `os.MkdirAll` 的错误——如果目录已存在就忽略。
+
+---
+
+### 19.8 WebSocket session resume 历史消息回放
+
+**结论：完全不支持。重连后是新 session，没有任何历史消息回放机制。**
+
+#### 当前 session 生命周期
+
+```
+客户端连接
+  ├─ gqlgen 升级 WebSocket
+  ├─ AuthWebsocketInit() 验证 JWT
+  ├─ 注册 NotificationListener（新 ID、新 channel）
+  ├─ gqlgen 开始发 ping（10 秒间隔）
+  │
+  ├─ 正常运行：收到通知 → 通过 channel 发给客户端
+  │
+  ├─ 断开（网络/客户端关闭/服务器关闭）
+  │   ├─ ctx.Done() 触发
+  │   ├─ DeregisterListener() 删除 listener
+  │   └─ channel 被 GC 回收
+  │
+  └─ 重连
+      ├─ 新的 WebSocket 连接
+      ├─ 新的 JWT 验证
+      ├─ 新的 NotificationListener（新 ID、新 channel）
+      └─ 只收到重连后的新通知
+```
+
+#### 缺失的组件
+
+| 组件 | 作用 | 是否有 |
+|------|------|--------|
+| Session ID | 标识唯一会话 | ❌ |
+| 消息序列号 | 标识消息顺序 | ❌ |
+| 消息缓冲区 | 暂存最近 N 条消息 | ❌ |
+| 重连握手 | 客户端说"我上次收到 seq=X" | ❌ |
+| 历史回放 | 服务端从 seq+1 开始补发 | ❌ |
+| Session 状态持久化 | 服务端记住断连前的状态 | ❌ |
+
+#### 与视频转码的关联
+
+视频转码的状态查询有两个路径：
+
+1. **实时通知**（WebSocket subscription）：转码进度、完成通知——**断连即丢失**
+2. **主动查询**（GraphQL query）：查 `MediaURL` 记录——**总是可用**
+
+前端可以在重连后主动发一个 GraphQL query 来获取最新的转码状态，这是唯一的"回放"机制——但它不是自动的，需要前端自己实现。
+
+#### 改进方案
+
+如果要实现历史消息回放，最简单的方案：
+
+```go
+type NotificationWithSeq struct {
+    Seq           int
+    Notification  *models.Notification
+}
+
+var notificationHistory = make([]NotificationWithSeq, 0)
+var lastSeq = 0
+
+func BroadcastNotification(notification *models.Notification) {
+    notificationLock.Lock()
+    defer notificationLock.Unlock()
+
+    lastSeq++
+    entry := NotificationWithSeq{Seq: lastSeq, Notification: notification}
+    notificationHistory = append(notificationHistory, entry)
+
+    // 只保留最近 1000 条
+    if len(notificationHistory) > 1000 {
+        notificationHistory = notificationHistory[len(notificationHistory)-1000:]
+    }
+
+    for _, listener := range notificationListeners {
+        select {
+        case listener.channel <- notification:
+        default:
+            // 非阻塞发送，满了就跳过
+        }
+    }
+}
+```
+
+然后在 `RegisterListener` 时接受 `lastSeenSeq` 参数，补发之后的消息。
+
+---
+
+## 二十、已知问题与改进方向（最终汇总）
+
+基于以上所有分析，视频转码管线目前存在以下可改进点，按优先级排序：
+
+### 高优先级
+
+1. **FFmpeg 子进程无法被中断**（13.2 / 15.2 / 17.2）：改用 `exec.CommandContext` 传入 context + 超时，让取消信号能真正杀掉子进程，防止 goroutine 和子进程泄漏
+2. **通知系统阻塞式发送死锁**（15.6 / 17.6 / 19.4）：`BroadcastNotification` 中 `listener.channel <-` 是阻塞发送，拿着全局大锁遍历所有 listener，单个慢消费者会挂死整个通知系统
+3. **孤儿缓存文件**（13.3 / 17.3 / 19.3）：转码失败/中断/断电时，带随机 token 的不完整文件不会被清理，永久占用磁盘空间
+4. **并发转码重复劳动**（13.6 / 19.4）：后台扫描 + HTTP 请求补转码可能同时跑两个 ffmpeg 转同一个视频，浪费资源
+5. **QSV/NVENC/VAAPI 无回退**（13.5 / 17.5 / 19.5）：硬件编码器不可用时直接报错退出，应该自动 fallback 到 h264 软编码
+
+### 中优先级
+
+6. **缺少部分写入保护**（13.3）：视频转码可以参考 sidecar 的做法，先写 `.tmp` 文件，成功后 rename，避免断电留下残次文件
+7. **文件内容变更检测**（13.4 / 15.4）：仅靠 `path_hash` 无法检测文件替换，可以加入文件大小 + mtime 快速校验
+8. **磁盘空间检查**（13.7 / 19.3）：转码前预估所需空间，不足时告警或降级，避免一个个文件失败
+9. **重启后立即触发首次扫描**（17.1）：启动时检查配置的间隔，而不是等一整 interval 才第一次扫
+10. **僵尸 ffmpeg 进程清理**（17.2 / 19.2）：启动时检测并清理上一次运行留下的孤儿 ffmpeg 进程
+11. **增量缓存清理**（17.3 / 19.3）：定期扫描缓存目录，清理 DB 中没有对应 MediaURL 记录的孤儿文件
+12. **exiftool 并发瓶颈**（19.2 / 19.4）：单例长驻进程不支持并发，多 worker 时成为串行瓶颈，可以启动多个实例或用进程池
+13. **EXIF 时区处理**（19.1）：`TimeInLocal()` 主动丢弃时区信息导致拍摄时间偏差，应保留时区或正确转换
+
+### 低优先级
+
+14. **FFmpeg 转码超时**（15.2 / 19.2）：给 ffmpeg 转码加一个合理的超时（如 4 小时），防止损坏视频导致永久挂起
+15. **断线通知补发 / session resume**（15.8 / 17.8 / 19.8）：WebSocket 重连后丢失的通知可以通过序列号机制补发
+16. **正式支持 AMD AMF**（15.5）：在 `hwAccToCodec` map 中增加 `"amf": "h264_amf"`
+17. **时钟回拨保护**（15.1）：如果未来要做基于时间窗的增量扫描，需要考虑时钟回拨问题
+18. **NFS / SMB 兼容性**（15.7 / 17.7 / 19.7）：对于 `ESTALE` 等网络文件系统特有错误增加重试逻辑
+19. **Mutex 细粒度化**（15.6 / 19.4）：全局大锁改为按用户/按相册分片，减少锁竞争
+20. **QSV 全硬件流水线**（17.5 / 19.5）：增加 `-hwaccel qsv -hwaccel_output_format qsv` 参数，实现零拷贝全硬件编解码
+21. **运行时死锁检测**（17.6）：集成 go-deadlock 或 pprof，开发环境启用
+22. **SHA256 内容哈希**（15.4 / 17.4）：如果需要检测文件内容变更，加入 SHA256 内容哈希（配合大小+mtime）
+23. **TSAN 测试**（19.6）：CI 中加 `go test -race`，开发阶段捕获竞态条件
+24. **Docker cgroup 缓存管理**（19.3）：配置缓存目录 size limit 或基于 LRU 的自动清理
+25. **调度公平性**（19.4）：全局 FIFO 队列改为按用户公平调度，避免大相册饿死小相册
+
 
 
