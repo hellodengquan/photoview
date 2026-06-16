@@ -641,3 +641,555 @@ MediaURL 的 URL 路由由其 `Purpose` 决定：
 3. **HTTP 静态文件服务**：通过 `http.ServeFile` 直接输出 MP4 文件，依赖 HTTP Range 请求实现拖动进度条
 
 如果未来需要支持真正的 HLS 片段化（`.m3u8` 播放列表 + `.ts` 分片），需要在 `ffmpeg_cli.go` 中新增类似 `EncodeHLS` 的方法，使用 ffmpeg 的 `-f hls -hls_time 10 -hls_list_size 0` 等参数，并在 `ProcessVideoTask` 中增加对应 Purpose 和路由处理。
+
+---
+
+## 十三、深度细节分析
+
+### 13.1 全量与增量扫描的区分
+
+**结论：Photoview 采用"全量目录扫描 + 增量式处理"的混合模式。**
+
+#### 全量扫描（目录遍历是全量的）
+
+每次扫描都会递归遍历用户所有根相册目录下的所有文件：
+
+**文件**：`api/scanner/scanner_user.go:45` → `FindAlbumsForUser()`
+
+```go
+// BFS 遍历所有子目录
+scanQueue := list.New()
+for _, album := range userRootAlbums {
+    scanQueue.PushBack(scanInfo{path: album.Path, ...})
+}
+for scanQueue.Front() != nil {
+    albumInfo := scanQueue.Front().Value.(scanInfo)
+    scanQueue.Remove(scanQueue.Front())
+    dirContent, _ := os.ReadDir(albumPath)
+    // 每个子目录都入队
+    for _, item := range dirContent {
+        if item.IsDir() {
+            scanQueue.PushBack(scanInfo{path: subalbumPath, ...})
+        }
+    }
+}
+```
+
+每次扫描都是从根目录开始完整遍历一遍，没有基于 mtime 或文件大小的跳过优化。
+
+#### 增量处理（已存在的媒体跳过处理）
+
+虽然目录是全量扫，但媒体的发现和处理是增量的：
+
+**第一级去重：媒体级（path_hash）**
+
+**文件**：`api/scanner/scanner_media.go:21-38` → `ScanMedia()`
+
+```go
+// 用 path_hash 检查媒体是否已存在于数据库
+var media []*models.Media
+result := tx.Where("path_hash = ?", models.MD5Hash(mediaPath)).Find(&media)
+if result.RowsAffected > 0 {
+    return media[0], false, nil  // isNewMedia = false，已存在就跳过
+}
+```
+
+`path_hash` 是文件路径的 MD5（见 13.4 详解），只与路径有关，与内容无关。
+
+**第二级去重：处理产物级（MediaURL 记录）**
+
+**文件**：`api/scanner/scanner_tasks/processing_tasks/process_video_task.go:34-49`
+
+```go
+// 对三种 Purpose 分别查 DB
+mediaURLFromDB := makePhotoURLChecker(ctx.GetDB(), video.ID)
+videoOriginalURL, _  := mediaURLFromDB(models.MediaOriginal)
+videoWebURL, _       := mediaURLFromDB(models.VideoWeb)
+videoThumbnailURL, _  := mediaURLFromDB(models.VideoThumbnail)
+
+// 有记录就跳过对应阶段
+if videoWebURL == nil && !videoType.IsWebCompatible() { ... 转码 ... }
+if videoThumbnailURL == nil { ... 生成缩略图 ... }
+```
+
+**新旧媒体标识**
+
+`AfterMediaFound` 钩子会收到 `newMedia bool` 参数：
+- `newMedia = true`：第一次发现的新媒体，触发 `VideoMetadataTask` 采集元数据
+- `newMedia = false`：已存在的媒体，跳过元数据采集
+
+但不管新旧，都会进入 `scanMedia()` 走完整的处理任务链，只是任务内部会通过 DB 检查自动跳过已完成的步骤。
+
+> **实际效果**：首次扫描 = 全量处理；后续扫描 = 全量目录遍历 + 仅处理新文件 + 校验旧文件缓存完整性。每次扫描的目录遍历开销是 O(N) 的，但处理开销是 O(新增文件数) 的。
+
+---
+
+### 13.2 FFmpeg 子进程超时与中断机制
+
+**结论：FFmpeg 子进程本身没有超时控制，但上层有两种中断路径。**
+
+#### FFmpeg 命令无超时
+
+**文件**：`api/scanner/media_encoding/executable_worker/ffmpeg_cli.go:89-93`
+
+```go
+func (cli *FfmpegCli) EncodeMp4(inputPath string, outputPath string) error {
+    args := [...]
+    cmd := exec.Command(cli.path, args...)  // ← 用的是 exec.Command，不是 CommandContext
+    return cmd.Run()                         // ← 阻塞等待，没有超时
+}
+```
+
+**关键发现**：
+- 直接使用 `exec.Command` 而非 `exec.CommandContext`
+- `EncodeMp4()` 和 `EncodeVideoThumbnail()` 都没有传入 context，也没有设置超时
+- 理论上一个大视频可以无限期地转码下去
+
+#### 两种中断路径
+
+**路径 1：HTTP 请求取消（客户端断开连接）**
+
+**文件**：`api/routes/videos.go:92-99`
+
+```go
+if err := processSingleMediaFn(r.Context(), db, media); err != nil {
+    if r.Context().Err() != nil && errors.Is(r.Context().Err(), context.Canceled) {
+        log.Warn(r.Context(), "video processing cancelled due to client disconnect", ...)
+        return  // 客户端断了，直接返回，不发响应
+    }
+}
+```
+
+但注意：**context 取消只能中断 Go 层面的逻辑，不能直接杀掉正在运行的 ffmpeg 子进程**。因为 ffmpeg 调用没有传入 context，子进程会继续在后台运行直到完成，只是 Go 代码不再等它了。这是一个潜在的资源泄漏点。
+
+**路径 2：扫描任务的 context 取消**
+
+`scanner_task.TaskContext` 内嵌了 `context.Context`，任务链的每一步都会检查 `ctx.Done()`：
+
+**文件**：`api/scanner/scanner_tasks/scanner_tasks.go:38-49`
+
+```go
+func simpleCombinedTasks(...) error {
+    for _, task := range allTasks {
+        select {
+        case <-ctx.Done():    // ← 每个任务前检查 context 是否取消
+            return ctx.Err()
+        default:
+        }
+        err := doTask(ctx, task)
+        ...
+    }
+}
+```
+
+但同样的问题：只能在 ffmpeg 命令结束后、进入下一个任务时才能检测到取消。正在运行的 ffmpeg 子进程不会被中断。
+
+#### ffprobe 有超时
+
+相比之下，ffprobe 是有超时的：
+
+**文件**：`api/utils/environment_variables.go:87-95`
+
+```go
+func MediaProbeTimeout() time.Duration {
+    if val := EnvMediaProbeTimeout.GetValue(); val != "" {
+        if seconds, err := strconv.Atoi(val); err == nil && seconds > 0 {
+            return time.Duration(seconds) * time.Second
+        }
+    }
+    return 5 * time.Second  // 默认 5 秒
+}
+```
+
+**文件**：`api/scanner/scanner_tasks/processing_tasks/process_video_task.go:206-216`
+
+```go
+func ReadVideoMetadata(videoPath string) (*ffprobe.ProbeData, error) {
+    ctx, cancelFn := context.WithTimeout(context.Background(), utils.MediaProbeTimeout())
+    defer cancelFn()
+    data, err := ffprobe.ProbeURL(ctx, videoPath)  // ← 用了带超时的 context
+    ...
+}
+```
+
+> **总结**：ffprobe 有 5 秒默认超时；ffmpeg 转码没有超时，也不能被 context 取消中断，只能被动等待完成。HTTP 请求端虽然会检测取消，但只是不等了而已，子进程还在跑。
+
+---
+
+### 13.3 断电时部分写入清理
+
+**结论：没有显式的部分写入清理机制，但依靠"先写文件、后写 DB"的顺序 + 下次扫描重处理，实现了最终一致性。**
+
+#### 视频转码的写入顺序
+
+**文件**：`api/scanner/scanner_tasks/processing_tasks/process_video_task.go:87-125`
+
+```go
+// 1. 直接写最终文件名
+webVideoPath := path.Join(mediaCachePath, webVideoName)
+executable_worker.Ffmpeg.EncodeMp4(video.Path, webVideoPath)  // ← 直接写目标路径
+
+// 2. 转码成功后才写 DB
+mediaURL := models.MediaURL{...}
+ctx.GetDB().Create(&mediaURL)  // ← 成功后才入库
+```
+
+**断电场景分析**：
+
+| 断电时机 | 后果 | 恢复方式 |
+|----------|------|----------|
+| 转码过程中断电 | 磁盘上有不完整的 `.mp4` 文件，DB 无记录 | 下次扫描/请求时 DB 查不到 → 重新转码，覆盖不完整文件 |
+| 刚写完文件、还没写 DB 时断电 | 同上 | 同上 |
+| DB 写入中断电 | 事务回滚（`DatabaseTransaction` 包在事务里），相当于没写 | 同上 |
+
+> 关键：因为 **文件写入不在数据库事务内**，且 **直接写最终文件名**，所以断电后会留下残次文件。但下次处理时因为 DB 查不到 MediaURL 记录，会重新转码覆盖掉不完整的文件，最终是一致的。
+
+#### 对比：图片处理有临时文件模式（视频没有）
+
+有趣的是，在 sidecar 任务中图片处理用了 `.hold` 后缀的临时文件模式：
+
+**文件**：`api/scanner/scanner_tasks/processing_tasks/sidecar_task.go:99-117`
+
+```go
+tempHighResPath := baseImagePath + ".hold"  // 先备份原文件
+os.Rename(baseImagePath, tempHighResPath)
+// ... 重新生成 ...
+if err != nil {
+    os.Rename(tempHighResPath, baseImagePath)  // 失败就回滚
+    return err
+}
+os.Remove(tempHighResPath)  // 成功才删掉备份
+```
+
+但视频转码没有用这种模式，直接写目标路径。
+
+#### 清理任务的职责
+
+`MediaCleanupTask`（`cleanup_media.go`）只清理**DB 中存在但磁盘上源文件已删除**的媒体（即用户删了源文件，清理缓存和 DB 记录），不是用来清理部分写入的。
+
+> **风险点**：如果转码到一半失败且留下了不完整文件，而 DB 还没写，这个不完整文件会一直躺在缓存目录里占空间。因为文件名带随机 token（`web_video_xxx_<token>.mp4`），下次重新转码会用**新的随机 token** 写新文件，旧的残次文件就成了孤儿文件，永远不会被清理。
+
+---
+
+### 13.4 Hash 是否考虑元数据修改
+
+**结论：完全不考虑。`path_hash` 只是文件路径的 MD5，与内容、元数据、文件大小、修改时间统统无关。**
+
+#### MD5Hash 实现
+
+**文件**：`api/graphql/models/utils.go:42-46`
+
+```go
+// MD5Hash hashes value to a 32 length digest, the result is the same as the MYSQL function md5()
+func MD5Hash(value string) string {
+    hash := md5.Sum([]byte(value))
+    return hex.EncodeToString(hash[:])
+}
+```
+
+**文件**：`api/graphql/models/media.go:39-44`
+
+```go
+func (m *Media) BeforeSave(tx *gorm.DB) error {
+    m.PathHash = MD5Hash(m.Path)  // ← 只哈希路径字符串
+    return nil
+}
+```
+
+#### 这意味着什么
+
+| 场景 | 是否重新扫描/处理 |
+|------|------------------|
+| 文件路径不变，内容被替换（如覆盖一个同名视频） | ❌ 不会。`path_hash` 不变，DB 认为是同一个媒体，不会重新转码 |
+| 文件改名（路径变了） | ✅ 会。`path_hash` 变了，当成新媒体重新处理 |
+| 文件移动到别的相册 | ✅ 会。路径变了 |
+| EXIF/元数据修改（文件内容变了但路径不变） | ❌ 不会 |
+| 视频重新剪辑后替换原文件 | ❌ 不会。缓存的转码结果还是旧的 |
+
+> **设计意图推测**：Photoview 定位是"只读地浏览你的照片/视频库"，假设源文件是静态的、只会新增不会修改。这与面向用户上传的系统（需要检测文件变化）有本质区别。
+
+#### 补充：缓存文件名的随机性
+
+还有一个有趣的点：缓存文件名带随机 token（`web_video_filename_abc123.mp4`），即使源文件没改，如果 DB 记录丢了重新生成，缓存文件名也会不一样。这说明缓存没有"内容寻址"的设计，完全靠 DB 记录来关联。
+
+---
+
+### 13.5 VAAPI 与 NVENC 硬件加速分支
+
+**结论：支持三种硬件加速（QSV、VAAPI、NVENC），通过环境变量切换，默认软编码 H.264。**
+
+#### 编解码器映射表
+
+**文件**：`api/scanner/media_encoding/executable_worker/ffmpeg_cli.go:13-19`
+
+```go
+const defaultCodec = "h264"
+
+var hwAccToCodec = map[string]string{
+    "qsv":   defaultCodec + "_qsv",     // h264_qsv   - Intel Quick Sync Video
+    "vaapi": defaultCodec + "_vaapi",   // h264_vaapi - Video Acceleration API (Linux)
+    "nvenc": defaultCodec + "_nvenc",   // h264_nvenc - NVIDIA NVENC
+}
+```
+
+#### 初始化逻辑
+
+**文件**：`api/scanner/media_encoding/executable_worker/ffmpeg_cli.go:51-67`
+
+```go
+func newFfmpegCli() *FfmpegCli {
+    ...
+    hwAcc := utils.EnvVideoHardwareAcceleration.GetValue()
+    codec, ok := hwAccToCodec[hwAcc]
+    if !ok {
+        if strings.HasPrefix(hwAcc, "_") {
+            // A secret way to set the codec directly.
+            codec = hwAcc[1:]  // ← 彩蛋：下划线开头直接当编码器名用
+        } else {
+            codec = defaultCodec  // 默认 h264 软编
+        }
+    }
+    ...
+}
+```
+
+#### 环境变量配置
+
+**文件**：`api/utils/environment_variables.go:46`
+
+```go
+EnvVideoHardwareAcceleration EnvironmentVariable = "PHOTOVIEW_VIDEO_HARDWARE_ACCELERATION"
+```
+
+#### 支持的配置值
+
+| 配置值 | 编码器 | 适用硬件 |
+|--------|--------|----------|
+| （空或其他） | `h264` (libx264) | 通用 CPU 软编码 |
+| `qsv` | `h264_qsv` | Intel 核显 (Quick Sync Video) |
+| `vaapi` | `h264_vaapi` | Linux VA-API (AMD/Intel 通用) |
+| `nvenc` | `h264_nvenc` | NVIDIA GPU |
+| `_<任意编码器名>` | 直接使用 | 调试/高级用户（如 `_libx265` 试试 HEVC） |
+
+#### 注意事项
+
+1. **只有视频编码走硬件加速，音频固定是 AAC 软编**（`-acodec aac`）
+2. **没有可用性探测**：设置了 `nvenc` 但系统没有 NVIDIA 显卡的话，ffmpeg 会直接报错退出，转码失败
+3. **没有降级策略**：硬件加速失败不会自动回退到软编码
+4. **彩蛋功能**：`_` 开头可以指定任意 ffmpeg 编码器名，给高级用户调试用。比如设为 `_libx265` 就会用 H.265 编码（但前端播放器兼容性没保证）
+
+---
+
+### 13.6 并发同片段去重机制
+
+**结论：相册级有去重，媒体级没有去重。同一个视频可能被并发转码多次。**
+
+#### 相册级去重（队列层面）
+
+**文件**：`api/scanner/scanner_queue/queue.go:253-263`
+
+```go
+func (queue *ScannerQueue) jobOnQueue(job *ScannerJob) (bool, error) {
+    scannerJobs := append(queue.in_progress, queue.up_next...)
+    for _, scannerJob := range scannerJobs {
+        if scannerJob.ctx.GetAlbum().ID == job.ctx.GetAlbum().ID {  // ← 按相册 ID 去重
+            return true, nil
+        }
+    }
+    return false, nil
+}
+```
+
+同一个相册不会同时有两个扫描任务在跑。
+
+#### 媒体级：没有去重
+
+媒体层面**没有任何互斥**。同一个媒体可能被并发处理多次：
+
+**场景举例**：
+1. 扫描任务正在后台转码视频 A
+2. 恰好用户在浏览器打开视频 A，缓存未命中
+3. HTTP 请求触发 `ProcessSingleMedia()` 也开始转码视频 A
+4. 两个 ffmpeg 进程同时在跑，各写各的文件（因为文件名带随机 token，不会冲突）
+
+#### 为什么不会冲突但会重复劳动
+
+缓存文件名格式：`web_video_<原文件名>_<随机token>.mp4`
+
+**文件**：`api/scanner/scanner_tasks/processing_tasks/process_video_task.go:88-91`
+
+```go
+webVideoName := fmt.Sprintf("web_video_%s_%s", path.Base(video.Path), utils.GenerateToken())
+// web_video_mymovie_abc123def.mp4
+```
+
+每次转码都用新的随机 token，所以两个并发转码会写两个不同的文件。最后 DB 里可能会有两条 MediaURL 记录（都指向同一个 media_id，purpose 都是 video-web），查询时取最新的：
+
+**文件**：`api/routes/videos.go:32-37`
+
+```go
+result := db.Model(&models.MediaURL{}).
+    Where("media_urls.media_name = ? AND media_urls.purpose = ?", mediaName, models.VideoWeb).
+    Order("created_at DESC").  // ← 多个的话按时间倒序，取第一个
+    Find(&mediaURLs)
+```
+
+> **影响**：并发转码不会出错，但会浪费 CPU 和磁盘 IO。对于大视频文件，可能同时跑两个 ffmpeg 把系统资源吃满。
+
+---
+
+### 13.7 磁盘空间不足降级策略
+
+**结论：完全没有。磁盘满了就直接报错，没有任何降级策略。**
+
+#### 现状
+
+搜索 `disk`、`space`、`ENOSPC` 等关键词，整个代码库中没有任何磁盘空间检查逻辑。
+
+转码过程中如果磁盘空间不足：
+1. FFmpeg 写文件会失败，返回非零退出码
+2. `cmd.Run()` 返回 error
+3. 错误层层向上传递，任务失败
+4. 记录一条错误日志，继续处理下一个文件
+
+**文件**：`api/scanner/scanner_album.go:103-106`
+
+```go
+if err := scanMedia(ctx, media, &mediaData, i, len(albumMedia)); err != nil {
+    scanner_utils.ScannerError(ctx, "Error scanning media for album (%d) file (%s): %s\n", ...)
+    // ← 只是打日志，继续下一个
+}
+```
+
+#### 没有的功能
+
+- ❌ 转码前检查剩余磁盘空间
+- ❌ 磁盘不足时自动降低分辨率/码率
+- ❌ 磁盘不足时跳过视频转码（只保留原始文件）
+- ❌ 磁盘不足时暂停扫描等待
+- ❌ 磁盘空间阈值告警
+
+> **实际行为**：扫到哪个文件磁盘满了，那个文件就失败，后面的继续试，一个个失败，直到全部失败或者用户发现。
+
+---
+
+### 13.8 HLS 完成通知前端 Channel
+
+**结论：没有 HLS 自然也没有 HLS 完成通知。但有通用的扫描进度通知系统，基于 WebSocket + Channel 广播。**
+
+#### 通知系统架构
+
+```
+  ┌─────────────────────┐
+  │  scanner 任务产生    │
+  │  Notification 对象  │
+  └─────────┬───────────┘
+            │
+            ▼
+  ┌─────────────────────┐
+  │ BroadcastNotification│
+  │ (遍历所有 listener)  │
+  └─────────┬───────────┘
+            │
+            ▼
+  ┌──────────────────────────┐
+  │ 每个 WebSocket 连接一个  │
+  │  Go channel → 前端接收   │
+  └──────────────────────────┘
+```
+
+#### 通知注册与广播
+
+**文件**：`api/graphql/notification/Notification.go:28-40`
+
+```go
+var notificationListeners []*NotificationListener = make([]*NotificationListener, 0)
+var notificationLock = &sync.Mutex{}
+
+func RegisterListener(user *models.User, channel NotificationChannel) int {
+    notificationLock.Lock()
+    defer notificationLock.Unlock()
+    notificationListeners = append(notificationListeners, NewListener(*user, channel))
+    return nextNotificationId
+}
+```
+
+**文件**：`api/graphql/notification/Notification.go:70-82`
+
+```go
+func BroadcastNotification(notification *models.Notification) {
+    notificationLock.Lock()
+    defer notificationLock.Unlock()
+    for _, listener := range notificationListeners {
+        listener.channel <- notification  // ← 逐个发往每个 listener 的 channel
+    }
+}
+```
+
+> 注意：这里是**阻塞式发送**（`listener.channel <-`），如果某个前端 WebSocket 消费慢了，会阻塞整个广播。而且是全局一把大锁。
+
+#### 通知类型
+
+视频处理相关的通知由 `NotificationTask` 发出：
+
+**文件**：`api/scanner/scanner_tasks/notification_task.go:45-60`
+
+```go
+func (t NotificationTask) AfterProcessMedia(..., updatedURLs []*models.MediaURL, mediaIndex int, mediaTotal int) error {
+    if len(updatedURLs) > 0 {
+        progress := float64(mediaIndex) / float64(mediaTotal) * 100.0
+        notification.BroadcastNotification(&models.Notification{
+            Key:      t.albumKey,
+            Type:     models.NotificationTypeProgress,  // 进度通知
+            Header:   fmt.Sprintf("Processing media for album '%s'", ...),
+            Progress: &progress,
+        })
+    }
+    return nil
+}
+```
+
+**文件**：`api/scanner/scanner_tasks/notification_task.go:62-78`
+
+```go
+func (t NotificationTask) AfterScanAlbum(...) error {
+    if len(changedMedia) > 0 {
+        timeoutDelay := 2000
+        notification.BroadcastNotification(&models.Notification{
+            Type:     models.NotificationTypeMessage,
+            Positive: true,  // 成功通知
+            Header:   fmt.Sprintf("Done processing media for album '%s'", ...),
+            Timeout:  &timeoutDelay,
+        })
+    }
+    return nil
+}
+```
+
+#### 与视频转码的关系
+
+- 视频转码完成后，如果产生了新的 `MediaURL`，`AfterProcessMedia` 会发一条进度通知
+- 整个相册扫描完会发完成通知
+- **但没有专门的"单个视频转码完成"事件**，前端只能看到整体进度百分比，不知道哪个视频刚转好
+
+#### WebSocket 连接
+
+**文件**：`api/server/websocket.go` → `WebsocketUpgrader()`
+
+通知通过 GraphQL Subscription 推送到前端 WebSocket 连接。每个连接对应一个 channel，注册到全局 listener 列表。
+
+---
+
+## 十四、已知问题与改进方向
+
+基于以上分析，视频转码管线目前存在以下可改进点：
+
+1. **FFmpeg 子进程无法被中断**：改用 `exec.CommandContext` 传入 context，让取消信号能真正杀掉子进程
+2. **缺少部分写入保护**：视频转码可以参考 sidecar 的做法，先写 `.tmp` 文件，成功后 rename，避免断电留下残次文件
+3. **孤儿缓存文件**：转码失败或中断时，带随机 token 的不完整文件不会被清理，应在启动时或定期扫描清理
+4. **文件内容变更检测**：仅靠 `path_hash` 无法检测文件替换，可以加入文件大小 + mtime 或内容 hash 校验
+5. **并发转码重复劳动**：可以加一个媒体级的 in-flight map，同一个媒体同时只跑一次转码
+6. **磁盘空间检查**：转码前预估所需空间，不足时告警或降级
+7. **硬件加速可用性探测**：设置了硬件加速但不可用时，自动 fallback 到软编码
+8. **孤儿缓存清理任务**：增加一个清理步骤，删除 DB 中没有对应 MediaURL 记录的缓存文件
+
