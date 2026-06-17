@@ -282,7 +282,157 @@ authenticateMedia / authenticateAlbum:
 
 ---
 
-## 五、安全注意事项
+## 五、Token 删除/过期后的外部访问响应与记录可查性
+
+### 5.1 删除后的响应路径
+
+**HTTP 资源层**（`api/routes/authenticate_routes.go:80-87`）：
+- 按 `Value` 查找 `ShareToken`，若不存在则触发 `gorm.ErrRecordNotFound`
+- 统一返回 `403 Forbidden`，响应消息 `"unauthorized"`，错误原因 `"invalid share token"`
+- 外部访问者无法区分"令牌不存在"与"令牌过期/密码错误"，均为模糊的 403
+
+**GraphQL 查询层**（`api/graphql/resolvers/share_token.go:76-82`）：
+- `Query.shareToken`：找不到返回错误 `"share not found"`
+- `Query.shareTokenValidatePassword`：找不到返回 `false` + 错误 `"share not found"`
+
+**前端页面**（`ui/src/Pages/SharePage/SharePage.tsx:169-181`）：
+- 检测到 `"share not found"` 错误时，展示友好提示页：
+  - 标题：`Share not found`
+  - 描述：`Maybe the share has expired or has been deleted.`
+- 不区分删除与过期，统一归为"链接失效"
+
+### 5.2 过期后的响应路径
+
+**HTTP 资源层**（`api/routes/authenticate_routes.go:89-92`）：
+- 判定逻辑：`time.Now().UTC().After(shareToken.Expire.UTC())`
+- 同样返回 403 `"unauthorized"`，错误原因 `"invalid share token"`
+
+**GraphQL 查询层**（`api/graphql/resolvers/share_token.go:84-98`）：
+- 使用截断到秒的 UTC 时间比较（`fakeTime`），粒度为秒
+- 返回错误 `"share expired"`（明确告知过期）
+
+**注意**：HTTP 层对过期/不存在/密码错误均返回相同的 403 + "unauthorized"，而 GraphQL 层会明确区分 "share expired"、"share not found"、"unauthorized" 三种情况，粒度更细。
+
+### 5.3 记录可查性
+
+| 维度 | 现状 | 说明 |
+|------|------|------|
+| 软删除 | ❌ 不支持 | `DeleteShareToken` 为物理删除（`db.Delete(&token)`），删除后数据库无残留 |
+| 过期自动清理 | ❌ 无机制 | 过期 token 仍留存于数据库，无后台任务定期清理 |
+| 访问审计日志 | ❌ 无 | 无访问计数、访问 IP、访问时间等审计信息 |
+| 分享历史 | ❌ 无 | 仅能查到当前有效的 token，无法追溯已删除的分享 |
+| 查看权限 | ✅ 所有者/管理员 | `Album.Shares` / `Media.Shares` 仅返回当前登录用户创建的令牌；管理员可通过 `getUserToken` 操作任意令牌 |
+| 级联清除 | ✅ 支持 | 删除用户/相册/媒体时，关联 token 级联删除 |
+
+---
+
+## 六、公开标志与 Token 链接的优先级判定
+
+### 6.1 结论：不存在"公开标志"
+
+经过对数据模型和 GraphQL Schema 的全面梳理，**Photoview 没有"公开标志"这一概念**：
+
+- `ShareToken` 模型中无 `is_public`、`visibility` 等字段（`api/graphql/models/share_token.go:7-18`）
+- `Album` / `Media` 模型中无公开/私有属性（`api/graphql/models/album.go:10-21`、`api/graphql/models/media.go`）
+- `SiteInfo` 中无全站公开设置（`api/graphql/models/site_info.go:9-13`）
+- 前端 UI 中的 "Public Link" 文字（`ui/src/components/sidebar/Sharing.tsx:525`）只是对分享链接的称呼，并非独立的权限维度
+
+### 6.2 唯一的公开机制：分享令牌
+
+所有外部访问都**必须**通过分享令牌实现，不存在"直接设为公开即可匿名访问"的模式：
+
+```
+访问方式          是否需要 token   鉴权方式
+─────────────────────────────────────────────
+ GraphQL 查询          是         tokenCredentials 参数
+ HTTP 媒体文件         是         URL ?token=xxx 参数
+ 相册下载 ZIP          是         URL ?token=xxx 参数
+ 前端分享页面          是         URL path /share/{token}
+```
+
+### 6.3 多 Token 并存的优先级
+
+一个相册/媒体可以同时存在**多个**分享令牌（通过 `shares` 查询可见），它们之间是**并列关系**，无优先级差异：
+
+- 每个 token 独立拥有过期时间和密码
+- 任意一个有效 token 都能解锁对应资源
+- 删除其中一个不影响其他
+- 前端"Add shares"按钮可无限追加新令牌
+
+---
+
+## 七、登录态携带非自身 Token 访问时的降级策略
+
+### 7.1 HTTP 资源层：完全忽略 Token
+
+在照片/视频/下载路由中，**只要用户已登录，URL 中的 `?token=xxx` 会被完全无视**。
+
+> 代码位置：`api/routes/authenticate_routes.go:22-43`
+
+```
+authenticateMedia:
+  if user != nil:
+      → 只走 OwnsAlbum 判定
+      → 不读取 URL 中的 token 参数
+      → 不检查令牌有效性
+```
+
+**行为矩阵**：
+
+| 登录态 | 相册权限 | URL 带 token | 结果 |
+|--------|---------|-------------|------|
+| 已登录 | ✅ 拥有 | 任意 | 200 正常访问 |
+| 已登录 | ❌ 不拥有 | ✅ 有效 token | 403（token 被忽略） |
+| 已登录 | ❌ 不拥有 | ❌ 无效 token | 403（token 被忽略） |
+| 未登录 | — | ✅ 有效 token | 200 正常访问 |
+| 未登录 | — | ❌ 无 token | 403 |
+
+**没有降级策略**：两条路径完全互斥，不会因为"用户无权限"就 fallback 到令牌校验。
+
+### 7.2 GraphQL 查询层：Token 优先，不降级
+
+在 `Query.album` 和 `Query.media` 中，规则相反——**只要传了 `tokenCredentials`，就先走令牌路径，且失败不降级**。
+
+> 代码位置：`api/graphql/resolvers/album.go:129-162`、`api/graphql/resolvers/media.go:171-205`
+
+```
+Query.album(id, tokenCredentials):
+  if tokenCredentials != nil:
+      → ShareToken() 验证
+      → 成功 → 返回结果（完全不查用户权限）
+      → 失败 → 直接报错返回，**不 fallback 到用户权限**
+  else:
+      → 走用户权限路径
+```
+
+**行为矩阵**：
+
+| 登录态 | 传了 tokenCredentials | token 有效 | 用户是否拥有 | 结果 |
+|--------|---------------------|-----------|------------|------|
+| 已登录 | ✅ 是 | ✅ 有效 | 任意 | 返回 token 指向的资源 |
+| 已登录 | ✅ 是 | ❌ 无效/过期 | ✅ 拥有 | 报错（不降级！） |
+| 已登录 | ❌ 否 | — | ✅ 拥有 | 返回资源（用户权限） |
+| 已登录 | ❌ 否 | — | ❌ 不拥有 | 报错 |
+| 未登录 | ✅ 是 | ✅ 有效 | — | 返回 token 指向的资源 |
+| 未登录 | ✅ 是 | ❌ 无效 | — | 报错 |
+
+### 7.3 "非自身 Token" 的身份校验
+
+**令牌验证完全不校验 Owner 是否为当前登录用户**：
+
+- `shareTokenFromRequest` 只查 `value = ?`，不关联 `OwnerID`（`api/routes/authenticate_routes.go:80`）
+- `ShareToken()` resolver 同样只按 `value` 查找，Preload 了 `Owner` 但仅用于返回，不做权限判定（`api/graphql/resolvers/share_token.go:76`）
+- 只要知道 token 值、密码（如有）、未过期，任何人（无论登录与否）都能通过 token 访问资源
+
+因此，"登录态携带非自身 token" 的场景：
+- **HTTP 层**：token 被忽略，按登录用户自身权限走
+- **GraphQL 层**：token 生效，按令牌权限走，与登录用户身份无关
+
+唯一对 Owner 做校验的是**写操作**（`DeleteShareToken`、`ProtectShareToken`、`SetExpireShareToken`），需满足 `Owner.id = ? OR Owner.admin = TRUE`（`api/graphql/models/actions/share_token_actions.go:167-183`）。
+
+---
+
+## 八、安全注意事项（补充）
 
 1. **令牌熵不足**：`GenerateToken()` 仅 8 位 62 进制字符（约 47.6 bit），暴力破解空间偏小，建议加长到至少 16 位或使用 UUID。
 2. **已登录用户不检查令牌**：`authenticateMedia`/`authenticateAlbum` 中，登录用户路径与令牌路径互斥。如果登录用户恰好没有某个相册的权限，即使 URL 携带了有效分享令牌，也会被拒绝——这是一个潜在的体验问题。
@@ -290,3 +440,7 @@ authenticateMedia / authenticateAlbum:
 4. **时间比较忽略时区**：`ShareToken()` resolver 用截断到秒的 UTC 时间与 `Expire` 比较，而 `shareTokenFromRequest` 用 `time.Now().UTC()`，两处逻辑一致，但应保证 `Expire` 存储时也是 UTC。
 5. **级联删除**：`ShareToken` 的 `Owner`、`Album`、`Media` 均设置 `OnDelete:CASCADE`，删除用户/相册/媒体时关联令牌自动清除。
 6. **无访问审计**：分享链接的访问没有任何日志或计数机制，无法追踪谁通过链接查看了内容。
+7. **物理删除无迹**：删除分享令牌为硬删除，无回收站、无操作日志，管理员无法追溯已删除的分享记录。
+8. **过期 token 残留**：过期令牌不会自动清理，长期运行后数据库可能累积大量无效记录，且仍可被枚举探测。
+9. **GraphQL 与 HTTP 层行为不一致**：HTTP 层对"不存在/过期/密码错"统一返回模糊的 403，而 GraphQL 层会明确区分错误类型，存在信息泄露粒度差异。
+10. **登录态 + token 的互斥陷阱**：GraphQL 层传了 token 就只走 token 路径，失败不降级到用户权限；HTTP 层有登录态就忽略 token。两处行为相反，容易在前后端联调时产生预期偏差。
