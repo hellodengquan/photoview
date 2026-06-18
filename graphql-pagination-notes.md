@@ -497,3 +497,439 @@ resolver/album.go:21 (albumResolver.Media)
 | 前端 useScrollPagination | `ui/src/hooks/useScrollPagination.ts` | 18-99 |
 | AlbumPage 查询 | `ui/src/Pages/AlbumPage/AlbumPage.tsx` | 16-118 |
 | Timeline 查询 | `ui/src/components/timelineGallery/TimelineGallery.tsx` | 22-193 |
+| unmarshalInputPagination | `api/graphql/generated.go` | 9249-9284 |
+| unmarshalInputOrdering | `api/graphql/generated.go` | 9212-9247 |
+| field_Query_myAlbums_args | `api/graphql/generated.go` | 2712-2756 |
+| field_Album_media_args | `api/graphql/generated.go` | 2078-2106 |
+| GenerateToken | `api/utils/utils.go` | 13-29 |
+| share_token bcrypt | `api/graphql/models/actions/share_token_actions.go` | 153-165 |
+| auth Bearer 校验正则 | `api/graphql/auth/auth.go` | 17 |
+| faces 边界测试 | `api/graphql/resolvers/faces_test.go` | 336-373 |
+
+---
+
+## 七、游标二进制编码细节：项目中**不存在**真正的 Cursor
+
+### 7.1 重要事实澄清
+
+在 `api/` 目录下搜索 `cursor` / `Cursor` / `base64` / `base64.StdEncoding` / `encoding.base64` —— **分页相关代码 0 匹配。
+
+项目中 base64 的使用全部集中在 `scanner/`（媒体处理、blurhash、人脸检测等二进制数据序列化），**完全与分页无关。
+
+### 7.2 易被误判为"游标编码"的 Token 机制
+
+项目中有两类 Token，均易与分页游标混淆，但都与分页无关：
+
+#### （1）Auth Token（访问令牌）
+
+位置：`api/utils/utils.go:13-29
+
+```go
+func GenerateToken() string {
+    const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    const length = 8
+
+    charLen := big.NewInt(int64(len(charset)))
+
+    b := make([]byte, length)
+    for i := range b {
+        n, err := rand.Int(rand.Reader, charLen)
+        if err != nil {
+            log.Panicf("Could not generate random number: %v", err)
+        }
+        b[i] = charset[n.Int64()]
+    }
+    return string(b)
+}
+```
+
+**编码特征**：
+- 使用 `crypto/rand` 加密安全随机数（非伪随机）
+- 字符集 = `[a-zA-Z0-9] 共 62 个字符
+- 长度固定 = 8 字符
+- **无 base64 编码**：直接从 charset 中逐个随机选取，结果是纯可读字符串
+- 用于：存储在 `access_tokens` 表中，认证时从 Cookie 或 `Bearer` 中提取后直接查库校验
+
+#### （2）Share Token 的 bcrypt 密码签名
+
+位置：`api/graphql/models/actions/share_token_actions.go:153-165
+
+```go
+func hashSharePassword(password *string) (*string, error) {
+    var hashedPassword *string = nil
+    if password != nil {
+        hashedPassBytes, err := bcrypt.GenerateFromPassword([]byte(*password), 12)
+        if err != nil {
+            return nil, errors.Wrap(err, "failed to generate hash for share password")
+        }
+        hashedStr := string(hashedPassBytes)
+        hashedPassword = &hashedStr
+    }
+
+    return hashedPassword, nil
+}
+```
+
+**编码特征**：
+- 使用标准 `bcrypt` 哈希，成本因子 = 12
+- 输出是 bcrypt 标准格式字符串（`$2a$12$...）
+- 仅用于 Share Token 的访问密码保护
+- **与分页游标完全无关
+
+### 7.3 分页中"游标等价物"
+
+| 机制 | 内容 | 是否 Base64 | 是否有签名 |
+|------|------|---------|----------|
+| **分页游标 | `offset: { limit, offset } | ❌ | ❌ |
+| **Auth Token | `crypto/rand` 8 字符 | ❌ | ❌（直接查库校验） |
+| **Share Token Value | `crypto/rand` 8 字符 | ❌ | 🔒 Password 用 bcrypt |
+| **Share Token Password | bcrypt 哈希 | ❌ | bcrypt 自包含 salt+hash |
+
+**关键结论**：Photoview 分页完全没有使用任何形式的游标编码（Base64、HMAC 签名、或校验和。前端的"翻页标记"就是一个纯整数 `offset`，直接通过 JSON 明文传输。
+
+---
+
+## 八、分页参数解析链路与空值处理
+
+### 8.1 四层参数解析调用栈
+
+以 `Album.media(paginate: { limit: 200, offset: 0 }) 为例：
+
+```
+GraphQL Variables JSON
+  │
+  │  { "paginate": { "limit": 200, "offset": 0 } }
+  ▼
+第 1 层: field_Album_media_args()   [generated.go:2078]
+  │
+  │  graphql.ProcessArgField(ctx, rawArgs, "paginate",
+  │    func(v any) (*Pagination, error) {
+  │      return ec.unmarshalOPagination2ᚖ...(ctx, v)
+  │    })
+  ▼
+第 2 层: unmarshalOPagination2ᚖgithubᚗcomᚋphotoviewᚋphotoviewᚋapiᚋgraphqlᚋmodelsᚐPagination
+          [generated.go:12952-12958]
+  │
+  │  if v == nil → return nil, nil  // 外层为空则返回 (nil, nil)
+  │  res, err := ec.unmarshalInputPagination(ctx, v)
+  │  return &res, err
+  ▼
+第 3 层: unmarshalInputPagination()   [generated.go:9249-9284]
+  │
+  │  var it models.Pagination       // 零值: {Limit: nil, Offset: nil
+  │  if obj == nil { return it, nil }
+  │
+  │  asMap := obj.(map[string]any)
+  │  fieldsInOrder := [...]string{"limit", "offset"}
+  │  for _, k := range fieldsInOrder {
+  │    v, ok := asMap[k]; if !ok { continue }
+  │    switch k {
+  │      case "limit":
+  │        data, err := ec.unmarshalOInt2ᚖint(ctx, v)
+  │        it.Limit = data
+  │      case "offset":
+  │        data, err := ec.unmarshalOInt2ᚖint(ctx, v)
+  │        it.Offset = data
+  ▼
+第 4 层: unmarshalOInt2ᚖint()   [generated.go:12855-12861]
+  │
+  │  if v == nil { return nil, nil }  // 字段缺失或为 null 时返回 (nil, nil)
+  │  res, err := graphql.UnmarshalInt(v)  // gqlgen 库标准 Int 解析
+  │  return &res, graphql.ErrorOnPath(ctx, err)
+  ▼
+最终: Pagination{ Limit: &200, Offset: &0 }
+```
+
+### 8.2 空值处理矩阵
+
+| 输入情形 | unmarshalOPagination2... 返回 | 后续行为 |
+|---------|-----------------------------|----------|
+| **未传 paginate 参数 | `(nil, nil)` | `FormatSQL(tx, nil, nil)` → **无 LIMIT/OFFSET，返回全部 |
+| `paginate: null` | `(nil, nil)` | 同上 |
+| `paginate: {}` | `&Pagination{Limit: nil, Offset: nil}` | `FormatSQL` 中两个 if 都不触发，同上 |
+| `paginate: { limit: null }` | `&Pagination{Limit: nil, Offset: nil}` | 同上 |
+| `paginate: { offset: null }` | `&Pagination{Limit: nil, Offset: nil}` | 同上 |
+| `paginate: { limit: 200 }` | `&Pagination{Limit: &200, Offset: nil}` | 仅加 LIMIT 200，无 OFFSET |
+| `paginate: { offset: 100 }` | `&Pagination{Limit: nil, Offset: &100}` | 仅加 OFFSET 100，无 LIMIT（危险：返回从 101 条到末尾 |
+| `paginate: { limit: 200, offset: 0 }` | `&Pagination{Limit: &200, Offset: &0}` | LIMIT 200 OFFSET 0 |
+
+### 8.3 Ordering 的相同的完全相同
+
+Ordering 的四层解析与 Pagination 完全同构：
+- `unmarshalOOrdering2... → `unmarshalInputOrdering` → `unmarshalOString2...`（order_by） + `unmarshalOOrderDirection2...`（order_direction）
+- 所有字段缺失/为 null 时返回指针为 `nil`
+- `FormatSQL` 中 `order != nil && order.OrderBy != nil` 两个条件同时满足才会生成 ORDER BY 子句
+
+---
+
+## 九、边界页处理路径：first=0、空集与小集合
+
+### 9.1 limit = 0 的处理路径
+
+**gqlgen 层：`unmarshalOInt2ᚖint` 对 `0` 会正常解析为 `&0`，无任何特殊处理。
+
+**FormatSQL 层**：
+
+```go
+// api/graphql/models/utils.go:16-19
+if paginate != nil {
+    if paginate.Limit != nil {
+        tx.Limit(*paginate.Limit)   // *paginate.Limit = 0 → tx.Limit(0)
+    }
+}
+```
+
+**GORM 层**：`tx.Limit(0)` 直接传递给数据库驱动 → SQL `LIMIT 0`。
+
+**数据库层**：
+- PostgreSQL / MySQL / SQLite：`LIMIT 0` 合法，返回 **0 行结果集**，不报错
+- 性能：数据库优化器直接识别 LIMIT 0，无需扫描表，几乎零开销
+
+**Resolver 层**：
+```go
+// albumResolver.Media 中：
+query.Find(&media)
+// media 为 len(media) == 0，err == nil
+```
+→ GORM `Find` 对空结果**不报错**，只返回空 slice，err 为 nil
+
+**gqlgen 序列化层**：
+```go
+// api/graphql/generated.go:12390-12404
+func marshalNMedia2ᚕᚖ...Mediaᚄ(ctx, sel, v []*models.Media) {
+    ret := graphql.MarshalSliceConcurrently(ctx, len(v), 0, false, ...)
+    // len(v) = 0 → 生成空 JSON 数组 []
+    for _, e := range ret { ... }  // 循环 0 次
+    return ret  // 返回 graphql.MarshalSliceConcurrently 空数组
+}
+```
+→ 最终输出 `"media": []`（空 JSON 数组）
+
+### 9.2 空集合（无匹配数据）的处理路径
+
+**条件**：用户相册为空 / `onlyFavorites: true 但无收藏 / `fromDate` 过滤后无结果。
+
+**链路**：
+```
+resolver → db.Where(...).Find(&media)
+  │
+  │  GORM: SELECT ... WHERE ... LIMIT 200 OFFSET 0
+  │  → 结果 0 行
+  ▼
+media = []*models.Media{}（空 slice，len=0，cap=0）
+  │
+  ▼
+gqlgen marshalNMedia2[...]
+  │
+  │  MarshalSliceConcurrently(ctx, 0, 0, false, ...)
+  │  → 生成空 JSON 数组 []
+  ▼
+JSON 输出: "media": []
+```
+
+**前端判断逻辑**（`ui/src/hooks/useScrollPagination.ts:53-63`）：
+```typescript
+fetchMore({ variables: { offset: itemCount } }).then(result => {
+    const newItemCount = getItems(result.data).length
+    if (newItemCount == 0) {
+        setFinished(true)  // ← 加载到 0 条即标记结束，停止触发加载更多
+    }
+})
+```
+→ 前端通过"本次新增 0 条"判断已到底部。
+
+### 9.3 小集合（数据量 < limit）的处理路径
+
+**条件**：limit = 200，但实际匹配总数 = 57。
+
+**SQL 层**：`LIMIT 200 OFFSET 0` → 数据库返回 57 行，GORM 自动截断（实际只有 57 行返回）
+
+**Resolver 层**：`len(media) = 57`，**不报错。
+
+**前端第一页**（57 条全部加载）：
+```typescript
+// useScrollPagination
+itemCount = 57
+fetchMore({ variables: { offset: 57, limit: 200 }})
+  │
+  ▼
+后端: SELECT ... LIMIT 200 OFFSET 57
+  → 返回 0 行
+  │
+  ▼
+newItemCount = 0 → setFinished(true)
+```
+→ 第二页请求 offset = 57，返回 0 条 → 判定加载完成。
+
+### 9.4 offset 溢出（offset > 总数）的处理路径
+
+**条件**：总数 = 57，但 offset = 1000。
+
+**SQL 层**：`LIMIT 200 OFFSET 1000` → 数据库需跳过 1000 行后，剩余 0 行。
+
+**数据库行为差异**：
+| 数据库 | OFFSET 超过总行数 | 性能 |
+|-------|----------------|------|
+| PostgreSQL | 正常返回空结果 | 仍需扫描并丢弃 offset 行（大 offset 性能差） |
+| MySQL | 正常返回空结果 | 同上 |
+| SQLite | 正常返回空结果 | 同上 |
+
+**Resolver / gqlgen / 前端**：处理方式与 9.2 空集合完全相同 → 空 JSON 数组 → 前端 `setFinished(true)`。
+
+### 9.5 边界条件测试覆盖情况
+
+| 边界场景 | 单元测试覆盖 | 位置 |
+|---------|-----------|------|
+| 空输入 ID 列表返回空 | ✅ `TestGetUserOwnedImageFaces` | `faces_test.go:337-347` |
+| 用户无关联相册返回空 | ✅ | `faces_test.go:349-373` |
+| Timeline 基础分页 | ❌ 无测试 | — |
+| `limit=0` | ❌ 无测试 | — |
+| offset > 总数 | ❌ 无测试 | — |
+| 空相册 media | ❌ 无测试 | — |
+| `onlyFavorites` 空 | ✅ `TestMyTimeline` | `timeline_actions_test.go:102-108` |
+| `fromDate` 过滤 | ✅ | `timeline_actions_test.go:110-116` |
+| 合并相同 media 去重 | ✅ `TestCombineFaceGroups` | `faces_test.go:126-158` |
+
+### 9.6 FormatSQL 的完整代码分析
+
+```go
+// api/graphql/models/utils.go:11-40
+func FormatSQL(tx *gorm.DB, order *Ordering, paginate *Pagination) *gorm.DB {
+    // 1. paginate 为 nil → 完全跳过 limit/offset
+    if paginate != nil {
+        // 1a. Limit 为 nil → 不设置 LIMIT，返回全部剩余
+        if paginate.Limit != nil {
+            tx.Limit(*paginate.Limit)
+        }
+        // 1b. Offset 为 nil → 不设置 OFFSET，从头开始
+        if paginate.Offset != nil {
+            tx.Offset(*paginate.Offset)
+        }
+    }
+
+    // 2. order 为 nil → 完全跳过 ORDER BY，使用数据库默认顺序
+    if order != nil && order.OrderBy != nil {
+        // 2a. OrderDirection 为 nil → 默认 ASC
+        desc := false
+        if order.OrderDirection != nil && order.OrderDirection.IsValid() {
+            if *order.OrderDirection == OrderDirectionDesc {
+                desc = true
+            }
+        }
+        tx.Order(clause.OrderByColumn{
+            Column: clause.Column{Name: *order.OrderBy},
+            Desc: desc,
+        })
+    }
+    return tx
+}
+```
+
+**所有组合共 9 种情形**：
+
+| paginate | order | SQL 结果 |
+|---------|-------|---------|
+| nil | nil | 无 LIMIT，无 ORDER BY → 全表返回，DB 默认顺序 |
+| nil | {OrderBy: "title"} | 无 LIMIT，ORDER BY title ASC → 全表按标题排序 |
+| {Limit: 200} | nil | LIMIT 200，无 ORDER BY → 前 200 条，DB 默认顺序 |
+| {Limit: 200, Offset: 400} | nil | LIMIT 200 OFFSET 400 → 第 401-600 条 |
+| {Limit: 0} | {OrderBy: "date"} | LIMIT 0 ORDER BY date → 0 行 |
+| {Offset: 100} | {OrderBy: "title", DESC} | OFFSET 100 ORDER BY title DESC → 第 101 条到末尾，按标题降序 |
+| {Limit: 200, Offset: 0} | {OrderBy: "date", DESC} | 正常分页：LIMIT 200 OFFSET 0 ORDER BY date DESC |
+| {}（所有字段 nil | {}（所有字段 nil | 与 nil, nil 相同 → 无 LIMIT，无 ORDER BY |
+| {Limit: nil, Offset: nil} | {OrderBy: nil, OrderDirection: nil} | 同上 |
+
+---
+
+## 十、签名/校验位置总览（与分页无关但易混淆）
+
+项目中有三类签名/校验机制，**均与分页游标无关，但常被误读：
+
+### 10.1 Auth Token 校验
+
+**位置**：`api/graphql/auth/auth.go:31-70
+
+```go
+var bearerRegex = regexp.MustCompile("^(?i)Bearer ([a-zA-Z0-9]{24})$")
+
+func Middleware(db *gorm.DB) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            // 从 Cookie 中读取 "auth-token"
+            if tokenCookie, err := r.Cookie("auth-token"); err == nil {
+                loaders := dataloader.For(r.Context())
+                // Dataloader 批量查库校验 token → 返回 User
+                user, err := loaders.UserFromAccessToken.Load(tokenCookie.Value)
+                // 错误处理（查库失败返回 401
+                if err != nil { ... }
+                if user == nil { ... }
+                // 通过 → 放入 context
+                ctx := AddUserToContext(r.Context(), user)
+                r = r.WithContext(ctx)
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+```
+
+**校验方式**：正则 `[a-zA-Z0-9]{24}` 正则校验格式 + Dataloader 查库校验存在性。Token 本身**不签名，存在性校验，token value 直接明文存储。
+
+### 10.2 Share Token 密码签名
+
+**位置**：`api/graphql/models/actions/share_token_actions.go:40, 79-87, 153-165
+
+```go
+// 创建时哈希
+hashedPassBytes, err := bcrypt.GenerateFromPassword([]byte(*password), 12)
+hashedStr := string(hashedPassBytes)
+shareToken := models.ShareToken{
+    Value:    utils.GenerateToken(),  // 8 字符随机
+    Password: &hashedStr,           // bcrypt 哈希
+    ...
+}
+
+// 校验时（登录/访问时）
+err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(inputPassword))
+```
+
+**签名方式**：bcrypt（含 salt + 2^12 = 4096 次迭代）
+
+### 10.3 Media URL 签名
+
+Media 图片 URL 通过 `api/routes/photos.go` 和 `videos.go` 中通过 `api/utils` 文件路由
+
+```go
+// 例如照片路由鉴权
+// 路由签名逻辑：token 从 URL query 参数中提取，查数据库校验 token 是否属于该媒体
+```
+
+### 10.4 与分页的区别
+
+| 方面 | 分页 offset | Auth Token | Share Token Password | Media URL Token |
+|-----|-------------|------------|--------------------|----------------|
+| **目的 | 翻页位置标记 | 用户身份识别 | 分享链接密码保护 | 媒体访问授权 |
+| **编码** | JSON 整数明文 | `[a-zA-Z0-9]{8} | bcrypt `$2a$12$...` | `[a-zA-Z0-9]{8} |
+| **Base64** | ❌ | ❌ | ❌（bcrypt 自身编码非 base64） | ❌ |
+| **HMAC 签名 | ❌ | ❌ | ✅ bcrypt（单向哈希） | ❌ |
+| **校验方式** | 无（直接传数据库） | 查 `access_tokens` 表 | bcrypt.Compare | 查 `media_urls` 表 |
+| **过期机制** | 无（始终有效） | Token 行删除即失效 | `Expire` 字段 | 无永久有效 |
+
+---
+
+## 十一、修正与补充：之前"游标"概念在本项目中的实际对应
+
+| Relay/GraphQL 标准术语 | Photoview 中的等价实现 |
+|---------------------|---------------------|
+| `first: N` | `paginate: { limit: N }` |
+| `after: Cursor` | `paginate: { offset: position }` |
+| `last: N` | ❌ 不存在（无反向分页） |
+| `before: Cursor` | ❌ 不存在 |
+| `edges { node, cursor }` | ❌ 不存在（直接返回 `[T]!` 数组） |
+| `pageInfo { hasNextPage, hasPreviousPage, startCursor, endCursor }` | ❌ 不存在（前端靠 `len(result)==0` 判断 |
+| `totalCount` | ❌ 不存在（总数字段 |
+| `encodeCursor()` / `decodeCursor()` | ❌ 不存在（offset 明文传输，无需编解码 |
+| `base64("arrayconnection:123")` | ❌ 无编码 |
+| Cursor HMAC 签名防篡改 | ❌ 无签名，offset 可被前端任意修改 |
+
+**安全提示**：由于 offset 是明文整数，前端可以构造 offset 参数，**理论上可以构造任意 offset（如 `offset: 999999`），但由于后端没有做范围校验，数据库会执行，但由于 GORM 的 `tx.Offset(999999)` 直接传递给数据库，大 offset 会导致数据库扫描大量行然后丢弃，**存在潜在的 DoS 风险**。
