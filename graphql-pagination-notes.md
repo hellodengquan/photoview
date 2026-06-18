@@ -1520,3 +1520,678 @@ type Media struct {
 | `myTimeline` | ✅ 100% 触发 | DATE_TRUNC 函数调用，列不原生排序 | 表达式索引 |
 | `myAlbums` | ⚠️ albums 行数少（通常 <1000），影响可忽略 | 虽无索引但数据量小 | 无需优化 |
 | `myFaceGroups` | ⚠️ 同上，通常 <1000 组 | 用 COUNT 排序但量小 | 无需优化 |
+
+---
+
+## 十五、GORM Session 与事务隔离：按代码顺序拆解
+
+### 15.1 GORM DB 实例从启动到 Resolver 的完整生命周期
+
+```
+[进程启动阶段] main.go / server setup
+  │
+  │  SetupDatabase()   [database.go:113-152]
+  │    │
+  │    ├─ gorm.Config{}  ← 空配置，无自定义 Session
+  │    │   └─ Logger: 根据开发模式决定 Info/Warn
+  │    │
+  │    ├─ ConfigureDatabase(&config)  [database.go:77-110]
+  │    │   ├─ drivers.DatabaseDriverFromEnv()  → 读 PHOTOVIEW_DATABASE_DRIVER
+  │    │   │   → mysql / sqlite / postgres 三选一
+  │    │   │
+  │    │   ├─ [mysql] GetMysqlAddress() → 解析 DSN
+  │    │   │     └─ config.MultiStatements = true
+  │    │   │        config.ParseTime = true
+  │    │   │        ↑ 注意：未设置 parsetime 默认事务隔离级别
+  │    │   │        ↑ 默认用 go-sql-driver/mysql 默认 = REPEATABLE-READ
+  │    │   │
+  │    │   ├─ [sqlite] GetSqliteAddress()  [database.go:53-75]  ← 关键配置
+  │    │   │     ├─ _journal_mode = WAL        (Write-Ahead Logging)
+  │    │   │     ├─ _locking_mode = NORMAL     (读写并发)
+  │    │   │     ├─ _foreign_keys = ON
+  │    │   │     ├─ cache = shared
+  │    │   │     └─ mode = rwc                 (read-write-create)
+  │    │   │
+  │    │   ├─ [postgres] GetPostgresAddress() → url.Parse，无额外参数
+  │    │   │     → 完全由 DSN 中的 sslmode、options 决定
+  │    │   │     → 未指定 default_transaction_isolation
+  │    │   │
+  │    │   └─ gorm.Open(dialector, config)  → 返回 *gorm.DB 单例
+  │    │         ↑ 此实例内部持有：连接池 + Config + 空 Statement
+  │    │
+  │    ├─ sqlDB.SetMaxOpenConns(80)   [database.go:140]
+  │    │     → 全局连接池最大 80 个连接
+  │    │     → 每个查询独立获取连接，用完归还
+  │    │
+  │    └─ 返回 *gorm.DB 实例
+  │
+  │  NewRootResolver(db)  [resolver.go:15-19]
+  │    └─ Resolver { database: db }  ← 保存单例引用
+  ▼
+[HTTP 请求阶段] GraphQL 请求到达
+  │
+  │  Auth Middleware  [auth.go:31-70]
+  │    └─ r.WithContext(ctx)  ← 注入 User 到 context，无 DB 变更
+  │
+  │  Dataloader Middleware  [loaders.go:35]
+  │    └─ r.WithContext(ctx)  ← 注入 Dataloaders，无 DB 变更
+  │
+  ▼
+[Resolver 执行阶段]
+  │
+  │  albumResolver.Media(ctx, obj, order, paginate, onlyFavorites)
+  │    │
+  │    ├─ r.DB(ctx)   [resolver.go:22-24]
+  │    │    │
+  │    │    │    // 代码：
+  │    │    │    // func (r *Resolver) DB(ctx context.Context) *gorm.DB {
+  │    │    │    //     return r.database.WithContext(ctx)
+  │    │    │    // }
+  │    │    │
+  │    │    └─ r.database.WithContext(ctx)  ← ★ 关键点 1
+  │    │         │
+  │    │         │  GORM 内部实现 (gorm.io/gorm v1.31.1)：
+  │    │         │  func (db *DB) WithContext(ctx context.Context) *DB {
+  │    │         │      if ctx == nil {
+  │    │         │          return db
+  │    │         │      }
+  │    │         │      // 克隆一个新 Session（浅拷贝 Statement，不共享内存）
+  │    │         │      tx := db.getInstance()
+  │    │         │      tx.Statement.Context = ctx
+  │    │         │      return tx
+  │    │         │  }
+  │    │         │
+  │    │         └─ 返回**新克隆**的 *gorm.DB，ctx 已绑定
+  │    │              → 每个 Resolver 拿到独立的 DB 实例
+  │    │              → 但底层共享同一个 sql.DB 连接池
+  │    │
+  │    ├─ query := r.DB(ctx).Where(...).Where(...)
+  │    │    │
+  │    │    │  每次链式调用都会内部再次克隆：
+  │    │    │  func (db *DB) Where(query interface{}, args ...interface{}) (tx *DB) {
+  │    │    │      tx = db.getInstance()   // 每次克隆
+  │    │    │      tx.Statement.AddClause(clause.Where{...})
+  │    │    │      return
+  │    │    │  }
+  │    │    │
+  │    │    └─ 产生一个独立 query（Statement 独立）
+  │    │
+  │    ├─ models.FormatSQL(query, order, paginate)   [utils.go:11-40]
+  │    │    ├─ tx.Limit(*paginate.Limit)    → 克隆 + 设置 Clause.LIMIT
+  │    │    ├─ tx.Offset(*paginate.Offset)  → 克隆 + 修改 Clause.LIMIT.Offset
+  │    │    └─ tx.Order(clause.OrderByColumn{...})  → 克隆 + 设置 Clause.ORDER BY
+  │    │
+  │    └─ query.Find(&media)   [GORM 内部]
+  │         │
+  │         ├─ 1. 从连接池获取 sql.Conn（可能新建，可能复用）
+  │         │      → sqlDB.Conn(ctx) 阻塞直到拿到连接
+  │         │      → ★ 关键点 2：没有 BEGIN，是 auto-commit 模式！
+  │         │
+  │         ├─ 2. db.Statement.Build("SELECT")
+  │         │      → 组装 SQL 字符串（参数化占位符）
+  │         │
+  │         ├─ 3. stmt, err := tx.Statement.ConnPool.PrepareContext(ctx, sql)
+  │         │      → DB 驱动层预编译
+  │         │
+  │         ├─ 4. rows, err := stmt.QueryContext(ctx, vars...)
+  │         │      → 发送到数据库执行
+  │         │      → ★ 关键点 3：单条 SELECT，无事务包裹
+  │         │
+  │         └─ 5. rows.Close() → 归还连接到连接池
+  ▼
+[后续字段解析] gqlgen 调度子 Resolver
+  │
+  │  mediaResolver.Thumbnail(ctx, media)
+  │    ├─ r.DB(ctx)   ← 再次 WithContext，又一个独立 *gorm.DB
+  │    └─ Dataloader 批量查 media_urls
+  │         └─ 单独获取连接，单独执行 SQL
+  │
+  └─ 同一张表的两次查询可能拿到**不同的连接池连接**
+      → 完全独立的执行上下文
+      → 无法看到彼此的未提交写入（但所有写入都已提交，因为 auto-commit）
+```
+
+### 15.2 Session 隔离分析：每个 Resolver 的独立性
+
+| 概念 | 实际情况 | 对分页一致性的影响 |
+|-----|---------|------------------|
+| **GORM *gorm.DB 实例共享性** | 每个 `WithContext` + 链式调用都克隆 | ✅ 无数据竞争（独立 Statement） |
+| **Statement 内存共享** | 每个查询独立 clone | ✅ 不会互相污染 WHERE/LIMIT/OFFSET |
+| **SQL 连接共享** | 从 80 连接池随机获取 | ❌ 两次查询可能不同连接，MVCC 视图不同 |
+| **显式事务** | 分页查询均无，完全 auto-commit | ❌ 每条 SELECT 是独立快照 |
+| **事务隔离级别** | 使用各数据库驱动默认 | ❌ 差异大（详见 15.3） |
+| **跨 Resolver 一致性** | 完全无保障 | ❌ 翻第一页和第二页的可见性可能不一致 |
+
+### 15.3 三种数据库驱动的默认事务隔离级别对比
+
+#### A. PostgreSQL（默认 READ COMMITTED）
+
+驱动：`gorm.io/driver/postgres v1.6.0` → 底层 `github.com/jackc/pgx/v5`
+
+```go
+// PostgreSQL 默认行为（未在 DSN 中指定 transaction_isolation）：
+//   数据库默认 SHOW default_transaction_isolation = 'read committed'
+//
+// 对单条 SELECT（auto-commit）的含义：
+//   1. 语句开始时获取快照
+//   2. 语句执行期间只能看到语句开始前已提交的数据
+//   3. 同一会话的下一条 SELECT 获取新快照
+//
+// 对分页的影响（最常见）：
+//   T0: 用户点击下一页，前端 fetchMore(offset=200)
+//   T1: 第 1 页 SELECT (offset 0-199) 开始 → 快照 S1
+//   T2: Scanner 提交了新照片（已插入且 COMMIT）
+//   T3: 第 2 页 SELECT (offset 200-399) 开始 → 快照 S2
+//        ↑ S2 能看到 T2 的新插入，S1 看不到
+//        → 如果新照片排序在 199 和 200 之间
+//        → 第 2 页第 1 条是原第 199 条（重复）
+//
+// READ COMMITTED 下，同一翻页会话的两次请求**必然**不同快照
+```
+
+#### B. MySQL InnoDB（默认 REPEATABLE READ）
+
+驱动：`gorm.io/driver/mysql v1.6.0` → 底层 `github.com/go-sql-driver/mysql v1.10.0`
+
+```go
+// MySQL 连接配置 [database.go:24-38]：
+func GetMysqlAddress(addressString string) (string, error) {
+    config, _ := mysql.ParseDSN(addressString)
+    config.MultiStatements = true   // 允许多语句
+    config.ParseTime = true         // 时间解析
+    // ★ 未设置 config.Params["transaction_isolation"]
+    // → 使用 MySQL Server 默认
+    // → MySQL 8.0 默认 transaction_isolation = REPEATABLE-READ
+}
+
+// MySQL InnoDB 的 REPEATABLE READ 特性：
+//   ★ 但这仅在**显式 START TRANSACTION**内生效！
+//   ★ auto-commit 模式下的单条 SELECT：
+//     - 行为与 READ COMMITTED 几乎相同
+//     - 每条语句都获取新的 ReadView（读视图）
+//     - 因为没有 BEGIN，InnoDB 不启动一致性快照
+//
+// 对分页的影响：
+//   与 PostgreSQL READ COMMITTED 完全相同
+//   → 翻到下一页时可能看到第一页之后提交的写入
+//   → 重复/遗漏同样可能发生
+//
+// 额外风险：config.MultiStatements = true
+//   → 虽不直接影响 OFFSET 一致性，但放宽了驱动对 SQL 注入的限制
+//   → 若 ORDER BY 被注入，攻击者可构造多语句
+```
+
+#### C. SQLite（WAL 模式 + NORMAL 锁）
+
+驱动：`gorm.io/driver/sqlite v1.6.0` → 底层 `github.com/mattn/go-sqlite3`
+
+```go
+// SQLite 关键配置 [database.go:63-70]：
+queryValues.Add("cache", "shared")         // 多连接共享页缓存
+queryValues.Add("mode", "rwc")             // read-write-create
+queryValues.Add("_journal_mode", "WAL")    // Write-Ahead Logging ← 关键
+queryValues.Add("_locking_mode", "NORMAL") // 读写并发 ← 关键
+queryValues.Add("_foreign_keys", "ON")
+
+// SQLite WAL 模式下的并发行为：
+//   1. 写操作写入 .wal 文件，不阻塞读
+//   2. 读操作读主库 + .wal 中已提交的页
+//   3. 每个读连接看到的是连接开始时的快照
+//   4. 每次新获取连接（从 Go sql.DB 连接池）→ 新快照
+//
+// SQLite 的隔离级别是 SERIALIZABLE，但只对"连接内"有保证
+//   由于连接池的存在，第 1 页和第 2 页可能使用不同连接
+//   → 看到不同的 .wal 快照
+//
+// 对分页的影响：
+//   与 PG/MySQL 相同：翻下一页可能看到扫描期间新增的写入
+//   但 SQLite 的写性能瓶颈明显（CHECKPOINT 时可能短暂阻塞读）
+//   → 大规模并发翻页场景下反而比 PG/MySQL 更差
+//
+// 额外注意：[scanner.go:87-89] 明确限制
+//   if workers > 1 && drivers.DatabaseDriverFromEnv() == drivers.SQLITE {
+//       return 0, errors.New("multiple workers not supported for SQLite databases")
+//   }
+//   → SQLite 仅允许 1 个 Scanner worker 串行写
+//   → 减少了并发写竞争，但不消除读不一致
+```
+
+### 15.4 各驱动对并发增删 OFFSET 一致性的对比总结
+
+| 特性 | PostgreSQL | MySQL InnoDB | SQLite WAL |
+|-----|-----------|-------------|-----------|
+| 驱动默认隔离 | READ COMMITTED | REPEATABLE READ（仅显式事务内） | SERIALIZABLE（仅连接内） |
+| auto-commit 单条 SELECT 实际隔离 | READ COMMITTED | READ COMMITTED 级别读视图 | 连接级快照 |
+| 翻两页是否同一事务 | ❌ 不是 | ❌ 不是 | ❌ 可能是也可能不是（连接池） |
+| 翻两页是否同一连接 | ❌ 几乎必然不同 | ❌ 几乎必然不同 | ⚠️ 可能相同（连接池空闲少） |
+| 是否可看到翻页期间新提交的写入 | ✅ 第 2 页必然可见 | ✅ 第 2 页必然可见 | ✅ 新连接可见 |
+| 重复/遗漏风险 | 中 | 中 | 低（串行 Scanner 写入少） |
+| 大 offset 与并发写叠加 | 排序+丢弃期间写提交可能改变顺序 | 同 PG | WAL checkpoing 期间锁竞争 |
+| 是否可用 REPEATABLE READ 统一保护 | ✅ `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ` | ✅ `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ` | ✅ 但 SQLite 连接复用困难 |
+| 项目代码是否实现上述保护 | ❌ 未实现 | ❌ 未实现 | ❌ 未实现 |
+
+### 15.5 现有 Session 配置的使用位置
+
+全代码库仅有 **2 处显式 Session 配置**，且都在**写操作**中，与分页查询无关：
+
+```go
+// scanner.go:61-65（SetPeriodicScanInterval）
+db.
+    Session(&gorm.Session{AllowGlobalUpdate: true}).  // 允许不带 WHERE 的全局 UPDATE
+    Model(&models.SiteInfo{}).
+    Update("periodic_scan_interval", interval)
+
+// scanner.go:91-95（SetScannerConcurrentWorkers）
+db.
+    Session(&gorm.Session{AllowGlobalUpdate: true}).
+    Model(&models.SiteInfo{}).
+    Update("concurrent_workers", workers)
+```
+
+→ 分页查询从未使用 `Session()` 配置，完全使用 GORM 默认。
+
+---
+
+## 十六、sort-by 排序键注入到查询的完整代码生成路径
+
+### 16.1 端到端链路追踪：从浏览器下拉框到 SQL ORDER BY
+
+```
+[前端 UI 层] AlbumFilter.tsx:68-88
+  │
+  │  // 排序选项硬编码白名单（TS 类型约束）
+  │  export type SortingOptionValue = 'date_shot' | 'updated_at' | 'title' | 'type'
+  │
+  │  const defaultOptions = [
+  │    { value: 'date_shot',   label: 'Date shot'   },
+  │    { value: 'updated_at',  label: 'Date imported' },
+  │    { value: 'title',       label: 'Title'        },
+  │    { value: 'type',        label: 'Kind'         },
+  │  ]
+  │
+  │  changeOrderBy = (value: SortingOptionValue) => {
+  │    setOrdering({ orderBy: value })  // ← TS 类型检查：只能是 4 个值之一
+  │  }
+  ▼
+[前端 URL 状态层] useOrderingParams.ts:15-47
+  │
+  │  // orderBy 从 URL query 参数读取
+  │  const rawOrderBy = getParam('orderBy', defaultOrderBy)
+  │  // ↑ ★ 关键安全隐患 1：URL 参数是完全开放的字符串，不经过 TS 类型检查
+  │  //   用户可以手动编辑 URL：?orderBy=(SELECT+password+from+users)
+  │
+  │  const orderBy = rawOrderBy === null || rawOrderBy === ''
+  │    ? defaultOrderBy   // 空值时回退到 'date_shot'
+  │    : rawOrderBy       // ← 其他字符串原样保留！
+  │
+  │  // orderDirection 有枚举校验，但 orderBy 完全没有白名单校验
+  │  const orderDirection =
+  │    Object.values(OrderDirection).includes(rawOrderDir)
+  │      ? rawOrderDir
+  │      : OrderDirection.ASC
+  ▼
+[前端 GraphQL 变量] AlbumGallery.tsx:22-34
+  │
+  │  query AlbumPage($mediaOrderBy: String) {
+  │    album(id: $id) {
+  │      media(order: { order_by: $mediaOrderBy, order_direction: $orderDirection }) {
+  │        ...
+  │      }
+  │    }
+  │  }
+  │
+  │  // $mediaOrderBy 的类型是 String！（不是 Enum）
+  │  // ↑ ★ 关键安全隐患 2：GraphQL Schema 中 order_by 是 String 类型
+  │  //   无 Schema 层白名单
+  ▼
+[GraphQL 协议层] → HTTP POST JSON payload
+  │
+  │  {
+  │    "variables": {
+  │      "mediaOrderBy": "(SELECT password FROM users WHERE admin=true LIMIT 1)"
+  │    }
+  │  }
+  ▼
+[gqlgen 参数解析层] generated.go:9212-9247
+  │
+  │  func unmarshalInputOrdering(ctx, obj any) (models.Ordering, error) {
+  │    // ...
+  │    case "order_by":
+  │      data, err := ec.unmarshalOString2ᚖstring(ctx, v)
+  │      // ↑ 无任何校验：v 是任意 string，直接转为 *string
+  │      it.OrderBy = data
+  │    // ...
+  │  }
+  │
+  │  // unmarshalOString2ᚖstring [generated.go:12865-12876]
+  │  func (ec *executionContext) unmarshalOString2...(ctx, v any) (*string, error) {
+  │    if v == nil { return nil, nil }
+  │    res, err := graphql.UnmarshalString(v)
+  │    // ↑ gqlgen 内置：只确保是合法的 JSON string 字面量
+  │    // ↑ 不检查长度、不检查字符集、不做 SQL 关键字校验
+  │    return &res, ...
+  │  }
+  ▼
+[Resolver 层] album.go:21-51（albumResolver.Media）
+  │
+  │  func (r *albumResolver) Media(ctx, obj, order *models.Ordering, paginate, onlyFavorites) {
+  │    // order 参数是 gqlgen 解析后的 models.Ordering
+  │    // order.OrderBy = *string（可能是任意字符串）
+  │    // ↑ 无任何白名单校验：直接透传
+  │    query := db.Where(...)
+  │    // ...
+  │    query = models.FormatSQL(query, order, paginate)
+  │    // ...
+  │  }
+  ▼
+[FormatSQL 层] utils.go:11-40
+  │
+  │  func FormatSQL(tx *gorm.DB, order *Ordering, paginate *Pagination) *gorm.DB {
+  │    if order != nil && order.OrderBy != nil {
+  │      // ... 解析 orderDirection（此处有枚举校验 .IsValid()）
+  │      desc := ...
+  │
+  │      tx.Order(clause.OrderByColumn{
+  │        Column: clause.Column{
+  │          Name: *order.OrderBy,   // ← ★ 关键点：注入点
+  │          // *order.OrderBy 是任意字符串，直接写入 clause.Column.Name
+  │        },
+  │        Desc: desc,
+  │      })
+  │    }
+  │    return tx
+  │  }
+  ▼
+[GORM Clause 构建层] gorm.io/gorm/clause（v1.31.1 内置）
+  │
+  │  // clause.Column 的 Build 方法（GORM 内部）：
+  │  func (col Column) Build(builder Builder) {
+  │    if col.Table != "" {
+  │      builder.Write(quoteChar)
+  │      builder.WriteString(col.Table)
+  │      builder.Write(quoteChar)
+  │      builder.WriteByte('.')
+  │    }
+  │    if col.Name == "*" {
+  │      builder.WriteByte('*')
+  │    } else {
+  │      builder.Write(quoteChar)        // ← 添加 " 或 ` 取决于数据库
+  │      builder.WriteString(col.Name)   // ← ★ 安全边界：原样写入 col.Name
+  │      builder.Write(quoteChar)        // ← 添加闭合引号
+  │      // ↑ 这是 GORM 的主要防注入手段：把列名包在引号中
+  │    }
+  │    // ... 处理 Alias 等
+  │  }
+  │
+  │  // 最终 SQL 形如（PostgreSQL）：
+  │  //   ORDER BY "date_shot" DESC
+  │  //
+  │  // 如果用户传入：date_shot; DROP TABLE media; --
+  │  // 结果：ORDER BY "date_shot; DROP TABLE media; --" DESC
+  │  //        ↑ 引号将其整体括起，被当作列名
+  │  //        ↑ 不会真正执行 DROP TABLE
+  │
+  │  // quoteChar 选择：
+  │  //   PostgreSQL: "  （双引号标识符）
+  │  //   MySQL:      `  （反引号标识符）
+  │  //   SQLite:     "  （双引号，兼容 SQL 标准）
+  │
+  ▼
+[数据库最终执行 SQL]
+  │
+  │  -- 正常请求 date_shot：
+  │  SELECT * FROM "media"
+  │    WHERE "media"."album_id" = 42
+  │    ORDER BY "date_shot" DESC
+  │    LIMIT 200 OFFSET 0
+  │
+  │  -- 恶意输入：(CASE WHEN (SELECT count(*)>0 FROM users WHERE password LIKE 'a%') THEN date_shot ELSE id END)
+  │  SELECT * FROM "media"
+  │    WHERE "media"."album_id" = 42
+  │    ORDER BY "(CASE WHEN (SELECT count(*)>0 FROM users WHERE password LIKE 'a%') THEN date_shot ELSE id END)" DESC
+  │    ↑ 被整体引号包裹，数据库会尝试以此为列名查找
+  │    ↑ 通常报: column "(CASE ...)" does not exist → **不会真正执行子查询**
+  │
+  │  -- 但如果攻击者用 " 闭合引号呢？
+  │  -- 输入：date_shot" DESC; DROP TABLE media; --
+  │  SELECT * FROM "media"
+  │    WHERE ...
+  │    ORDER BY "date_shot" DESC; DROP TABLE media; --" DESC
+  │    ↑ PostgreSQL: 单条 query 只执行第一个分号前的语句
+  │    ↑ MySQL: 如果 MultiStatements=true（本项目开启了！）则会执行多语句！
+  │    ↑ SQLite: 通常不支持多语句（但 Mattn 驱动有编译选项）
+  ▼
+[安全防线总结]
+  │
+  ├─ 防线 1（前端 TS 类型）: SortingOptionValue 联合类型
+  │   → 绕过：编辑 URL 参数、直接发 GraphQL 请求
+  │   → 强度：弱（仅 UI 提示，非强制）
+  │
+  ├─ 防线 2（前端 GraphQL 类型）: String 而非 Enum
+  │   → 绕过：GraphQL 类型系统允许任意字符串
+  │   → 强度：无
+  │
+  ├─ 防线 3（gqlgen unmarshal）: 仅验证 JSON string 字面量
+  │   → 绕过：任意字符串字面量都通过
+  │   → 强度：无
+  │
+  ├─ 防线 4（后端 Resolver）: 无白名单校验
+  │   → 绕过：直接传递
+  │   → 强度：无
+  │
+  ├─ 防线 5（GORM clause.Column 引号转义）: 将 Name 包在 " 或 ` 中
+  │   → 绕过：闭合引号 + 特殊情况（见 16.2）
+  │   → 强度：中（PG/SQLite 较好，MySQL 有风险）
+  │
+  └─ 最终防线（数据库驱动）: 单语句限制
+      → 绕过：MySQL MultiStatements=true（本项目开启）
+      → 强度：PG: 强；MySQL: 弱；SQLite: 中
+```
+
+### 16.2 注入风险分析：三种数据库分别评估
+
+#### A. PostgreSQL
+
+```
+clause.Column 引号策略: " (双引号，SQL 标准标识符)
+
+能否绕过引号执行子查询？
+  例：输入 →  id" DESC, (SELECT CASE WHEN current_user='postgres' THEN 1 ELSE 2 END)
+  结果 →  ORDER BY "id" DESC, (SELECT CASE WHEN current_user='postgres' THEN 1 ELSE 2 END)"
+          ↑ 引号在最后，(SELECT...) 仍在引号内，被当作标识符
+          ↑ 报：column "id DESC, (SELECT ...)" does not exist
+          → **不能执行任意子查询**
+
+能否用分号执行多语句？
+  pg_query 协议层面：一次 Parse 只允许 1 条语句
+  → 即使传入分号，驱动会报：cannot insert multiple commands into a prepared statement
+  → **PG 下安全**
+
+实际可行的注入（仍是 ORDER BY 列名层面）：
+  输入 →  CASE WHEN EXISTS(SELECT 1 FROM users WHERE username='admin' AND substr(password,1,1)='a') THEN id ELSE date_shot END
+  → 被括成 "CASE WHEN ... END"，当作列名
+  → 报错，无法盲注
+
+结论：PostgreSQL 下由于引号包裹 + 单语句限制，注入风险**极低**
+```
+
+#### B. MySQL（⚠️ 本项目开启了 MultiStatements=true）
+
+```
+clause.Column 引号策略: ` (反引号)
+
+关键：database.go:34 → config.MultiStatements = true
+
+注入示例 1：闭合引号 + 分号 + DROP
+  输入 →  date_shot` DESC; DROP TABLE media; --
+  GORM 生成 SQL：
+    ORDER BY `date_shot` DESC; DROP TABLE media; --` DESC
+  ↑ MultiStatements=true → MySQL 驱动将分号拆分执行 3 条：
+    1. SELECT ... ORDER BY `date_shot` DESC  → 正常（无错误）
+    2. DROP TABLE media                      → ★ 实际删除！
+    3. --` DESC                               → 注释，忽略
+  → **高危：可真执行任意 DDL/DML！**
+
+注入示例 2：基于布尔盲注
+  输入 →  id` DESC, IF((SELECT COUNT(*) FROM users)=1, SLEEP(5), 0) --
+  → 第 2 条 IF(...) 在 ORDER BY 表达式中计算
+  → 如果用户表有 1 条记录，查询延迟 5 秒（盲注成功）
+
+结论：MySQL MultiStatements=true 情况下，注入风险**极高**
+```
+
+#### C. SQLite
+
+```
+clause.Column 引号策略: " (双引号，SQL 标准)
+
+SQLite 默认驱动（mattn/go-sqlite3）：
+  - 是否支持多语句取决于编译选项（通常开启）
+  - 但 SQLite 的 DROP TABLE 需要写锁
+  - 结合 WAL 模式，写锁只在 COMMIT 时需要
+
+注入分析：
+  与 PG 类似，引号整体包裹 → 子查询不会真正执行
+  多语句：若驱动允许且 WAL 锁竞争少，可能注入成功
+
+实际风险：SQLite 通常单用户本地部署
+  → 攻击者与合法用户是同一人
+  → 即使注入成功，也是删自己的数据
+  → 风险**中**（非零但场景有限）
+```
+
+### 16.3 Timeline 的特殊情况：内置排序无注入风险
+
+`myTimeline` 的排序是**硬编码的字符串**，不接受 order 参数：
+
+```go
+// timeline_actions.go:20-40
+switch drivers.GetDatabaseDriverType(db) {
+case drivers.POSTGRES:
+    query = query.
+        Order("DATE_TRUNC('year', date_shot) DESC").    // 硬编码字符串
+        Order("DATE_TRUNC('month', date_shot) DESC").   // 不经过 clause.Column
+        Order("DATE_TRUNC('day', date_shot) DESC").
+        Order("albums.title ASC").
+        Order("media.date_shot DESC")
+case drivers.SQLITE:
+    query = query.
+        Order("strftime('%Y-%m-%d', media.date_shot) DESC").
+        Order(albumsTitleASC).
+        Order("TIME(media.date_shot) DESC")
+// ...
+}
+query = models.FormatSQL(query, nil, paginate)  // order 参数传入 nil
+```
+
+**分析**：
+- `query.Order("DATE_TRUNC('year', date_shot) DESC")` 使用的是 GORM 的 `Order(string)` 重载
+- 这是一个**原始 SQL 字符串**，不经过 `clause.Column`，直接拼接到 ORDER BY
+- 但由于是硬编码（无变量插值），完全安全
+- 然而这也意味着：**如果 order 参数被错误传入，会有额外风险**（当前 FormatSQL 当 order=nil 时跳过，所以安全）
+
+### 16.4 Search 的特殊情况：使用 clause.Expr 直接拼 SQL
+
+```go
+// search_actions.go:39-44
+Clauses(clause.OrderBy{
+    Expression: clause.Expr{
+        SQL: "(CASE WHEN LOWER(media.title) LIKE ? THEN 2 WHEN LOWER(media.path) LIKE ? THEN 1 END) DESC",
+        Vars:               []interface{}{wildQuery, wildQuery},
+        WithoutParentheses: true,
+    },
+})
+```
+
+**分析**：
+- 使用 `clause.Expr`（表达式）而非 `clause.OrderByColumn`
+- `SQL` 是硬编码字符串，`Vars` 通过参数化绑定（`?` 占位符）
+- **安全**：wildQuery 中的特殊字符会被驱动作为参数处理，不会解析为 SQL 关键字
+- 但如果有人把 user input 直接拼进 `SQL` 字段（而不是用 Vars），就会注入
+
+### 16.5 注入风险矩阵汇总
+
+| 查询 | order_by 来源 | 注入风险 | 原因 |
+|-----|-------------|---------|------|
+| `Query.myAlbums(order)` | 前端变量 → `clause.OrderByColumn` | ⚠️ PG: 低；MySQL: **高**；SQLite: 中 | 见 16.2 |
+| `Query.myMedia(order)` | 同上 | ⚠️ 同上 | 同上 |
+| `Album.media(order)` | 同上 | ⚠️ 同上 | 同上 |
+| `Album.subAlbums(order)` | 同上 | ⚠️ 同上 | 同上 |
+| `ShareAlbum.media(order_by)` | 同上 | ⚠️ 同上 | 同上 |
+| `Query.myTimeline` | **硬编码**，order 参数传入 nil | ✅ 安全 | 无用户可控输入 |
+| `Query.myFaceGroups` | **硬编码**（label NULL 优先 + COUNT） | ✅ 安全 | FormatSQL 传入 order=nil |
+| `Search (media)` | **硬编码** + `clause.Expr` 参数化 | ✅ 安全 | `?` 占位符绑定 wildQuery |
+| `Search (albums)` | 同上 | ✅ 安全 | 同上 |
+| `FaceGroup.imageFaces(paginate)` | **无排序** | ✅ 安全 | FormatSQL 传入 order=nil |
+
+### 16.6 建议的安全加固（代码中未实现）
+
+```go
+// 方案 A：在 FormatSQL 中加白名单校验
+var validOrderByColumns = map[string]struct{}{
+    "id":         {},
+    "title":      {},
+    "date_shot":  {},
+    "updated_at": {},
+    "created_at": {},
+    "type":       {},
+    "album_id":   {},
+    // ... 其他合法列名
+}
+
+func FormatSQL(tx *gorm.DB, order *Ordering, paginate *Pagination) *gorm.DB {
+    // ...
+    if order != nil && order.OrderBy != nil {
+        if _, ok := validOrderByColumns[*order.OrderBy]; !ok {
+            // 非法列名：回退到默认（date_shot）或报错
+            *order.OrderBy = "date_shot"
+            // 或：return tx.Clauses(clause.Where{Exprs: []clause.Expression{gorm.ErrInvalidTransaction}})
+        }
+        tx.Order(clause.OrderByColumn{
+            Column: clause.Column{Name: *order.OrderBy},
+            Desc:   desc,
+        })
+    }
+    // ...
+}
+
+// 方案 B：Schema 层改为 Enum（强烈推荐）
+// graphql schema:
+// enum MediaOrderField {
+//   ID
+//   TITLE
+//   DATE_SHOT
+//   UPDATED_AT
+//   CREATED_AT
+//   TYPE
+// }
+//
+// input Ordering {
+//   order_by: MediaOrderField    ← 从 String 改为 Enum
+//   order_direction: OrderDirection
+// }
+// → gqlgen 自动校验非法值，无需后端额外代码
+```
+
+---
+
+## 十七、代码路径索引补充
+
+| 主题 | 文件 | 行号 |
+|-----|------|-----|
+| 数据库启动 SetupDatabase | `api/database/database.go` | 113-152 |
+| 数据库 ConfigureDatabase | `api/database/database.go` | 77-110 |
+| MySQL DSN 解析（MultiStatements=true） | `api/database/database.go` | 24-38 |
+| SQLite WAL / _locking_mode 配置 | `api/database/database.go` | 63-70 |
+| Resolver.DB(ctx) → WithContext | `api/graphql/resolvers/resolver.go` | 22-24 |
+| FormatSQL → clause.OrderByColumn | `api/graphql/models/utils.go` | 11-40 |
+| gqlgen unmarshalInputOrdering | `api/graphql/generated.go` | 9212-9247 |
+| gqlgen unmarshalInputPagination | `api/graphql/generated.go` | 9249-9284 |
+| Timeline 硬编码多数据库排序 | `api/graphql/models/actions/timeline_actions.go` | 20-40 |
+| Search clause.Expr 参数化排序 | `api/graphql/models/actions/search_actions.go` | 39-44, 56-61 |
+| 前端 SortingOptionValue 白名单类型 | `ui/src/components/album/AlbumFilter.tsx` | 14, 68-88 |
+| 前端 useOrderingParams（orderBy 无白名单） | `ui/src/hooks/useOrderingParams.ts` | 15-47 |
+| SQLite Scanner 单 worker 限制 | `api/graphql/resolvers/scanner.go` | 87-89 |
+| Session AllowGlobalUpdate（非分页用） | `api/graphql/resolvers/scanner.go` | 62, 92 |
+| 驱动类型枚举与判断 | `api/database/drivers/database_drivers.go` | 10-55 |
+| 连接池 SetMaxOpenConns(80) | `api/database/database.go` | 140 |
