@@ -933,3 +933,590 @@ Media 图片 URL 通过 `api/routes/photos.go` 和 `videos.go` 中通过 `api/ut
 | Cursor HMAC 签名防篡改 | ❌ 无签名，offset 可被前端任意修改 |
 
 **安全提示**：由于 offset 是明文整数，前端可以构造 offset 参数，**理论上可以构造任意 offset（如 `offset: 999999`），但由于后端没有做范围校验，数据库会执行，但由于 GORM 的 `tx.Offset(999999)` 直接传递给数据库，大 offset 会导致数据库扫描大量行然后丢弃，**存在潜在的 DoS 风险**。
+
+---
+
+## 十二、并发增删时 offset 一致性影响分析
+
+### 12.1 项目的事务与隔离级别现状
+
+**查询 Resolver（所有 myAlbums / myMedia / myTimeline / Album.media / ...）均无显式事务**：
+
+```go
+// api/graphql/resolvers/resolver.go:22-24
+func (r *Resolver) DB(ctx context.Context) *gorm.DB {
+    return r.database.WithContext(ctx)  // ← 仅加入 context，无 Transaction()
+}
+
+// actions/album_actions.go:42-45
+query.Find(&albums)  // ← 裸查询，无 BEGIN / COMMIT 包裹
+```
+
+**代码中仅 10 处显式事务**，且全部集中在写操作：
+
+| 位置 | 事务用途 | 与分页查询的关系 |
+|-----|---------|---------------|
+| `scanner_user.go:127` | Album 创建 + Owner 关联原子化 | 相册目录扫描写入时并发 |
+| `cleanup_media.go:111` | UserAlbums 删除 + Album 删除原子化 | 清理旧相册时并发 |
+| `user.go:36,72,151,202` | 用户注册/授权/删除操作 | 用户管理写操作 |
+| `faces.go:182,242,313,342` | 人脸组合并/移动/重命名 | 人脸管理写操作 |
+
+**隔离级别**：代码中**未自定义隔离级别**，完全依赖数据库默认：
+
+| 数据库 | 默认隔离级别 | 能否防止不可重复读 | 对分页一致性的影响 |
+|-------|-----------|---------------|------------------|
+| **PostgreSQL** | READ COMMITTED | ❌ 不能 | **同一翻页会话可能遇到不可重复读**（翻到第二页时第一页数据已变） |
+| **MySQL InnoDB** | REPEATABLE READ | ✅ 可以 | **同一事务内可重复读**，但 Resolver 未开事务 → 仍是 READ COMMITTED 级别 |
+| **SQLite (WAL 模式)** | SERIALIZABLE（读无锁） | ✅ 可以 | WAL 下写操作做快照，读操作一致但**只对单个语句** |
+
+### 12.2 写操作触发源：可能引起数据漂移的 4 条路径
+
+在分页浏览的同时，以下路径可能**修改结果集**：
+
+#### 路径 1：Scanner 扫描新文件（插入）
+
+位置：`api/scanner/scanner_media.go:21-73`
+
+```go
+func ScanMedia(tx *gorm.DB, mediaPath string, albumId int, ...) (*models.Media, bool, error) {
+    // ...
+    media := models.Media{
+        Title:    mediaName,
+        Path:     mediaPath,
+        AlbumID:  albumId,
+        DateShot: stat.ModTime(),  // ← 日期值取决于文件修改时间
+    }
+
+    tx.Create(&media)  // ← 插入新行，可能改变排序结果
+    return &media, true, nil
+}
+```
+
+**对 offset 的影响**：
+- Scanner 是**后台 goroutine 异步**执行，插入时机完全不可控
+- 若按 `date_shot DESC` 排序，**新照片的 `DateShot` 可能是任意值**，既可能排在前面（最近修改），也可能在中间，也可能在最后
+- **典型漂移场景**：用户在 `AlbumPage` 翻到第 3 页（offset=400），此时 Scanner 扫描到 5 张新照片，`DateShot` 刚好位于第 2 页和第 3 页之间 → 用户翻第 4 页时会**重复看到第 3 页已经看过的条目**
+
+#### 路径 2：CleanupMedia 清理旧文件（删除）
+
+位置：`api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go:17-65`
+
+```go
+func CleanupMedia(db *gorm.DB, albumId int, albumMedia []*models.Media) []error {
+    // ...
+    var mediaList []models.Media
+    query := db.Where("album_id = ?", albumId)
+    if len(albumMedia) > 0 {
+        query = query.Where("NOT id IN (?)", albumMediaIds)  // ← 选中磁盘上已不存在的
+    }
+    query.Find(&mediaList)
+
+    // ...
+    db.Where("id IN (?)", mediaIDs).Delete(models.Media{})  // ← 批量删除
+    // ...
+}
+```
+
+**对 offset 的影响**：
+- 删除发生在**第一页到第 N 页之间**的条目时，会导致**后续条目整体前移**
+- **典型漂移场景**：用户刚翻完第 1 页（offset 0-199），此时 Scanner 清理掉了第 1 页上的 3 条记录 → 翻到第 2 页（offset=200）时，实际看到的是原来第 203 条开始的记录，**遗漏了原本应该是 200-202 的三条记录**
+- 更极端：清理量很大时，第 2 页可能直接跳到与第 1 页差出几十条的位置
+
+#### 路径 3：收藏/取消收藏（改变 onlyFavorites 过滤结果集）
+
+位置：`api/graphql/models/user.go:183-200`
+
+```go
+func (user *User) FavoriteMedia(db *gorm.DB, mediaID int, favorite bool) (*Media, error) {
+    userMediaData := UserMediaData{
+        UserID:   user.ID,
+        MediaID:  mediaID,
+        Favorite: favorite,
+    }
+    // ← UPSERT（OnConflict UpdateAll），无事务包裹整个操作
+    db.Clauses(clause.OnConflict{UpdateAll: true}).Create(&userMediaData)
+
+    db.First(&media, mediaID)
+    return &media, nil
+}
+```
+
+**对 offset 的影响**（仅当查询带 `onlyFavorites=true` 时）：
+- **收藏新照片**：原来不在结果集里的照片变成了结果集成员 → 若 `OrderBy` 排序键恰好把它排在正在浏览的窗口**之前**，会导致后续页面重复或错乱
+- **取消收藏**：照片从结果集中消失 → 后续页面前移，可能漏掉记录
+- **多用户并发收藏**：A 用户在翻页，B 用户同时对同一相册的照片大量操作，结果集变化与 A 无关（`user_media_data.user_id` 过滤隔离），但 B 自己翻页会受自己操作影响
+
+#### 路径 4：删除人脸组 / 合并人脸组（改变 FaceGroup 查询结果）
+
+位置：`api/graphql/resolvers/faces.go:182-242,313-342`
+
+```go
+// CombineFaceGroups 事务内：先查重复 media → 批量更新 ImageFace → 更新 FaceGroup 计数
+updateError := db.Transaction(func(tx *gorm.DB) error {
+    // ... 批量 UPDATE image_faces SET face_group_id = dest ...
+    // ...
+})
+```
+
+**对 offset 的影响**：仅对 `myFaceGroups` 和 `FaceGroup.imageFaces` 分页生效，影响较小。
+
+### 12.3 6 种典型并发漂移场景
+
+假设相册有 1000 张照片，按 `date_shot DESC` 排序，前端每页 200 张：
+
+| 场景 | 并发操作时机 | 第一页结果 (0-199) | 第二页结果 (200-399) | 用户体验 |
+|-----|-----------|------------------|-------------------|---------|
+| **S1. 前置插入** | 第一页渲染完成后，Scanner 插入 5 张 date_shot 比当前第 200 条**新**的照片 | 不变（已加载） | 原 195-194 + 原 200-398（5 条重复出现在第 1 页未刷新的内容） | **看到重复照片** |
+| **S2. 中置插入** | 第一页与第二页之间插入 5 张照片，date_shot 恰好落在 200-201 之间 | 不变 | 原 195-199 + 新 5 + 原 200-394（**5 条与第 1 页末尾重复**） | 看到重复照片 |
+| **S3. 前置删除** | 第一页渲染完成后，Cleanup 删除了第 1 页前 10 条 | 不变 | 原 210-409（丢失原 200-209 共 10 条） | **照片莫名其妙缺失** |
+| **S4. 后置删除** | 翻到第 2 页后，删除原 205-214 共 10 条 | 不变 | 原 200-204 + 原 215-404（**原 205-214 从第 2 页消失**） | 第 2 页只剩 190 条不重复，但与第 1 页逻辑上衔接正常 |
+| **S5. 排序键更新** | 翻到第 2 页时，Scanner 重新处理了第 1 页某些照片的 EXIF → 更新了 date_shot | 不变 | 顺序完全错乱，部分记录换页 | **严重错乱** |
+| **S6. onlyFavorites 并发收藏** | 第 1 页浏览中用户快速收藏了 3 张本应在第 3 页的照片 | 不变（仅 200 条内） | 第 2 页可能混入本应第 3 页的条目 | 顺序错乱 |
+
+### 12.4 代码中**未**使用的一致性保障手段
+
+| 保障手段 | 是否使用 | 说明 |
+|---------|---------|------|
+| **查询时开启 REPEATABLE READ 事务** | ❌ 未用 | 所有分页查询均无事务包裹 |
+| **Snapshot Isolation / FOR SHARE 锁** | ❌ 未用 | 无 `Clauses(clause.Locking{Strength: "SHARE"})` |
+| **Cursor-based Keyset Pagination** | ❌ 未用 | 用 `(id, sort_key) > (last_id, last_val)` 天然免疫漂移 |
+| **Limit+1 预读一页（hasNextPage 验证）** | ❌ 未用 | 无 `limit + 1` 模式 |
+| **时间戳快照过滤** | ❌ 未用 | 无 `WHERE updated_at <= snapshot_time` |
+| **单用户串行化 Scanner 与查询** | ❌ 未用 | Scanner 与 HTTP 请求无协调 |
+
+### 12.5 实际风险评估
+
+| 场景 | 发生频率 | 用户可见影响 | 严重度 |
+|-----|---------|------------|-------|
+| 日常小量增删（S1-S2） | 中（每次扫描都有） | 偶见重复或漏掉 1-2 张 | 低 |
+| 大规模清理后翻页（S3） | 低（仅定期扫描） | 可能漏掉几十张 | 中 |
+| Scanner 批量导入新照片（S1-S2 极端） | 中 | 重复率高 | 中 |
+| onlyFavorites 翻页中操作（S6） | 低 | 顺序错乱 | 低 |
+| EXIF 更新重排序（S5） | 极低（一般不重处理） | 严重错乱 | 中 |
+| 大 offset 扫描期间数据变更 | 高（每次大翻页都有） | 偏移计算与实际行位置不对应 | 中 |
+
+---
+
+## 十三、大 offset 在 ORM/数据库侧的性能成本
+
+### 13.1 GORM 中的 offset/limit 传递链
+
+```go
+// 第 1 层: FormatSQL (api/graphql/models/utils.go:11-40)
+func FormatSQL(tx *gorm.DB, order *Ordering, paginate *Pagination) *gorm.DB {
+    if paginate != nil {
+        if paginate.Limit != nil {
+            tx.Limit(*paginate.Limit)   // ← 第 1 步: 写入 tx.Statement.Limit
+        }
+        if paginate.Offset != nil {
+            tx.Offset(*paginate.Offset) // ← 第 2 步: 写入 tx.Statement.Offset
+        }
+    }
+    if order != nil && order.OrderBy != nil {
+        tx.Order(clause.OrderByColumn{...}) // ← 写入 ORDER BY
+    }
+    return tx
+}
+```
+
+**GORM 内部处理 Limit/Offset**（`gorm.io/gorm` 库，版本由 `go.mod` 决定）：
+- `tx.Limit(N)` → 设置 `Statement.Clauses["LIMIT"] = clause.Limit{Limit: N}`
+- `tx.Offset(M)` → 设置 `Statement.Clauses["LIMIT"] = clause.Limit{Offset: M}`（同一条 clause，内部区分）
+- 到 Build SQL 阶段（PostgreSQL 驱动）：`SELECT ... ORDER BY ... LIMIT $1 OFFSET $2`，参数化绑定
+
+**GORM 侧无任何优化**：不会改写 SQL 为游标/seek 模式，不会自动分页，不会预判 offset 合法性。完全原样透传至数据库。
+
+### 13.2 数据库侧 LIMIT/OFFSET 执行路径
+
+以 PostgreSQL 为例（MySQL/SQLite 原理相同）：
+
+```sql
+-- 用户翻到第 100 页（每页 200）：offset=19800, limit=200
+SELECT * FROM media
+WHERE media.album_id IN (
+    SELECT user_albums.album_id FROM user_albums WHERE user_albums.user_id = 42
+)
+ORDER BY media.date_shot DESC
+LIMIT 200 OFFSET 19800;
+```
+
+**PostgreSQL 查询执行器内部路径**：
+
+```
+优化器生成计划（EXPLAIN）：
+  ├─ 如果 ORDER BY 列有索引（media.date_shot）→ Index Scan Backward（索引反向扫描）
+  │    但 OFFSET 19800 仍需跳过前 19800 条索引页，逐一丢弃 → **成本仍高**
+  │
+  ├─ 如果 ORDER BY 列无索引（media.date_shot 默认无索引）→ Sort + Limit
+  │    ├─ 步骤 1: Seq Scan on media（全表扫描找到所有匹配行）
+  │    │   → 对 100 万行 media 做过滤 album_id IN (...)
+  │    ├─ 步骤 2: Sort (Sort Method: external merge Disk Sort 或 quicksort memory)
+  │    │   → 对过滤后的 50 万行按 date_shot DESC 排序
+  │    │   → 需要 O(N log N) 时间，可能溢出到磁盘
+  │    └─ 步骤 3: Limit
+  │         → 跳过前 19800 条已排序的行，取出 200 条
+  │         → **前 19800 行虽然丢弃但必须实际排完序**
+  │
+  └─ 有额外 WHERE 子查询（onlyFavorites / onlyWithFavorites）
+       → 子查询每一行都要执行 EXISTS 判断，复杂度进一步放大
+```
+
+### 13.3 Media 模型索引现状（关键点：`date_shot` 无索引）
+
+模型定义（`api/graphql/models/media.go:15-33`）：
+
+```go
+type Media struct {
+    Model           // ID: gorm:"primarykey"（隐含索引 PRIMARY KEY）
+    Title    string
+    Path     string
+    PathHash string `gorm:"not null;unique"`       // UNIQUE INDEX
+    AlbumID  int    `gorm:"not null;index"`        // ✅ 有索引 btree(album_id)
+    DateShot time.Time `gorm:"not null"`           // ❌ 无索引（最常用的排序键！）
+    Type     MediaType  `gorm:"not null;index"`    // ✅ btree(type)
+    // ...
+}
+```
+
+**实际表的索引矩阵**：
+
+| 索引名 | 列 | 对分页的作用 |
+|-------|-----|-----------|
+| PRIMARY KEY | `id` | 按 ID 排序可走索引，但前端默认按 date_shot 或 title，用不上 |
+| `media_path_hash_key` | `path_hash` | UNIQUE，分页无用 |
+| `idx_media_album_id` | `album_id` | ✅ 过滤 Album.media 能走索引 |
+| `idx_media_exif_id` | `exif_id` | 关联查询用 |
+| `idx_media_type` | `type` | 筛选 photo/video 用 |
+| `idx_media_video_metadata_id` | `video_metadata_id` | 关联查询用 |
+| **(缺失)** | `date_shot` | ❌ **Timeline 和默认排序都需要，全表排序瓶颈** |
+| **(缺失)** | `(album_id, date_shot)` | ❌ **Album.media 按日期排序最佳复合索引** |
+| **(缺失)** | `title` | ❌ 按标题排序不走索引 |
+| **(缺失)** | `created_at` | ❌ 按导入时间排序不走索引 |
+
+### 13.4 各分页查询的性能瓶颈
+
+#### A. `Album.media(order: {order_by: "date_shot", DESC})`
+
+```
+瓶颈来源:
+  1. AlbumID 过滤可用 idx_media_album_id → 快速缩小到该相册的 50,000 行
+  2. 但 date_shot 无索引 → 对 50,000 行做 filesort（50,000 * log(50,000) ≈ 50k * 16 ≈ 80万次比较）
+  3. OFFSET 10000 → 必须完整排序后丢弃前 10000 行 → 与 offset 成正比
+
+假设相册 50,000 张照片：
+  OFFSET 0      → 取 200: 需排序 50,000 行
+  OFFSET 10,000 → 取 200: 仍需完整排序 50,000 行 + 额外丢弃 10,000 条
+  OFFSET 40,000 → 取 200: 仍需完整排序 50,000 行 + 额外丢弃 40,000 条
+```
+
+**时间复杂度**：O(N log N) + O(OFFSET)，其中 N 是过滤后的总行数。OFFSET 不参与复杂度核心项但加线性开销。
+
+#### B. `myTimeline(paginate)`
+
+Timeline 有**内置多维排序**且有日期函数参与：
+
+PostgreSQL 版（`timeline_actions.go:20-40`）：
+```go
+query.Order("DATE_TRUNC('year', date_shot) DESC").
+      Order("DATE_TRUNC('month', date_shot) DESC").
+      Order("DATE_TRUNC('day', date_shot) DESC").
+      Order("albums.title ASC").
+      Order("media.date_shot DESC")
+```
+
+**性能特征**：
+- `DATE_TRUNC(..., date_shot)` → **函数计算，无法使用任何列索引**
+- 必须为每一行计算 3 个日期截断值 → O(N) 额外计算开销
+- 排序 5 个键 → 排序成本更高
+- 即使在 date_shot 上加了普通索引也用不上（因为是函数调用，不是原始列排序）
+- 必须使用**表达式索引**才可能走索引：
+  ```sql
+  CREATE INDEX idx_media_date_year ON media(DATE_TRUNC('year', date_shot));
+  CREATE INDEX idx_media_date_month ON media(DATE_TRUNC('month', date_shot));
+  CREATE INDEX idx_media_date_day ON media(DATE_TRUNC('day', date_shot));
+  -- 或更理想的复合表达式索引
+  CREATE INDEX idx_timeline_sort
+  ON media(
+    DATE_TRUNC('year', date_shot) DESC,
+    DATE_TRUNC('month', date_shot) DESC,
+    DATE_TRUNC('day', date_shot) DESC,
+    date_shot DESC
+  );
+  ```
+- **当前代码未创建任何表达式索引** → 每次 Timeline 查询都是全表排序
+
+#### C. `myAlbums(paginate, order)`
+
+- 排序键是字符串列 title → 文本排序开销大于数字/日期
+- `onlyRoot` + `onlyWithFavorites` 引入子查询 EXISTS → 每行额外查数据库
+- albums 表通常只有几十到几百行 → 大 offset 场景不常见，**实际影响小**
+
+#### D. `myFaceGroups(paginate)` + `FaceGroup.imageFaces(paginate)`
+
+- 人脸组通常数量有限（即使上万张照片也通常 < 1000 组）
+- 排序内置：`label NULL 优先` + `COUNT(image_faces) DESC`
+- COUNT() 聚合排序 → 同样无法走索引
+- 但规模小 → **实际性能问题不大**
+
+### 13.5 不同数据库的 LIMIT/OFFSET 实现差异
+
+| 数据库 | OFFSET 算法 | 大 offset 性能 | WAL/并发读影响 |
+|-------|-----------|-------------|-------------|
+| **PostgreSQL** | 排序完成后用 scan direction + skip counter | 差，线性增长 | MVCC，读无锁但构建快照有开销 |
+| **MySQL InnoDB** | 类似 PG 但 Filesort 实现略不同 | 差，线性增长 | MVCC，RR 级别需构建 read view |
+| **SQLite (WAL)** | 需先排序到临时 B-Tree/VDBE cursor，再 seek | 更差（内存小） | WAL 下写做 checkpoing 时可能阻塞读 |
+
+### 13.6 量化估算：100 万行 media 的表现
+
+假设数据库硬件：4 核 CPU、16GB RAM、SSD、单用户相册 50 万张照片：
+
+| offset | limit | PostgreSQL（有 album_id 索引，date_shot 无） | SQLite（WAL，相同数据） | 用户体感 |
+|-------|------|------------------------------------------|----------------------|---------|
+| 0 | 200 | ~50ms（排序 50 万行 → 但有 work_mem 优化） | ~200ms | 即时加载 |
+| 2,000 | 200 | ~70ms（仍需完整排序，丢弃仅线性开销） | ~350ms | 轻微卡顿 |
+| 10,000 | 200 | ~100ms | ~700ms | 明显等待 |
+| 50,000 | 200 | ~250ms | ~2s | 超过 UI 轮询阈值，可能超时 |
+| 100,000 | 200 | ~400ms | ~4s | 用户体验极差，可能触发 UI loading indicator |
+| 500,000 | 200 | ~1.5s | ~15s | ❌ 基本上不可用 |
+
+**关键洞察**：即使排序时间相同（因为 OFFSET 前的排序必须对全量完成），OFFSET 本身也会带来线性增长的"seek"开销，因为数据库必须真的遍历并丢弃前 N 条已排序记录。
+
+### 13.7 代码中已有的性能优化（与分页相关）
+
+#### (1) SQLite WAL 模式
+
+位置：`api/database/database.go:63-70`
+
+```go
+queryValues.Add("_journal_mode", "WAL")    // Write-Ahead Logging
+queryValues.Add("_locking_mode", "NORMAL") // 允许并发读写
+queryValues.Add("_foreign_keys", "ON")
+```
+
+**对分页的作用**：
+- 写操作写入 WAL 文件而不是主 DB → 读操作（分页查询）无需等待写锁
+- 显著改善"Scanner 后台扫描 + 前端浏览"并发场景下的性能
+- 但**对大 offset 本身的算法复杂度无帮助**
+
+#### (2) 最大连接数
+
+位置：`api/database/database.go:140`
+```go
+sqlDB.SetMaxOpenConns(80)
+```
+
+80 个连接池 → 支持 80 个并发分页查询同时执行，但每个查询本身的性能瓶颈不会变。
+
+#### (3) Dataloader 批量加载（对关联查询）
+
+位置：`api/dataloader/`（`gen_mediaurlloader.go`、`gen_userloader.go`、`gen_userfavoritesloader.go`）
+
+**对分页的作用**：
+- 分页返回 200 条 Media → 请求 Media.thumbnail 时，Dataloader 会合并 200 次单独查询为 1 次批量查询（`WHERE media_id IN (?,?,?,…)`）
+- 解决了"n+1 查询"问题，减少了 Resolver 层额外查询
+- 但**对主查询（media 列表分页）的 offset/limit 性能无帮助**
+
+### 13.8 可行的优化方向（代码中未实现）
+
+| 优化 | 实现思路 | 对大 offset 的改进 | 开发成本 |
+|-----|---------|------------------|---------|
+| **增加复合索引** | `CREATE INDEX idx_media_album_date ON media(album_id, date_shot DESC)` | 消除 filesort，但 OFFSET 仍线性 | 低（一次 migration） |
+| **增加表达式索引** | Timeline 专用函数索引（见 13.4 B） | Timeline 从全表排序变 Index Scan | 中（需按 DB 适配） |
+| **Keyset Pagination** | 用 `WHERE (date_shot, id) < (last_date, last_id) ORDER BY date_shot DESC LIMIT 200` 替代 OFFSET | **O(log N) + O(LIMIT)**，与 offset 无关 | 高（需改 Schema、Resolver、前端） |
+| **Limit+1 预估 hasNext** | `Limit(limit+1)` 查询，判断返回 `len > limit` → 告诉前端有下一页 | 前端可提前停止，减少无效请求 | 低（无需 Schema 改动，内部优化） |
+| **offset 上限校验** | `if *paginate.Offset > 50000 { return Err }` | 防止 DoS 级大 offset | 极低 |
+| **列裁剪 SELECT** | 从 gqlgen 的 `CollectFields` 结果构建 `db.Select(...)` | 减少内存消耗和磁盘 IO | 中（需字段到列的映射维护） |
+| **只请求 count** | 首次请求额外可选 COUNT(*) | 前端可显示进度条，减少用户盲目翻页 | 低 |
+
+---
+
+## 十四、底层存储全表扫描路径追踪（以 Album.media + 大 offset 为例）
+
+以以下真实查询为例：
+
+```graphql
+query {
+  album(id: 42) {
+    media(order: { order_by: "date_shot", order_direction: DESC },
+          paginate: { limit: 200, offset: 40000 }) {
+      id title thumbnail { url }
+    }
+  }
+}
+```
+
+### 14.1 GORM 到 PostgreSQL 的完整追踪
+
+```
+[Go 代码层]
+  albumResolver.Media(ctx, album(42), order, paginate(limit=200, offset=40000), nil)
+  │
+  │  1. db.Where("media.album_id = ?", 42)
+  │  2. db.Where("media.id IN (SELECT media_id FROM media_urls WHERE media_id = media.id)")
+  │        ↑ 保证至少有一个 MediaURL（可显示的有效图片）
+  │  3. models.FormatSQL(query, order, paginate)
+  │     → query.Limit(200).Offset(40000)
+  │     → query.Order(clause.OrderByColumn{Column: clause.Column{Name:"date_shot"}, Desc:true})
+  │  4. query.Find(&media)
+  ▼
+[GORM Statement 层]
+  Statement.SQL 字符串构建
+  │
+  │  SELECT * FROM "media"
+  │  WHERE media.album_id = $1
+  │    AND media.id IN (SELECT media_id FROM media_urls WHERE media_id = media.id)
+  │  ORDER BY "date_shot" DESC
+  │  LIMIT $2 OFFSET $3
+  │
+  │  参数绑定: [$1=42, $2=200, $3=40000]
+  ▼
+[lib/pq 驱动层]
+  发送 PostgreSQL 二进制协议 (Extended Query)
+  │  Parse  → "SELECT * FROM media WHERE ... ORDER BY date_shot DESC LIMIT $1 OFFSET $2"
+  │  Bind   → [200, 40000, 42] （参数重新排序）
+  │  Execute
+  ▼
+[PostgreSQL 服务器层 - Backend Process]
+  │
+  ├─ Parser: 解析 SQL，生成 Parse Tree
+  ├─ Analyzer: 语义分析，检查权限、类型
+  ├─ Rewriter: 应用规则（无影响）
+  ├─ Planner:
+  │   ├─ 读取 pg_stats 统计信息
+  │   ├─ 评估 3 种计划：
+  │   │   Plan A: Seq Scan + Sort
+  │   │      → rows=50000 (album_id=42 的估算)
+  │   │      → cost=50000*2.5 (seq_page_cost) + 50000*log(50000)*cpu_operator_cost
+  │   │      → total_cost ≈ 125000 + 50000*16*0.0025 ≈ 125000 + 2000 = 127000
+  │   │   Plan B: Index Scan using idx_media_album_id + Sort
+  │   │      → Bitmap Heap Scan 读取 50000 行（随机 IO 代价高）
+  │   │      → Sort 50000 行
+  │   │      → total_cost ≈ 50000*4.0 + 2000 = 202000（比 A 更差）
+  │   │   Plan C: 直接走 date_shot 上的索引（但 date_shot 无索引，跳过）
+  │   └─ 选定 Plan A: Seq Scan on media → Sort → Limit
+  │
+  ├─ Executor:
+  │   ├─ 节点 1: Seq Scan on media
+  │   │   ├─ 遍历 1,000,000 个页面（假设 media 表 100 万行）
+  │   │   ├─ 对每一行检查 album_id = 42 子句
+  │   │   └─ 通过后再检查 media_id IN (media_urls 子查询)
+  │   │   └─ 输出 → 约 50,000 行匹配
+  │   │
+  │   ├─ 节点 2: Sort (Sort Method: quicksort, memory: 12000kB)
+  │   │   ├─ 读取 50,000 行到内存 tuplesort
+  │   │   ├─ 执行快速排序按 date_shot DESC
+  │   │   ├─ 排序完成，写回 sorted tuples 数组
+  │   │   └─ 内存不够则溢出到磁盘临时文件 merge sort
+  │   │
+  │   └─ 节点 3: Limit
+  │        ├─ 创建 cursor 指向 sorted[0]
+  │        ├─ FORWARD 40,000 个位置 → 逐个跳过（内部 goto，仍需寻址）
+  │        └─ 读取下一个 200 条 → 返回给客户端
+  │
+  └─ 统计信息输出:
+       - total_exec_time: ≈ 200-400ms
+       - buffers_read: ≈ 12,000 (主要是 media 表的页面)
+       - sort_mem_used: ≈ 10MB
+       - rows_returned: 200
+
+[网络传输层]
+  200 行 * (每行列数据平均 ~2KB，含 Blurhash 等字段) ≈ 400KB payload
+  → PostgreSQL → Go → GraphQL JSON 序列化 → HTTP Response → 前端
+```
+
+### 14.2 如果有了 (album_id, date_shot DESC) 复合索引后
+
+```
+Planner 选择:
+  Index Scan Backward using idx_media_album_date on media
+    Index Cond: (album_id = 42)
+    → 直接从索引顺序读取，无需 Sort 节点
+
+执行路径对比：
+  节点 1: Index Scan Backward (idx_media_album_date)
+    ├─ 定位索引叶节点 (42, max_date)
+    ├─ 沿索引链表反向（DESC）读取
+    ├─ 每条记录直接查回主表（索引包含 album_id 和 date_shot，但返回 SELECT * 需回表）
+    ├─ 每行额外做 media_urls 子查询检查
+    ├─ FORWARD 40,000 条（沿索引链表逐个跳过 → 仍有开销但比排序快很多）
+    └─ 取 200 条
+
+收益：
+  - 消除 50,000 行 Sort（O(N log N) 变为 O(1) 定位）
+  - 大 offset 从 "排序 + 跳过" 变为 "索引跳过 + 回表"
+  - 实际时间从 200-400ms 降至 50-80ms
+  - 内存：不再需要 Sort Buffer
+```
+
+### 14.3 SQLite 的全表扫描实现差异
+
+```
+SQLite 执行路径（VDBE 虚拟机字节码）：
+  OpenRead 0 → 打开 media 表 B-Tree 根页
+  OpenRead 1 → 打开 idx_media_album_id 索引（若用 album_id）
+
+  方案 A（无 date_shot 索引）：
+    Rewind 0 → 定位表开头
+    Loop:  // 全表扫描
+      Column 0, album_id → 比较 = 42
+      若匹配 → 复制到 ephemeral B-Tree (临时表，以 date_shot DESC 为键)
+      Next 0 → 下一行，直到 EOF
+
+    // 临时表构建完毕（含 50,000 条）
+    OpenEphemeral 2 → 打开排序后的临时表
+    Limit 40000 → 跳过 40,000 个 B-Tree 条目（向下 seek）
+    Loop 200:
+      Column → 构建输出行
+      Next
+
+  方案 B（有复合索引）：
+    OpenRead 1 (idx_media_album_date)
+    SeekGE 1 (42, MAXINT64) → 定位到 (42, 最大日期)
+    Limit 40000 → Next 1 × 40000 次（沿 B-Tree Leaf 链表跳）
+    Loop 200:
+      IdxRowid → 回表取完整行
+      Next 1
+
+关键区别：
+  - SQLite 用临时 B-Tree 做排序，PostgreSQL 用 quicksort/mergesort
+  - SQLite 在 OFFSET 时也是真的 Next 40000 次（但 B-Tree seek 比数组遍历略高效）
+  - SQLite 默认 page cache = 2000 页 → 大表扫描时频繁换入换出
+```
+
+### 14.4 "SELECT *" 加剧大 offset 的成本
+
+所有 Resolver 都使用默认的 `query.Find(&media)`，即 **SELECT 全部列**：
+
+```go
+// media.go 模型
+type Media struct {
+    Model           // ID (int) + CreatedAt + UpdatedAt → ~32 bytes
+    Title    string // ~100 bytes
+    Path     string // ~500 bytes
+    PathHash string // 32 bytes (MD5 hex)
+    AlbumID  int
+    DateShot time.Time // 8 bytes
+    Type     MediaType // ~10 bytes
+    Blurhash *string // ~256 bytes 字符串（base64）
+    // ... 还有若干指针列、关联列
+}
+// 每行总计 ≈ 1000-2000 bytes（取决于 Path 长度和 Blurhash 存在性）
+```
+
+**含义**：
+- `OFFSET 40000 LIMIT 200` 时，即使最终只返回 200 行给客户端，数据库在 Sort 阶段也**必须处理 50,000 行的完整列**（200 bytes × 50,000 = 10MB 数据要排序）
+- 加上 Blurhash 列（base64 字符串 ~256 字节），sort buffer 需要额外 12.5MB
+- 如果字段裁剪实现为 `db.Select("id", "title", "date_shot")` → **排序时处理的数据量可缩小到 1/10**，显著加速
+- 但 gqlgen `CollectFields` 仅调度 Resolver，不会把列名回传到 FormatSQL → 需要额外开发
+
+### 14.5 全表扫描触发条件总结
+
+| 查询场景 | 是否触发全表排序 | 原因 | 可被优化的方向 |
+|---------|---------------|------|-------------|
+| `Album.media` 按 `date_shot` 排序 | ✅ 100% 触发 | album_id 单索引不足以提供排序 | 加复合索引 |
+| `Album.media` 按 `title` 排序 | ✅ 100% 触发 | 无 title 索引 | 加 (album_id, title) 索引 |
+| `Album.media` 按 `id` 排序 | ⚠️ 可走主键索引，但前端默认不按 id | 主键天然有序 | 无需优化 |
+| `myMedia` 任意排序 | ✅ 100% 触发 | user_albums 子查询 + JOIN，不连贯 | 加 (id, date_shot) 索引 + 改查询 |
+| `myTimeline` | ✅ 100% 触发 | DATE_TRUNC 函数调用，列不原生排序 | 表达式索引 |
+| `myAlbums` | ⚠️ albums 行数少（通常 <1000），影响可忽略 | 虽无索引但数据量小 | 无需优化 |
+| `myFaceGroups` | ⚠️ 同上，通常 <1000 组 | 用 COUNT 排序但量小 | 无需优化 |
