@@ -765,9 +765,422 @@ Subscription 推送数据
 
 ---
 
-## 十一、Mutation 乐观更新的 Rollback 链路
+## 十一、扫描完成后缓存失效与 refetch 链路
 
-### 11.1 唯一使用 optimisticResponse 的 Mutation
+### 11.1 前提：项目没有上传功能
+
+需要先澄清：**Photoview 前端没有媒体上传功能**。新媒体进入系统的唯一途径是**后端扫描器**（Scanner）从服务器文件系统发现并导入照片。因此"媒体上传成功后"对应的实际场景是"扫描完成后"。
+
+扫描触发入口：
+- 设置页 "Scan all users" 按钮 → `scanAll` mutation
+- 用户管理页单个用户扫描 → `scanUser` mutation
+- 定期自动扫描 → `setPeriodicScanInterval` mutation
+
+### 11.2 扫描 Mutation 的返回与缓存关系
+
+文件：`api/graphql/resolvers/scanner.graphql`
+
+```graphql
+type ScannerResult {
+  finished: Boolean!
+  success: Boolean!
+  progress: Float
+  message: String
+}
+
+mutation scanAll {
+  scanAll { finished success progress message }
+}
+```
+
+`ScannerResult` 是一个**非实体类型**（没有 `id` 字段），Apollo 无法将其标准化为缓存对象。扫描 mutation 执行后：
+- 返回结果只存在于 mutation 的响应中
+- 不会写入任何可复用的缓存实体
+- **对相册列表、时间线等查询缓存没有任何影响**
+
+### 11.3 扫描进度通知链路
+
+扫描过程的进度通过 **Subscription** 推送，而非 mutation 响应。完整链路：
+
+```
+后端 scanner_queue 执行扫描任务
+        │
+        ▼
+scanner_tasks/notification_task.go 调用 BroadcastNotification
+        │
+        ▼
+GraphQL Subscription: notificationSubscription
+        │
+        ▼
+前端 SubscriptionsHook.useSubscription
+        │
+        ▼
+useEffect([data]) → 解析通知 → setMessages 更新 React state
+        │
+        ▼
+Messages 组件展示通知（进度条 / 完成提示）
+```
+
+**关键结论**：整条链路**完全不触碰 Apollo 缓存中的相册和时间线数据**。扫描完成通知只是一个 UI 提示，不会触发任何查询刷新。
+
+### 11.4 扫描完成后，谁触发 Refetch？—— 答案是：没有自动触发
+
+```
+扫描完成通知弹出来 → 用户看到"扫描完成"消息
+        │
+        ├─ 用户手动点击刷新按钮？ → 没有刷新按钮
+        │
+        ├─ 用户重新进入页面？ → 如果是第一次进入（缓存 miss），会发请求
+        │                     如果已缓存（cache-first），直接读旧缓存
+        │
+        └─ 用户切换年份筛选（Timeline）？ → 触发 client.resetStore() + refetch
+              这是唯一能强制刷新的交互，但不是因扫描而触发
+```
+
+**验证代码**：在 `SubscriptionsHook.ts` 中搜索 `refetch`、`client`、`cache` —— 结果为零。订阅钩子只操作 `setMessages`，完全不涉及 Apollo 缓存操作。
+
+### 11.5 收藏操作触发的手动 Refetch 机制
+
+作为对比，**收藏/取消收藏操作**有一套完整的缓存失效机制，这是项目中唯一的"数据变化 → 缓存标记 → 下次使用时刷新"模式。
+
+文件：`ui/src/Pages/AlbumPage/AlbumPage.tsx:33-91`
+
+```typescript
+let refetchNeededAll = false       // 模块级变量，跨实例共享
+let refetchNeededFavorites = false
+
+function AlbumPage() {
+  const { data, refetch } = useQuery(ALBUM_QUERY, { ... })
+
+  const toggleFavorites = useCallback((onlyFavorites: boolean) => {
+    if (
+      (refetchNeededAll && !onlyFavorites) ||
+      (refetchNeededFavorites && onlyFavorites)
+    ) {
+      // 标记了需要刷新 → 先 refetch 再切换筛选
+      refetch({ id: albumId, onlyFavorites }).then(() => {
+        if (onlyFavorites) refetchNeededFavorites = false
+        else refetchNeededAll = false
+        setOnlyFavorites(onlyFavorites)
+      })
+    } else {
+      setOnlyFavorites(onlyFavorites)
+    }
+  }, [setOnlyFavorites, refetch])
+
+  return (
+    <AlbumGallery
+      onFavorite={() => (refetchNeededAll = refetchNeededFavorites = true)}
+    />
+  )
+}
+```
+
+**工作原理**：
+1. 用户在相册中点击星标收藏/取消收藏 → `onFavorite` 回调将两个标记都设为 `true`
+2. 同时 `toggleFavoriteAction` 乐观更新已经修改了缓存中单个 `Media` 对象的 `favorite` 字段
+3. 但 `Album.media` 分页列表的缓存不会自动重新过滤（因为 Apollo 不知道哪些条目应该加入/移出收藏列表）
+4. 当用户切换"只看收藏"开关时，`toggleFavorites` 检查标记
+5. 如果标记了需要刷新，就先 `refetch` 从服务器拉最新数据，再切换筛选状态
+6. refetch 成功后清除对应标记
+
+**局限性**：
+- 只在 Album 页面有效，Timeline 页面没有类似机制
+- 只影响"只看收藏"筛选切换时的刷新，不影响普通浏览
+- 标记是模块级变量，如果同时打开多个 AlbumPage 实例会互相干扰
+
+### 11.6 扫描 vs 收藏：缓存失效策略对比
+
+| 场景 | 缓存失效方式 | 触发时机 | 自动/手动 |
+|------|-------------|---------|----------|
+| 扫描添加新媒体 | ❌ 无任何机制 | - | - |
+| 收藏/取消收藏 | 标记 + 下次切换筛选时 refetch | 用户切换 favorites 开关 | 半自动（需用户操作触发） |
+| Timeline 切年份 | `client.resetStore()` 全量清空 | URL 参数 `date` 变化 | 自动（路由参数驱动） |
+| Sharing mutation | `refetchQueries` 指定查询 | mutation 完成后 | 自动 |
+| 登录新用户 | 硬刷新整个页面 | login 成功后 | 自动 |
+
+### 11.7 扫描后缓存空洞的用户体验影响
+
+实际使用流程中，用户看到扫描完成通知后：
+
+```
+1. 用户在 Timeline 页面 → 看到扫描完成消息
+2. 用户滚动浏览 → 仍然是旧数据（cache-first 直接读缓存）
+3. 用户切换到某个相册 → 如果该相册已缓存，还是旧数据
+4. 用户刷新浏览器 → 所有缓存清空 → 重新请求 → 看到新照片
+```
+
+这是当前架构的一个明显缺陷：扫描完成通知与实际数据刷新完全脱节。
+
+---
+
+## 十二、路由切换时 in-flight Query 的取消行为
+
+### 12.1 问题本质
+
+当用户在页面 A 发起了一个 GraphQL 查询，在响应返回前导航到页面 B，这个"进行中的查询"（in-flight query）会怎样？
+
+涉及三层行为：
+1. **React 层**：组件卸载后是否还会接收更新
+2. **Apollo 层**：observable 取消订阅后的行为
+3. **网络层**：HTTP 请求是否真的被中断
+
+### 12.2 React 层：useQuery 的自动清理
+
+`@apollo/client` 3.6.9 的 `useQuery` hook 内部通过 `useEffect` 管理订阅：
+
+```
+组件挂载
+  → useQuery 创建 observable
+  → observable.subscribe()
+  → 注册 cleanup 函数
+  → 渲染组件
+
+组件卸载（路由切换导致）
+  → React 执行 cleanup
+  → observable.unsubscribe()
+  → 组件不再接收任何更新
+```
+
+**确认证据**：项目中没有手动管理订阅的代码（没有 `subscribe`/`unsubscribe` 调用），完全依赖 `useQuery` 的自动管理。
+
+### 12.3 Apollo 层：Observable 取消后的行为
+
+Apollo Client 的 `QueryManager` 维护着"查询 → 订阅者"的映射。当一个查询的所有订阅者都 unsubscribe 后：
+
+```
+QueryManager 内部状态
+  ├── activeQueries: Map<queryId, QueryInfo>
+  └── observables: Map<queryId, ObservableQuery>
+
+最后一个订阅者 unsubscribe
+  │
+  ├─ 方式 A：查询立即被标记为"非活跃"
+  │     但查询结果**仍然会写入缓存**（因为请求已经发出去了）
+  │     理由：缓存是全局的，未来其他组件可能需要这些数据
+  │
+  └─ 方式 B：查询被完全取消
+        结果不会写入缓存
+```
+
+**Apollo Client 3.6 的实际行为是方式 A**。
+
+验证依据：
+- 项目使用的 `@apollo/client` 版本是 `^3.6.9`
+- Apollo Client 3.x 的设计原则是"缓存是单一真实来源"，网络请求的结果始终服务于缓存
+- 即使没有活跃订阅者，已发出请求的响应仍然会更新缓存
+- 这一点从 `QueryManager` 的 `fetchQuery` 方法行为可以推断
+
+### 12.4 网络层：HTTP 请求无法取消
+
+项目使用默认的 `HttpLink`，底层是浏览器 `fetch` API：
+
+```typescript
+// apolloClient.ts:26-29
+const httpLink = new HttpLink({
+  uri: GRAPHQL_ENDPOINT,
+  credentials: 'include',
+})
+```
+
+**关键事实**：
+1. `fetch` API **原生不支持请求取消**（除非使用 `AbortController`）
+2. 项目中**没有使用 `AbortController`**（搜索 `AbortController` / `abort` / `signal` 均无结果）
+3. 因此，HTTP 请求一旦发出，就会一直运行到完成
+
+### 12.5 完整行为链
+
+```
+用户在 Timeline 页面触发 fetchMore（加载下一页）
+        │
+        ▼
+HTTP 请求发出（fetch，无法取消）
+        │
+        ▼
+用户快速点击 Album 链接 → 路由切换到 /album/:id
+        │
+        ├─ TimelineGallery 组件卸载
+        │     → useQuery cleanup → observable.unsubscribe()
+        │     → 组件不再接收更新
+        │
+        ├─ AlbumPage 组件挂载
+        │     → 新的 useQuery 发起 ALBUM_QUERY 请求
+        │
+        ▼
+时间线 fetchMore 的响应返回
+        │
+        ├─ Apollo QueryManager 收到响应
+        │     → 写入 InMemoryCache（Query.myTimeline 分页数据）
+        │     → 但 TimelineGallery 已卸载，没有订阅者收到通知
+        │
+        └─ 缓存中已包含时间线下一页数据
+              → 如果用户切回 Timeline 页面
+              → cache-first 策略下会直接读取已缓存的下一页
+              → 可能不会再发请求
+```
+
+### 12.6 实际影响
+
+1. **带宽浪费**：用户快速切换页面时，之前页面的请求仍然在后台跑，占用带宽
+2. **缓存意外填充**：用户离开页面后，该页面的数据仍在后台写入缓存
+3. **竞态风险低**：因为每个查询有独立的缓存键（`keyArgs`），不会互相干扰
+4. **无法取消的副作用**：mutation 一旦发出就无法回滚（但 mutation 的响应时间通常较短）
+
+### 12.7 Subscription 的特殊情况
+
+WebSocket 连接是**全局单例**，不随路由变化而断开：
+
+```typescript
+// apolloClient.ts:38-53
+const wsLink = new WebSocketLink({
+  uri: websocketUri.toString(),
+  options: {
+    reconnect: true,
+    lazy: true,
+    // ...
+  }
+})
+```
+
+- `lazy: true` 表示第一次订阅时才建立连接
+- 只要有至少一个 subscription 活跃，WebSocket 连接就保持
+- 当 `SubscriptionsHook` 组件卸载时（比如登出后），subscription 取消
+- 但 WebSocket 连接本身不会立即断开（有重连机制）
+- 长期来看，当没有活跃订阅时，连接可能因心跳超时或服务端断开而关闭
+
+---
+
+## 十三、长会话下缓存 GC 与上限策略
+
+### 13.1 Apollo Client 3.6 的缓存模型
+
+`InMemoryCache` 是一个**纯内存缓存**，没有内置的自动垃圾回收（GC）机制。
+
+核心设计原则：
+- 缓存是"单一真实来源"
+- 数据一旦写入，就永久保留
+- 开发者完全控制缓存的生命周期
+- 没有大小限制、没有 TTL、没有 LRU 淘汰
+
+### 13.2 项目中的缓存配置
+
+文件：`ui/src/apolloClient.ts:161-188`
+
+```typescript
+const memoryCache = new InMemoryCache({
+  typePolicies: {
+    SiteInfo: { merge: true },
+    MediaURL: { keyFields: ['url'] },
+    Album: {
+      fields: {
+        media: paginateCache(['onlyFavorites', 'order']),
+      },
+    },
+    FaceGroup: {
+      fields: {
+        imageFaces: paginateCache([]),
+      },
+    },
+    Query: {
+      fields: {
+        myTimeline: paginateCache(['onlyFavorites']),
+        myFaceGroups: paginateCache([]),
+      },
+    },
+  },
+})
+```
+
+**配置分析**：
+- 只有 `typePolicies`（类型策略）配置
+- **没有** `resultCaching` 显式配置（默认 `true`）
+- **没有** `freezeResults` 显式配置（生产环境默认 `true`）
+- **没有** 任何 GC 相关配置
+- **没有** 缓存大小限制
+
+### 13.3 缓存增长路径
+
+在长时间使用中，缓存会不断累积以下类型的数据：
+
+| 缓存实体类型 | 增长方式 | 数量级估算 |
+|-------------|---------|-----------|
+| `Media` 对象 | 分页加载无限追加 | 几千 ~ 几万张照片 |
+| `Album` 对象 | 每个相册一个对象 | 几十 ~ 几百个 |
+| `MediaURL` 对象 | 每张照片多个尺寸 URL | 几万 ~ 几十万条 |
+| `Query.myTimeline` 分页 | 按 onlyFavorites 分两组 | 2 组，每组无限增长 |
+| `Album.media` 分页 | 每个相册 × 排序方式 × 收藏筛选 | 每个相册多种分页 |
+| `FaceGroup` / `ImageFace` | 人脸数据 | 几千 ~ 几万张人脸 |
+| `SearchResult` 等临时查询 | SearchBar 使用后残留 | 视搜索频率而定 |
+| `Notification` 对象 | Subscription 推送 | 每条通知一个无用实体 |
+
+**分页的特殊问题**：
+`paginateCache` 使用数组索引合并，理论上可以无限增长。如果用户一直往下滚动时间线，`Query.myTimeline` 数组会变得非常长，每条都是 `{ __ref: 'Media:123' }` 的引用。
+
+### 13.4 项目中唯一的缓存清空方式：resetStore
+
+文件：`ui/src/components/timelineGallery/TimelineGallery.tsx:125-137`
+
+```typescript
+useEffect(() => {
+  ;(async () => {
+    await client.resetStore()
+    await refetch({ ... })
+  })()
+}, [filterDate])
+```
+
+这是整个项目中**唯一一处主动清空缓存**的代码，在 Timeline 切换年份时触发。
+
+`resetStore` 的行为：
+1. 清空整个 `InMemoryCache`
+2. 重新获取所有**活跃**的查询（有订阅者的查询）
+3. 非活跃查询的数据被丢弃
+
+**注意**：`resetStore` 是**全局操作**，会影响所有页面的缓存。当用户在 Timeline 切年份时，Album 页面的缓存也会被清空。
+
+### 13.5 其他隐含的缓存重置时机
+
+| 时机 | 方式 | 效果 |
+|------|------|------|
+| 登录新用户 | `window.location.href = '/'` 硬刷新 | 整个页面 reload，缓存完全重建 |
+| 浏览器刷新 | 用户手动 F5 | 同上 |
+| 关闭标签页 | - | 内存释放 |
+| 登出 | `navigate('/')` 软切换 | **不清缓存**（旧数据残留） |
+
+### 13.6 与缓存 GC 相关的 Apollo 配置选项（项目均未使用）
+
+Apollo Client 3.x 提供了一些与缓存生命周期相关的配置，但本项目都没有使用：
+
+| 配置 | 作用 | 默认值 |
+|------|------|--------|
+| `resultCaching` | 是否缓存查询结果（不是实体缓存） | `true` |
+| `freezeResults` | 冻结缓存数据防止意外修改 | 生产环境 `true` |
+| `dataIdFromObject` | 自定义缓存键生成函数 | 默认 `__typename:id` |
+| `possibleTypes` | 接口/联合类型的可能类型映射 | - |
+
+Apollo Client 3.4+ 引入的缓存管理工具（但本项目未显式使用）：
+- `cache.evict()`：手动移除指定实体
+- `cache.modify()`：手动修改缓存字段
+- `cache.gc()`：手动执行垃圾回收（移除无引用的实体）
+
+### 13.7 实际影响评估
+
+对于 Photoview 这种照片浏览应用：
+1. **缓存增长速度**：中等。用户浏览照片时每张都会创建 `Media` 和 `MediaURL` 对象
+2. **内存占用**：几千张照片的元数据通常在几十 MB 量级，不会造成严重问题
+3. **长会话风险**：如果用户连续浏览几万张照片，可能出现明显内存增长
+4. **实际缓解**：用户通常不会连续浏览太久，且浏览器刷新/重新登录会重置缓存
+
+**潜在问题**：
+- SearchBar 的搜索结果会永久留在缓存中
+- Share 页面查询的对象会与主应用缓存合并
+- Notification subscription 推送的无用对象持续累积（虽然每次量很小）
+
+---
+
+## 十四、Mutation 乐观更新的 Rollback 链路
+
+### 14.1 唯一使用 optimisticResponse 的 Mutation
 
 文件：`ui/src/components/photoGallery/photoGalleryMutations.ts:23-43`
 
@@ -788,7 +1201,7 @@ export const toggleFavoriteAction = ({ media, markFavorite }) => {
 }
 ```
 
-### 11.2 Apollo 乐观更新的内部写入机制
+### 14.2 Apollo 乐观更新的内部写入机制
 
 当 `markFavorite` 被调用时，Apollo Client 执行以下步骤：
 
@@ -819,7 +1232,7 @@ export const toggleFavoriteAction = ({ media, markFavorite }) => {
         → 所有观察该 Media 的组件自动回滚
 ```
 
-### 11.3 Rollback 的责任归属
+### 14.3 Rollback 的责任归属
 
 **谁负责 rollback？——Apollo Client 自动完成，无需业务代码介入。**
 
@@ -841,7 +1254,7 @@ Apollo 的乐观更新基于**分层缓存**架构：
 
 **关键代码验证**：`toggleFavoriteAction` 没有提供 `onError` 回调，也没有任何手动缓存修复逻辑。这证实了 rollback 完全依赖 Apollo 内部机制。
 
-### 11.4 失败场景下的完整影响链
+### 14.4 失败场景下的完整影响链
 
 ```
 用户点击收藏星标
@@ -863,7 +1276,7 @@ HTTP 请求发出 → 服务器返回错误
         └─ UI 自动回滚到未收藏状态（星标取消高亮）
 ```
 
-### 11.5 其他 Mutation 的错误处理模式
+### 14.5 其他 Mutation 的错误处理模式
 
 项目中不使用乐观更新的 Mutation 采用了两种错误处理策略：
 
@@ -893,9 +1306,9 @@ const [addRootPath] = useMutation(USER_ADD_ROOT_PATH_MUTATION, {
 
 ---
 
-## 十二、退出登录 / 切换用户时 Sidebar 的清理触发点
+## 十五、退出登录 / 切换用户时 Sidebar 的清理触发点
 
-### 12.1 Sidebar 的生命周期与清理时机
+### 15.1 Sidebar 的生命周期与清理时机
 
 Sidebar 的状态存储在 `SidebarProvider` 的 `useState` 中：
 
@@ -915,7 +1328,7 @@ export const SidebarProvider = ({ children }) => {
 
 Sidebar 不随路由变化自动重置，它的清理完全依赖**显式调用 `updateSidebar(null)`**。
 
-### 12.2 全部 updateSidebar 调用点盘点
+### 15.2 全部 updateSidebar 调用点盘点
 
 | 位置 | 触发场景 | 传入值 |
 |------|---------|-------|
@@ -926,7 +1339,7 @@ Sidebar 不随路由变化自动重置，它的清理完全依赖**显式调用 
 | `SidebarHeader.tsx:22` | 用户点击关闭按钮 | `null` |
 | `MediaSidebar.tsx:195` | album path 链接点击时 | `null` |
 
-### 12.3 登出时 Sidebar 的清理路径
+### 15.3 登出时 Sidebar 的清理路径
 
 ```
 用户访问 /logout
@@ -952,7 +1365,7 @@ LoginPage 渲染
 4. **Sidebar 仍然显示旧的 AlbumSidebar 内容**（包含旧用户的相册信息）
 5. Sidebar 组件内部的 `useQuery` 因 `authToken()` 返回 null，部分组件（如 `AlbumSidebar`）不会发起新请求，但**旧内容仍在 DOM 中**
 
-### 12.4 为什么视觉上不会出问题？
+### 15.4 为什么视觉上不会出问题？
 
 Sidebar 的可见性由 CSS `translate-x-full` / `translate-x-0` 控制：
 
@@ -968,7 +1381,7 @@ className={`... ${content == null && !pinned ? 'translate-x-full' : 'translate-x
 
 所以虽然 **state 未清理**，但用户不太可能注意到残留数据。
 
-### 12.5 登录（用户切换）时的清理路径
+### 15.5 登录（用户切换）时的清理路径
 
 ```
 LoginPage authorize mutation 成功
@@ -989,7 +1402,7 @@ login(token) (loginUtilities.tsx:13-16)
 
 **登录使用硬刷新，Sidebar state 自然清空**。这是唯一可靠的清理路径。
 
-### 12.6 Sidebar 清理缺失的完整影响矩阵
+### 15.6 Sidebar 清理缺失的完整影响矩阵
 
 | 场景 | Sidebar 是否清理 | 清理方式 | 风险 |
 |------|-----------------|---------|------|
@@ -998,7 +1411,7 @@ login(token) (loginUtilities.tsx:13-16)
 | Session 过期 (linkError) | ❌ 不清理 | `clearTokenCookie()` 但无 `updateSidebar(null)` | Sidebar 内容可能引用已无权限的数据 |
 | Token 变为无效 | ❌ 不清理 | 后续 useQuery 返回错误，但 sidebar 不自动关闭 | Sidebar 中显示错误信息 |
 
-### 12.7 对比：App.tsx 路由变化时的副作用
+### 15.7 对比：App.tsx 路由变化时的副作用
 
 文件：`ui/src/App.tsx:15-19`
 
@@ -1014,7 +1427,7 @@ App 组件监听 `pathname` 变化做了滚动重置和焦点释放，但**没�
 
 ---
 
-## 十三、路由切换时的全局副作用
+## 十六、路由切换时的全局副作用
 
 文件：`ui/src/App.tsx:15-19`
 
@@ -1034,7 +1447,7 @@ useEffect(() => {
 
 ---
 
-## 十四、SearchBar 的延迟查询
+## 十七、SearchBar 的延迟查询
 
 文件：`ui/src/components/header/Searchbar.tsx`
 
@@ -1057,7 +1470,7 @@ useEffect(() => {
 
 ---
 
-## 十五、关键代码位置速查
+## 十八、关键代码位置速查
 
 | 功能模块 | 文件路径 | 关键行 |
 |---------|---------|-------|
@@ -1088,10 +1501,17 @@ useEffect(() => {
 | Notification GraphQL schema | `api/graphql/resolvers/notification.graphql` | 全文 |
 | 登出路由 (无 Sidebar 清理) | `ui/src/components/routes/Routes.tsx` | 151-155 |
 | Mutation 错误处理 (linkError) | `ui/src/apolloClient.ts` | 68-136 |
+| 扫描 Mutation (前端) | `ui/src/Pages/SettingsPage/ScannerSection.tsx` | 10-22 |
+| 扫描 Mutation (后端 schema) | `api/graphql/resolvers/scanner.graphql` | 8-23 |
+| Album 收藏 refetch 标记 | `ui/src/Pages/AlbumPage/AlbumPage.tsx` | 33-91 |
+| HttpLink 配置 | `ui/src/apolloClient.ts` | 26-29 |
+| WebSocketLink 配置 | `ui/src/apolloClient.ts` | 38-53 |
+| InMemoryCache 配置 | `ui/src/apolloClient.ts` | 161-188 |
+| 分页缓存合并函数 | `ui/src/apolloClient.ts` | 144-159 |
 
 ---
 
-## 十六、潜在问题与设计权衡
+## 十九、潜在问题与设计权衡
 
 | 现象 | 原因 | 影响 |
 |------|------|------|
@@ -1106,3 +1526,7 @@ useEffect(() => {
 | SearchBar 结果无清除缓存策略 | 搜索结果写入 Apollo 标准化缓存 | 低频搜索的 Album/Media 条目永久留在缓存中，可能占用内存 |
 | Share 页面与主应用共享缓存 | 共用同一个 Apollo Client | Share 页面查询的 Album/Media 对象会与主应用查询合并，可能产生字段覆盖（如 Share 查询含 downloads 字段而主查询不含） |
 | Notification 写入 store 但无效 | 无 `keyFields` 配置且无 `id` 字段 | 每次 subscription 推送都创建无法复用的缓存实体，造成内存浪费 |
+| 扫描完成后缓存不自动刷新 | Subscription 通知只更新 Messages state，不触发 refetch | 用户看到扫描完成通知但列表仍是旧数据，需手动刷新浏览器 |
+| 路由切换时 in-flight query 不取消 | fetch API 原生不支持取消，项目未用 AbortController | 快速切换页面时后台仍在跑请求，浪费带宽；响应仍写入缓存 |
+| 缓存无 GC 机制无限增长 | InMemoryCache 无大小限制、无 TTL、无自动回收 | 长会话下缓存持续膨胀，只有 resetStore/页面刷新才能清空 |
+| 分页数组无上限 | `paginateCache` 按索引合并，理论上可无限追加 | 用户一直滚动浏览会导致分页数组越来越长 |
