@@ -504,7 +504,7 @@ db.Model(&UserMediaData{UserID: user.ID}).
 
 ### 10.7 不存在定期清理过期 ShareToken 的后台任务
 
-过期 ShareToken 仅在使用时被拦截（GraphQL `ShareToken` query 和 HTTP `shareTokenFromRequest` 均检查 `Expire`），但没有任何 periodic job 或 cron 会从数据库中物理删除过期行。过期 token 会永久堆积。
+过期 ShareToken 仅在使用时被拦截（GraphQL `ShareToken` query 和 HTTP `shareTokenFromRequest` 均检查 `Expire`），但没有任何 periodic job 或 cron 会从数据库中物理删除过期行。过期 token 会永久堆积。详见第 14 章的完整代码路径分析。
 
 ---
 
@@ -1030,3 +1030,218 @@ scanner.ProcessSingleMedia(ctx, db, media)
 | Token 枚举 | 8 字符 token (48 bits) + 无频率限制 | 暴力枚举可能，但配合过期时间概率偏低 |
 | CORS 限制 | 生产环境限定 UI Endpoint 域名；TokenPassword 在 Cookie | 第三方页面无法跨域读取图片元数据，但 `<img src>` 级联加载不受限 |
 | Referer 检查 | ❌ 无 | 外链盗图（token 暴露在 URL 中）无法阻止 |
+
+---
+
+## 14. ShareToken 过期清理任务：代码路径梳理
+
+### 14.1 结论先行：不存在定期清理
+
+经过对 `periodic_scanner`、`scanner_tasks`、`cleanup_tasks`、`server.go` 启动流程、以及数据库迁移的全面排查，**Photoview 中没有任何定期清理过期 ShareToken 的后台任务**。
+
+过期的 ShareToken 仅在"访问时被拦截"（软失效），但永远不会从数据库中物理删除。
+
+### 14.2 唯一的 periodic 任务：媒体扫描器
+
+**文件**: `api/scanner/periodic_scanner/periodic_scanner.go`
+
+这是代码中唯一的周期性调度器，但其唯一功能是触发媒体扫描：
+
+```
+periodicScanner.scanIntervalRunner()
+    └─ ticker.C 触发
+        └─ ps.scannerQueue.AddAllToQueue()
+            └─ scanner_queue.AddAllToQueue()
+                └─ 把所有用户加入扫描队列
+```
+
+**配置项** (`SiteInfo.PeriodicScanInterval`):
+- 类型：秒数
+- 默认值：0（禁用）
+- 由管理员在 GraphQL `setPeriodicScanInterval` mutation 中设置
+- 修改通过 `ChangePeriodicScanInterval()` 实时生效，无需重启
+
+**启动入口** (`api/server.go:66`):
+```go
+if err := periodic_scanner.InitializePeriodicScanner(db); err != nil {
+    log.Panicf("Could not initialize periodic scanner: %s", err)
+}
+```
+
+**关键观察**：`periodicScanner` 的职责非常单一，只做文件系统扫描。没有任何 token 清理钩子或扩展点。
+
+### 14.3 Cleanup Tasks 家族的职责边界
+
+`api/scanner/scanner_tasks/cleanup_tasks/` 目录下有两个清理任务：
+
+| 任务 | 文件 | 职责 |
+|------|------|------|
+| `MediaCleanupTask` | `media_cleanup_task.go` | 扫描相册后，删除文件系统中已不存在的媒体记录 |
+| `DeleteOldUserAlbums` | `cleanup_media.go`？不，是 `scanner_user.go:222` | 扫描用户后，删除不再存在的 user_albums 关联 |
+
+两者都只在**扫描流程内**触发，且都只处理**媒体/相册**层面的清理，完全不涉及 ShareToken。
+
+### 14.4 数据库层：无 Trigger / Event / Cron
+
+- **GORM 自动迁移**（`database.MigrateDatabase`）只建表和索引，不创建 trigger
+- **迁移脚本**（`api/database/migrations/`）中无任何与 share_token 清理相关的 migration
+- **SQLite / MySQL / Postgres**：无数据库级别的定时任务配置
+
+### 14.5 过期 token 的实际处理流程
+
+```
+过期 ShareToken 在数据库中:
+├─ GraphQL 层访问:
+│   └─ ShareToken query / ShareTokenValidatePassword query
+│        └─ fakeTime 对比 → 返回错误 / false
+│        └─ 不做 DELETE
+│
+├─ HTTP 路由层访问:
+│   └─ shareTokenFromRequest()
+│        └─ time.Now().After(Expire) → 返回 ErrUnauthorized
+│        └─ 不做 DELETE
+│
+└─ 隐式级联删除（仅在关联对象被删时）:
+    ├─ 删除 Album → ON DELETE CASCADE → 删该相册的所有 ShareToken
+    ├─ 删除 Media → ON DELETE CASCADE → 删该媒体的所有 ShareToken
+    └─ 删除 User → ON DELETE CASCADE → 删该用户创建的所有 ShareToken
+```
+
+### 14.6 长期运行的影响
+
+- ShareToken 表会持续增长，永不自动收缩
+- 设了过期时间的 token 在过期后仍然占用行空间
+- 大量过期 token 可能影响查询性能（虽然 token 有索引，但无用数据多）
+- 如果管理员设置了非常多短期 token，表膨胀是不可忽视的问题
+
+### 14.7 为什么没有清理任务？——架构推测
+
+从代码组织来看：
+1. `periodic_scanner` 是为"定期扫描文件系统"这个核心场景设计的
+2. ShareToken 被视为"轻量功能"，没有单独的定期任务调度器
+3. 开发者可能假设 token 数量不会很大，或者由外部运维（如 SQL cron）处理
+
+---
+
+## 15. 搜索引擎索引 / Robots 防护：代码挂载点分析
+
+### 15.1 结论先行：完全没有防护
+
+经过对 Go 后端、UI 前端、静态资源的全面搜索，**Photoview 没有任何针对搜索引擎爬虫的防护措施**。没有 `robots.txt`、没有 `X-Robots-Tag`、没有 `<meta name="robots">`、没有 `rel="nofollow"`。
+
+这意味着如果一个共享相册链接被发布到公开网络上，搜索引擎爬虫可以：
+1. 访问并索引共享页面（`/share/{token}`）
+2. 跟随页面中的图片链接，批量爬取照片
+3. 递归发现子相册共享页面
+
+### 15.2 后端路由层：无 robots.txt 处理
+
+**文件**: `api/server.go` + `api/routes/spa.go`
+
+```
+rootRouter 注册的路由:
+├─ /api/graphql
+├─ /api/photo/*
+├─ /api/video/*
+├─ /api/download/*
+└─ / (SPA Handler, 即 frontend)
+```
+
+**没有** `/robots.txt` 路由，也没有任何 middleware 设置 `X-Robots-Tag` header。
+
+当爬虫请求 `/robots.txt` 时：
+1. 路径不匹配任何 API 路由
+2. 落到 `SpaHandler`
+3. `relPath = "robots.txt"`
+4. `os.Stat(ui/robots.txt)` → 不存在
+5. 走 SPA fallback → 返回 `index.html`（200 OK）
+6. 爬虫拿到的是 HTML 页面，而不是 robots.txt 指令
+
+**后果**：爬虫会把 200 OK 的 HTML 当作"没有 robots 限制"，继续爬取。
+
+### 15.3 UI 层：无 robots meta 标签
+
+**文件**: `ui/index.html`
+
+当前 `<head>` 中的 meta 标签：
+```html
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#000000" />
+<meta name="apple-mobile-web-app-title" content="Photoview" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="white" />
+```
+
+**缺失**：
+- `<meta name="robots" content="noindex, nofollow">` — 完全没有
+- 即使是登录页、共享页面也没有任何防索引标记
+
+### 15.4 共享页面的可发现性
+
+**共享链接 URL 结构** (`ui/src/components/sidebar/Sharing.tsx:535`):
+```
+${location.origin}/share/${share.token}
+```
+
+例如：`https://photoview.example.com/share/AbCdEf12`
+
+**子相册共享 URL** (`ui/src/Pages/SharePage/AlbumSharePage.tsx:147`):
+```
+/share/${token}/${albumId}
+```
+
+**图片 URL**（带 token 直接可访问）:
+```
+/api/photo/{media_url_name}?token={share_token}
+```
+
+这些 URL 的特征：
+- Token 在**路径**中（`/share/xxx`）而非 query string → 搜索引擎更容易索引
+- 图片 URL 的 token 在 **query string** 中（`?token=xxx`）→ 部分爬虫可能不会深度爬取带 query 的 URL，但现代爬虫会
+- 没有 `rel="canonical"` 指向统一页面
+
+### 15.5 图片/视频响应头：无 X-Robots-Tag
+
+**`/api/photo/{name}`** 的响应头（`photos.go:74`）：
+```
+Cache-Control: private, max-age=31536000, immutable
+Content-Type: image/jpeg
+Content-Disposition: inline (默认)
+```
+
+**没有** `X-Robots-Tag: noindex` 或 `X-Robots-Tag: noimageindex`。
+
+意味着即便爬虫无法访问相册页面，只要图片 URL 泄露（例如发布到论坛），Google 图片搜索仍可能索引这些图片。
+
+### 15.6 各层防护现状一览表
+
+| 防护层面 | 现状 | 应有的防护 |
+|---------|------|-----------|
+| `robots.txt` | ❌ 不存在，返回 index.html | `User-agent: * Disallow: /` 或至少 `Disallow: /share/` |
+| `<meta name="robots">` | ❌ 无 | 所有页面添加 `noindex, nofollow` |
+| `X-Robots-Tag` HTTP header | ❌ 无 | API 响应（尤其图片）添加 `noimageindex` |
+| `rel="nofollow"` | ❌ 链接无此属性 | 外链、共享链接添加 |
+| `rel="canonical"` | ❌ 无 | 减少重复内容索引 |
+| HTTP Basic Auth / 登录墙 | ⚠️ 共享页面没有 | 主站有登录墙，但共享页面公开 |
+
+### 15.7 实际风险评估
+
+**高风险场景**：
+1. 用户把共享链接发到公开论坛 / 社交媒体 → 爬虫抓取 → 所有照片被索引
+2. 相册共享 token 设为永不过期 → 照片长期可被搜索引擎发现
+3. 子相册递归可见 → 爬虫可能遍历整个相册树
+
+**降低风险的因素**：
+1. token 有 8 字符随机熵 → 不能被直接枚举（但可以通过外链发现）
+2. `Cache-Control: private` → 告诉代理不要缓存，但不影响搜索引擎索引
+3. SPA 应用需要 JS 渲染 → 早期简单爬虫可能看不到内容，但 Googlebot 等现代爬虫会执行 JS
+
+### 15.8 为什么没有防护？——设计哲学推测
+
+从代码来看，Photoview 的设计哲学似乎是：
+- 共享链接本身就是"公开"的（知道链接的人都能访问）
+- 没有考虑"被搜索引擎索引"这个维度的隐私问题
+- 假设用户只会把链接发给信任的人，不会公开传播
+
+这是许多自建照片共享应用的通病——security by obscurity（隐蔽性安全），但在搜索引擎时代是不够的。
