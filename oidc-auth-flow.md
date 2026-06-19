@@ -946,6 +946,424 @@ OIDC 场景下的完整 Logout
 └──────────────────────────────────────────────────────────────┘
 ```
 
+### 6.5 OIDC 回调与本地账号合并策略
+
+#### 6.5.1 当前数据模型的合并约束
+
+Photoview 的 User 模型（`api/graphql/models/user.go:14-21`）有一个关键约束：
+
+```go
+type User struct {
+    Model
+    Username string  `gorm:"unique;size:128"`  // ← 唯一约束
+    Password *string `gorm:"size:256"`
+    Albums   []Album `gorm:"many2many:user_albums;constraint:OnDelete:CASCADE;"`
+    Admin    bool    `gorm:"default:false"`
+}
+```
+
+`Username` 字段有 `unique` 约束，这意味着：
+- 本地用户 `alice` 和 OIDC 用户 `alice` 不能共存
+- 合并时必须解决 Username 冲突
+
+#### 6.5.2 当前代码中没有任何合并逻辑
+
+经过完整代码搜索，Photoview **完全没有**以下任何实现：
+
+| 缺失能力 | 代码证据 |
+|---------|---------|
+| OIDC 用户与本地用户的自动合并 | 无相关代码 |
+| 字段冲突解决策略（Username、Admin） | 无相关代码 |
+| OIDC identity 到本地 User 的映射表 | 无 `oauth_identities` 或类似表 |
+| OIDC sub claim 到 User 的关联字段 | User 模型无 `OIDCSub` 或类似字段 |
+| 合并后的数据迁移（相册、收藏等） | 无相关代码 |
+
+#### 6.5.3 反向代理模式下的合并场景分析
+
+在反向代理 OIDC 模式下，账号合并的核心问题是：**OIDC Provider 传来的用户名如何映射到本地用户**。
+
+```
+OIDC 回调后账号合并的三种场景
+
+场景 A：纯 OIDC 用户（无冲突）
+┌─────────────────────────────────────────────────────────────┐
+│  X-Remote-User: alice@oidc                                  │
+│  数据库查询: SELECT * FROM users WHERE username = 'alice@oidc' │
+│  结果: 未找到                                               │
+│  操作: RegisterUser(db, "alice@oidc", nil, false)            │
+│  结果: 新建无密码用户，相册为空                              │
+└─────────────────────────────────────────────────────────────┘
+
+场景 B：OIDC 用户名与本地用户冲突（当前会静默失败）
+┌─────────────────────────────────────────────────────────────┐
+│  X-Remote-User: alice                                       │
+│  数据库查询: SELECT * FROM users WHERE username = 'alice'    │
+│  结果: 找到，但 Password != nil（本地用户）                  │
+│  当前行为: OIDC 中间件跳过（Password != nil 安全检查）       │
+│  结果: 用户无法通过 OIDC 登录，也无法理解原因                │
+│                                                             │
+│  ❌ 没有: 提示用户名冲突、建议合并、自动关联等逻辑           │
+└─────────────────────────────────────────────────────────────┘
+
+场景 C：同一用户先本地后 OIDC（需要手动关联）
+┌─────────────────────────────────────────────────────────────┐
+│  步骤 1: 管理员创建本地用户 alice，设置密码，分配相册        │
+│  步骤 2: 部署 OIDC，alice 也想用 OIDC 登录                  │
+│  步骤 3: 需要"关联"操作，将 OIDC identity 绑到本地 alice    │
+│                                                             │
+│  ❌ 没有: 关联操作、identity 绑定表、合并确认流程            │
+│  当前唯一方案: 管理员手动将 alice 的密码清空（设为 NULL）    │
+│  → UPDATE users SET password = NULL WHERE username = 'alice' │
+│  → 但这样 alice 就不能再用密码登录了                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 6.5.4 合并所需的字段冲突解决
+
+| 字段 | 冲突场景 | 当前处理 | 需要的处理 |
+|------|---------|---------|-----------|
+| `Username` | OIDC 用户名与本地用户同名 | unique 约束报错 | 命名空间隔离（如 `oidc:alice`）或关联绑定 |
+| `Password` | 本地用户有密码，OIDC 用户无密码 | `Password != nil` 跳过 OIDC 登录 | 支持双认证方式：同时有密码和 OIDC 绑定 |
+| `Admin` | OIDC 用户声称 admin=true，本地记录 admin=false | 以本地记录为准 | 可配置：以 OIDC claim 为准 / 以本地为准 |
+| `Albums` | 本地用户有相册，OIDC 新建用户无相册 | 两个独立用户，互不影响 | 合并后应继承原用户的相册和收藏 |
+
+#### 6.5.5 建议的合并架构改造
+
+```sql
+-- 新增 oauth_identities 表，实现 OIDC 与本地用户的多对多绑定
+CREATE TABLE oauth_identities (
+    id          INTEGER PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider    VARCHAR(64) NOT NULL,    -- 'authelia', 'keycloak', 'google' 等
+    subject     VARCHAR(256) NOT NULL,   -- OIDC sub claim
+    created_at  DATETIME,
+    updated_at  DATETIME,
+    UNIQUE(provider, subject)            -- 同一 provider 的 sub 唯一
+);
+```
+
+```go
+// OIDC 中间件改造：先查 oauth_identities，再查 users
+func OIDCMiddleware(db *gorm.DB) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            remoteUser := r.Header.Get("X-Remote-User")
+            if remoteUser == "" {
+                next.ServeHTTP(w, r)
+                return
+            }
+
+            // 路径 1：通过 oauth_identities 查找已绑定用户
+            var identity OAuthIdentity
+            if err := db.Where("provider = ? AND subject = ?", "proxy", remoteUser).
+                First(&identity).Error; err == nil {
+                // 已绑定，直接生成 token
+                var user models.User
+                db.First(&user, identity.UserID)
+                // ... 生成 AccessToken
+                return
+            }
+
+            // 路径 2：未绑定，查询是否已有同名用户
+            var user models.User
+            if err := db.Where("username = ?", remoteUser).First(&user).Error; err == nil {
+                // 同名用户存在 → 拒绝自动创建，提示需要管理员关联
+                http.Error(w, "Username conflicts with existing local user", http.StatusForbidden)
+                return
+            }
+
+            // 路径 3：完全新用户，自动创建
+            user, _ = models.RegisterUser(db, remoteUser, nil, false)
+            db.Create(&OAuthIdentity{UserID: user.ID, Provider: "proxy", Subject: remoteUser})
+            // ... 生成 AccessToken
+        })
+    }
+}
+```
+
+---
+
+## 六-A、登录失败风控与防爆破机制
+
+### 6A.1 当前代码的防爆破现状
+
+经过对 `AuthorizeUser`、`authorizeUser` resolver、`auth.Middleware` 以及整个中间件链的完整审查：
+
+**文件**: `api/graphql/resolvers/user.go:24-54`
+
+```go
+func (r *mutationResolver) AuthorizeUser(ctx context.Context, username string, password string) (*models.AuthorizeResult, error) {
+    db := r.DB(ctx)
+    user, err := models.AuthorizeUser(db, username, password)
+    if err != nil {
+        // 登录失败：直接返回错误，没有任何计数或限制
+        return &models.AuthorizeResult{
+            Success: false,
+            Status:  err.Error(),
+        }, nil
+    }
+    // ... 生成 token
+}
+```
+
+**文件**: `api/graphql/models/user.go:76-100`
+
+```go
+func AuthorizeUser(db *gorm.DB, username string, password string) (*User, error) {
+    var user User
+    result := db.Where("username = ?", username).First(&user)
+    // 用户不存在 → 返回固定错误
+    // 密码错误   → 返回固定错误
+    // 没有任何延迟、计数、锁定逻辑
+}
+```
+
+**完整中间件链**（`api/server.go:74-78`）：
+
+```go
+rootRouter := mux.NewRouter()
+rootRouter.Use(dataloader.Middleware(db))
+rootRouter.Use(auth.Middleware(db))
+rootRouter.Use(server.LoggingMiddleware)
+rootRouter.Use(server.CORSMiddleware(devMode))
+// ❌ 没有 rate limiting 中间件
+// ❌ 没有 login attempt 计数中间件
+```
+
+### 6A.2 项目中唯一的 Throttle 机制
+
+**文件**: `api/utils/throttle.go:1-25`
+
+```go
+type Throttle struct {
+    interval   time.Duration
+    lastAction time.Time
+}
+
+func (t *Throttle) Trigger(action func()) {
+    if time.Now().After(t.lastAction.Add(t.interval)) {
+        t.lastAction = time.Now()
+        action()
+    }
+}
+```
+
+这个 `Throttle` **只用于扫描器通知频率控制**（`api/scanner/scanner_tasks/notification_task.go:21`），与登录风控完全无关。
+
+### 6A.3 缺失的防爆破能力清单
+
+| 缺失能力 | 攻击面 | 影响 |
+|---------|--------|------|
+| 登录失败次数限制 | `authorizeUser` mutation | 无限次尝试密码 |
+| 账号锁定机制 | 无 `login_attempts` / `locked_until` 字段 | 无法自动锁定被攻击账号 |
+| IP 频率限制 | 无 per-IP rate limiter | 单 IP 可无限暴力破解 |
+| 全局频率限制 | 无 per-endpoint rate limiter | 大规模分布式爆破无法遏制 |
+| 登录失败延迟 | 无指数退避 | 快速尝试无惩罚 |
+| 验证码 | 无 CAPTCHA 集成 | 无法区分人与机器 |
+| 登录审计日志 | 无 `auth_audit_log` 表 | 无法事后追溯攻击 |
+
+### 6A.4 暴力破解 PoC 路径
+
+```
+攻击路径（当前代码零防护）
+
+攻击者 → POST /api/graphql
+         {
+           "query": "mutation { authorizeUser(username: \"admin\", password: \"password123\") { success } }"
+         }
+         ↓
+         AuthorizeUser(db, "admin", "password123")
+         ↓ bcrypt 比对（耗时 ~100ms，cost=12）
+         失败 → 返回 { "success": false, "status": "invalid credentials" }
+         ↓
+         攻击者立即重试（无延迟、无限制）
+         ↓
+         每秒可尝试 ~10 次 → 6 分钟约 3600 次 → 覆盖常见弱密码字典
+```
+
+**唯一的自然延迟**：bcrypt cost=12 的哈希比对约 100ms/次，但这只是延迟攻击速度，并不阻止攻击。
+
+### 6A.5 建议的防爆破改造
+
+```
+防爆破改造方案（三层递进）
+
+┌─────────────────────────────────────────────────────────────────┐
+│  第一层：应用层速率限制（优先实施）                               │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 中间件：golang.org/x/time/rate 或 github.com/ulule/limiter │ │
+│  │ - Per-IP: 10 次/分钟                                       │ │
+│  │ - Per-username: 5 次/分钟                                   │ │
+│  │ - 全局: 100 次/分钟                                         │ │
+│  │ 超限 → HTTP 429 Too Many Requests                          │ │
+│  └────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│  第二层：登录失败计数与锁定                                      │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ User 模型新增字段:                                          │ │
+│  │   FailedLoginAttempts int     `gorm:"default:0"`           │ │
+│  │   LockedUntil         *time.Time                           │ │
+│  │                                                             │ │
+│  │ AuthorizeUser 逻辑改造:                                     │ │
+│  │   if LockedUntil != nil && now.Before(*LockedUntil) {      │ │
+│  │     return nil, ErrAccountLocked                            │ │
+│  │   }                                                         │ │
+│  │   // 密码错误后:                                             │ │
+│  │   FailedLoginAttempts++                                     │ │
+│  │   if FailedLoginAttempts >= 5 {                             │ │
+│  │     LockedUntil = now + 15 * time.Minute                    │ │
+│  │   }                                                         │ │
+│  └────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│  第三层：审计日志（可选）                                        │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 新增 auth_audit_logs 表:                                    │ │
+│  │   user_id, ip, action, success, timestamp                   │ │
+│  │ 用于事后追溯和安全分析                                       │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 六-B、第三方撤销授权后本地 Token 清理链路
+
+### 6B.1 OIDC Back-Channel Logout 的概念
+
+OIDC 规范定义了 **Back-Channel Logout** 机制：当用户在 OIDC Provider 端注销或管理员撤销授权时，Provider 会主动向应用发送 logout 请求，应用据此清理本地会话。
+
+### 6B.2 当前代码中的撤销链路现状
+
+经过完整搜索（`oauth`、`revoke`、`backchannel`、`end_session`、`introspect` 等关键词），Photoview **没有任何第三方撤销授权的处理逻辑**：
+
+| 缺失能力 | OIDC 规范对应 | 当前代码 |
+|---------|-------------|---------|
+| Back-Channel Logout 端点 | `backchannel_logout_uri` | ❌ 无 |
+| Front-Channel Logout 支持 | `post_logout_redirect_uri` | ❌ 无 |
+| Token Introspection | `GET /introspect` | ❌ 无 |
+| Session 管理 | OIDC Session / `sid` claim | ❌ 无 |
+| OIDC Provider → Photoview 的回调 | HTTP 端点 | ❌ 无 |
+
+### 6B.3 反向代理模式下的撤销链路分析
+
+在反向代理 OIDC 模式下，撤销授权的清理链路完全依赖反向代理：
+
+```
+第三方撤销授权的清理链路
+
+场景 A：OIDC Provider 撤销用户会话（Back-Channel Logout）
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  1. OIDC Provider 发送 Back-Channel Logout 请求                 │
+│     POST https://photoview.example.com/backchannel-logout       │
+│     Body: { "sub": "alice", "sid": "xxx" }                     │
+│                                                                 │
+│  2. Photoview 当前行为:                                         │
+│     ❌ 没有此端点 → 404                                        │
+│     ❌ 无法接收撤销通知                                         │
+│     ❌ 该用户的所有 AccessToken 继续有效直到 14 天过期          │
+│                                                                 │
+│  3. 反向代理行为:                                               │
+│     如果 OIDC Provider → 反向代理有集成:                        │
+│     ✅ 反向代理清除自己的 Session Cookie                        │
+│     ✅ 用户下次访问时反向代理重新要求 OIDC 认证                 │
+│     ❌ 但 Photoview 旧 AccessToken 仍然有效（如果被盗用）       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+场景 B：用户在 OIDC Provider 端主动注销（Front-Channel Logout）
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  1. OIDC Provider 在浏览器中加载 iframe:                        │
+│     https://photoview.example.com/frontchannel-logout            │
+│                                                                 │
+│  2. Photoview 当前行为:                                         │
+│     ❌ 没有此端点 → 404                                        │
+│     ❌ 不会清除 auth-token Cookie                               │
+│     ❌ 用户仍然可以访问 Photoview API（Cookie 仍有效）          │
+│                                                                 │
+│  3. 反向代理行为:                                               │
+│     ✅ 反向代理可能清除自己的 Cookie                            │
+│     ✅ 用户下次 API 请求时反向代理阻断                          │
+│     ❌ 但如果请求绕过反向代理，旧 token 仍可用                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+场景 C：管理员在 OIDC Provider 中禁用/删除用户
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  1. OIDC Provider 触发 Back-Channel Logout                      │
+│     → 同场景 A，Photoview 无法处理                              │
+│                                                                 │
+│  2. 反向代理不再为该用户签发认证 Header                         │
+│     → 用户无法发起新请求                                       │
+│     → 但已持有的 AccessToken 继续有效最长 14 天                 │
+│                                                                 │
+│  3. Photoview 端:                                              │
+│     ❌ 不会主动删除该用户的 access_tokens 记录                  │
+│     ❌ 不会断开该用户的 WebSocket 连接                          │
+│     ❌ 唯一触发点: 用户被删除时 OnDelete:CASCADE                │
+│        但 OIDC 禁用 ≠ Photoview 删除用户                      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6B.4 撤销授权清理的完整缺口
+
+```
+撤销授权清理的 4 步缺口
+
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 1: 接收撤销通知                                            │
+│ ❌ 无 Back-Channel Logout 端点                                  │
+│ ❌ 无 Front-Channel Logout 端点                                 │
+│ ❌ 无 Webhook 回调                                              │
+│ → Photoview 无法得知用户已被第三方撤销                          │
+├─────────────────────────────────────────────────────────────────┤
+│ Step 2: 解析撤销内容                                            │
+│ ❌ 无 OIDC sub/sid 到 User 的映射表                             │
+│ ❌ 无法将 OIDC 撤销通知关联到本地用户                          │
+│ → 即使收到通知，也不知道该清理哪个用户                          │
+├─────────────────────────────────────────────────────────────────┤
+│ Step 3: 清理本地 Token                                          │
+│ ❌ 无 DELETE FROM access_tokens WHERE user_id = ?               │
+│ ❌ 无断开 WebSocket 连接的机制                                  │
+│ ❌ 无清除 auth-token Cookie 的 Set-Cookie 响应                  │
+│ → 旧会话持续有效                                                │
+├─────────────────────────────────────────────────────────────────┤
+│ Step 4: 确认清理完成                                            │
+│ ❌ 无向 OIDC Provider 回复确认的机制                            │
+│ → OIDC Provider 无法知道清理是否成功                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6B.5 建议的撤销授权清理改造
+
+```
+改造方案：增加 Back-Channel Logout 端点 + OIDC Identity 映射
+
+前提：需要 6.5.5 节的 oauth_identities 表（provider + subject → user_id 映射）
+
+1. 新增 HTTP 端点：POST /api/backchannel-logout
+   - 接收 OIDC Provider 的 logout_token (JWT)
+   - 验证 JWT 签名和 claims
+   - 提取 sub 和 sid
+   - 查询 oauth_identities 找到本地 user_id
+   - DELETE FROM access_tokens WHERE user_id = ?
+   - 断开该用户的所有 WebSocket notification listeners
+   - 返回 200 OK
+
+2. 新增 HTTP 端点：GET /api/frontchannel-logout
+   - 清除 auth-token Cookie
+   - 重定向到首页
+
+3. 可选：定期 Token Introspection
+   - 后台 goroutine 每小时运行一次
+   - 对所有 expire > now 的 AccessToken
+   - 向反向代理/OIDC Provider 验证对应用户是否仍有效
+   - 无效则 DELETE access_tokens 并断开 WebSocket
+```
+
 ---
 
 ## 七、完整认证流程对比
@@ -1305,12 +1723,14 @@ CSRF 防护三层协同
 | 更新用户/密码 Resolver | `api/graphql/resolvers/user.go:110-145` |
 | Share Token Resolver | `api/graphql/resolvers/share_token.go` |
 | Share Token Actions | `api/graphql/models/actions/share_token_actions.go` |
-| 用户操作 Actions | `api/graphql/models/actions/user_actions.go` |
+| 用户操作 Actions（含 DeleteUser） | `api/graphql/models/actions/user_actions.go` |
 | 通知订阅 Resolver | `api/graphql/resolvers/notification.go` |
 | 通知广播中心 | `api/graphql/notification/notification.go` |
 | GraphQL 端点配置 | `api/graphql/endpoint/graphql_endpoint.go` |
 | WebSocket 升级器与 Origin 校验 | `api/server/websocket.go` |
 | CORS 中间件 | `api/server/cors_middleware.go` |
+| Throttle 工具（仅用于扫描器） | `api/utils/throttle.go` |
+| 服务器入口（中间件注册链） | `api/server.go` |
 | 媒体/相册 HTTP 鉴权 | `api/routes/authenticate_routes.go` |
 | 照片路由 | `api/routes/photos.go` |
 | 下载路由 | `api/routes/downloads.go` |
@@ -1327,7 +1747,7 @@ CSRF 防护三层协同
 | GraphQL Schema（Share） | `api/graphql/resolvers/share_token.graphql` |
 | GraphQL Schema（通知） | `api/graphql/resolvers/notification.graphql` |
 | GraphQL 认证指令 | `api/graphql/directive.go` |
-| 服务器入口（中间件注册） | `api/server.go` |
+| SiteInfo 模型 | `api/graphql/models/site_info.go` |
 | 环境变量 | `api/utils/environment_variables.go` |
 | Token 生成工具函数 | `api/utils/utils.go` |
 
@@ -1347,6 +1767,29 @@ Photoview 的代码架构为 OIDC 集成提供了良好的基础，但在 Token 
 7. ✅ **通知订阅体系完整**：WebSocket 订阅用于扫描进度等实时通知
 
 ### 本次补充的核心发现
+
+#### OIDC 回调与本地账号合并
+- ❌ **User.Username 有 unique 约束**，OIDC 用户名与本地用户名冲突时无法自动合并
+- ❌ **没有 `oauth_identities` 映射表**，无法将 OIDC sub claim 关联到本地 User
+- ❌ **没有合并逻辑**：当前唯一方案是管理员手动 `UPDATE users SET password = NULL`
+- ⚠️ **场景 B（用户名冲突）**：OIDC 中间件 `Password != nil` 检查会静默跳过，用户无法理解原因
+- ⚠️ **场景 C（先本地后 OIDC）**：清空密码后用户失去本地登录能力，不支持双认证方式
+- ✅ **建议改造**：新增 `oauth_identities` 表（provider + subject → user_id），中间件先查映射再查用户
+
+#### 登录失败风控与防爆破
+- ❌ **AuthorizeUser 无任何失败计数**：直接返回错误，无延迟、无锁定
+- ❌ **server.go 中间件链无 rate limiter**：仅 dataloader + auth + logging + CORS
+- ❌ **唯一的 Throttle 只用于扫描器通知**（`api/utils/throttle.go`），与登录无关
+- ❌ **暴力破解 PoC**：bcrypt cost=12 约 100ms/次，每秒可尝试 ~10 次，6 分钟覆盖常见弱密码
+- ✅ **建议三层改造**：Per-IP 速率限制 → 登录失败计数与锁定 → 审计日志
+
+#### 第三方撤销授权后本地 Token 清理
+- ❌ **没有 Back-Channel Logout 端点**：OIDC Provider 撤销通知无法送达
+- ❌ **没有 Front-Channel Logout 端点**：浏览器端注销无法清除 Cookie
+- ❌ **没有 Token Introspection**：无法主动验证 token 是否仍被 OIDC Provider 认可
+- ❌ **没有 OIDC sub/sid → User 映射**：即使收到通知也无法定位本地用户
+- ❌ **撤销后 4 步全部缺失**：接收通知 → 解析内容 → 清理 Token → 确认完成
+- ✅ **建议改造**：新增 backchannel-logout / frontchannel-logout 端点 + 定期 Introspection
 
 #### WebSocket 订阅 Token 失效
 - ❌ **InitFunc 只在连接建立时校验一次 token**，之后永不重新校验
@@ -1373,12 +1816,15 @@ Photoview 的代码架构为 OIDC 集成提供了良好的基础，但在 Token 
 ### 需要补齐的能力
 1. ⚠️ **缺少 OIDC 中间件**：需要自行实现反向代理 Header 的解析和自动登录逻辑
 2. ⚠️ **缺少 OIDC 用户管理 UI**：当前只能通过 GraphQL API 创建无密码用户
-3. ❌ **没有 Token 续期机制**：14 天后强制重新登录，无 refresh token，无滑动窗口
-4. ❌ **没有会话管理功能**：无法查看、吊销特定设备的登录会话
-5. ❌ **没有过期 Token 清理任务**：AccessToken 和 ShareToken 过期后永远留在数据库
-6. ❌ **Logout 只清前端 Cookie**：不影响服务端和其他设备的会话
-7. ❌ **修改密码不失效旧 Token**：安全漏洞，需在 UpdateUser 中追加 DELETE access_tokens
-8. ❌ **WebSocket 无 token 周期校验**：需在心跳或 context 中绑定过期时间
-9. ❌ **OIDC Logout 未联动**：清除本地 Cookie 后需同步跳转到 OIDC Provider 登出
+3. ❌ **没有 OIDC 账号合并机制**：Username unique 约束导致 OIDC 用户名与本地用户名冲突时无法自动合并，需新增 `oauth_identities` 映射表
+4. ❌ **没有登录失败风控**：无速率限制、无失败计数、无账号锁定、无验证码，bcrypt cost=12 是唯一的自然延迟
+5. ❌ **没有第三方撤销授权清理**：无 Back-Channel/Front-Channel Logout 端点、无 Token Introspection、无 OIDC sub→User 映射
+6. ❌ **没有 Token 续期机制**：14 天后强制重新登录，无 refresh token，无滑动窗口
+7. ❌ **没有会话管理功能**：无法查看、吊销特定设备的登录会话
+8. ❌ **没有过期 Token 清理任务**：AccessToken 和 ShareToken 过期后永远留在数据库
+9. ❌ **Logout 只清前端 Cookie**：不影响服务端和其他设备的会话
+10. ❌ **修改密码不失效旧 Token**：安全漏洞，需在 UpdateUser 中追加 DELETE access_tokens
+11. ❌ **WebSocket 无 token 周期校验**：需在心跳或 context 中绑定过期时间
+12. ❌ **OIDC Logout 未联动**：清除本地 Cookie 后需同步跳转到 OIDC Provider 登出
 
 OIDC 与本地账号鉴权是**并行关系**，通过 `Password` 字段是否为 `nil` 来区分。Share 链接是完全独立的第三条鉴权路径。三条路径最终都依赖相同的媒体访问控制层（`authenticateMedia`/`authenticateAlbum`），但在入口认证和会话保持上各自独立。
