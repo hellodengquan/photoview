@@ -646,26 +646,375 @@ const getProtectedUrl = (url) => {
 
 ---
 
-## 十、订阅通知 (WebSocket) 与缓存
+## 十、Subscription 推送与 Apollo Store 的 Normalize 关系
 
-文件：`ui/src/components/messages/SubscriptionsHook.ts`
+### 10.1 Subscription 数据流全链路
+
+文件：`ui/src/components/messages/SubscriptionsHook.ts`、`api/graphql/resolvers/notification.go`
 
 ```
-WebSocketLink (全局单例)
-    │
-    ▼
-NOTIFICATION_SUBSCRIPTION 监听
-    │
-    ├─ 扫描进度通知 → 更新 Messages 组件 state (与 Apollo 缓存无关)
-    ├─ 扫描完成 Close 通知 → 移除消息
-    └─ 通知类型不直接修改 Apollo 缓存（由用户手动刷新或下次进入页面触发）
+后端扫描器 (scanner_tasks/notification_task.go)
+        │
+        ▼ BroadcastNotification(&models.Notification{...})
+        │
+服务端 Subscription Resolver (notification.go:18-34)
+        │ 从 user context 鉴权 → 注册 listener → 返回 <-chan *Notification
+        │
+WebSocket 推送
+        │
+        ▼
+前端 wsLink (apolloClient.ts:38-53) 接收 WebSocket 帧
+        │
+        ▼ useSubscription<notificationSubscription>(NOTIFICATION_SUBSCRIPTION)
+        │
+        ▼ data 对象：{ notification: { key, type, header, content, progress, ... } }
+        │
+        ▼ useEffect([data]) → setMessages(...) → Messages 组件 React state
 ```
 
-**注意**：当前实现中，后端扫描完成后**不会主动刷新 Apollo 缓存中的媒体/相册列表**。用户需要手动刷新页面或重新进入路由才能看到新扫描的照片。
+### 10.2 关键问题：Subscription 数据是否 Normalize 进 Apollo Store？
+
+**答案：写入了 store，但没有产生有意义的标准化效果。**
+
+分析 `NOTIFICATION_SUBSCRIPTION` 的 GraphQL 定义和后端模型：
+
+```graphql
+subscription notificationSubscription {
+  notification {
+    key
+    type
+    header
+    content
+    progress
+    positive
+    negative
+    timeout
+  }
+}
+```
+
+后端 Go 结构体 (`api/graphql/models/generated.go:37-50`):
+
+```go
+type Notification struct {
+    Key      string           `json:"key"`
+    Type     NotificationType `json:"type"`
+    Header   string           `json:"header"`
+    Content  string           `json:"content"`
+    Progress *float64         `json:"progress,omitempty"`
+    Positive bool             `json:"positive"`
+    Negative bool             `json:"negative"`
+    Timeout  *int             `json:"timeout,omitempty"`
+}
+```
+
+Apollo Client 处理 subscription 响应时，会按 `__typename` 标准化写入 InMemoryCache。具体流程：
+
+```
+useSubscription 收到 data
+        │
+        ▼
+Apollo 自动将 data.notification 按 __typename:"Notification" + key 标识写入缓存
+        │
+        ├─ Apollo 内部会为 Notification 类型生成缓存实体
+        │  (因为没有自定义 keyFields，默认使用 id 字段，但 Notification 没有 id)
+        │
+        └─ 实际效果：Notification 对象没有 id 字段，
+           Apollo 无法建立稳定的缓存标识 → 每次推送都视为新对象
+```
+
+**为什么没有产生有意义的标准化？**
+
+1. **`Notification` 类型未在 `typePolicies` 中定义 `keyFields`**：`apolloClient.ts:161-188` 的 typePolicies 只配置了 `SiteInfo`、`MediaURL`、`Album`、`FaceGroup`、`Query`，没有 `Notification`。
+
+2. **`Notification` 没有 `id` 字段**：Apollo 默认以 `id` 字段作为缓存键。Notification 只有 `key` 字段（语义上是通知的业务标识，但 Apollo 不认识它）。
+
+3. **Subscription 根字段是 `Query.subscription` 下的叶子节点**：`notification` 是 `Subscription` 类型的字段，不在 `Query` 的 typePolicies 中，不会触发 `paginateCache` 等合并策略。
+
+4. **SubscriptionsHook 不依赖 Apollo 缓存读取**：`useEffect([data])` 直接消费 `data.notification`，转为 React `useState` 的 `messages` 数组——通知消息完全存储在组件 state 中。
+
+### 10.3 完整数据存储路径图
+
+```
+Subscription 推送数据
+        │
+        ├─→ Apollo InMemoryCache（写入但无人读取）
+        │    └─ Notification 对象因缺 keyFields 无法被有效标识和复用
+        │
+        └─→ Messages 组件 useState（实际消费路径）
+              └─ messages: Message[] 数组
+                    ├─ 新通知 → push
+                    ├─ 同 key 通知 → replace (findIndex 匹配)
+                    ├─ Close 类型 → filter 移除
+                    └─ timeout 到期 → filter 移除
+```
+
+### 10.4 后端扫描完成后的缓存空洞
+
+后端通过 `BroadcastNotification` 发出的通知类型：
+
+| 时机 | type | key | 语义 |
+|------|------|-----|------|
+| 发现新媒体 | `Message` | `albumKey` (随机 token) | "Found new media in album" |
+| 媒体处理进度 | `Progress` | `albumKey` | 进度百分比 |
+| 专辑处理完成 | `Message` | `albumKey` | "Done processing media" + timeout |
+| 扫描器整体完成 | `Message` | `globalScannerProgress` | "Scanner complete" |
+| 扫描器排队中 | `Message` | `globalScannerProgress` | "X jobs in progress" |
+
+**核心问题**：这些通知**全部只更新 Messages 组件的 React state**，不触碰 Apollo 缓存中的 `Album`、`Media`、`myTimeline` 等实体。即使扫描器已经入库了新的照片，用户当前的 Timeline/Album 页面数据仍是旧的缓存——必须手动导航离开再回来（触发 `useQuery` 重新执行）或 `resetStore` 才能看到新数据。
 
 ---
 
-## 十一、路由切换时的全局副作用
+## 十一、Mutation 乐观更新的 Rollback 链路
+
+### 11.1 唯一使用 optimisticResponse 的 Mutation
+
+文件：`ui/src/components/photoGallery/photoGalleryMutations.ts:23-43`
+
+在整个项目中，**只有 `toggleFavoriteAction`（收藏/取消收藏）使用了 `optimisticResponse`**。其余所有 `useMutation` 调用（Sharing、AlbumCovers、UserRow、PeoplePage 等）均未使用乐观更新。
+
+```typescript
+export const toggleFavoriteAction = ({ media, markFavorite }) => {
+  return markFavorite({
+    variables: { mediaId: media.id, favorite: !media.favorite },
+    optimisticResponse: {
+      favoriteMedia: {
+        id: media.id,
+        favorite: !media.favorite,
+        __typename: 'Media',
+      },
+    },
+  })
+}
+```
+
+### 11.2 Apollo 乐观更新的内部写入机制
+
+当 `markFavorite` 被调用时，Apollo Client 执行以下步骤：
+
+```
+1. 立即写入 optimisticResponse 到 InMemoryCache
+   │
+   ├─ Apollo 为此 mutation 创建一个 "optimistic layer"
+   │  (一个临时的缓存叠加层，独立于真实数据层)
+   │
+   ├─ 写入内容: Media:id=42 → { favorite: true }
+   │
+   └─ 所有正在观察该 Media 对象的 useQuery 组件收到更新通知
+      → MediaGallery、PresentView、TimelineGroupAlbum 中的星标立即切换
+
+2. 同时发出真实的 HTTP 请求到服务器
+
+3. 服务器响应返回后：
+   │
+   ├─ 成功 (data.favoriteMedia.favorite == true)
+   │    → Apollo 将真实数据写入主缓存层
+   │    → 移除 optimistic layer
+   │    → 重新通知观察者（但值通常与乐观值一致，UI 无闪烁）
+   │
+   └─ 失败 (GraphQL error 或 network error)
+        → Apollo 丢弃 optimistic layer（不将其合并到主缓存）
+        → 缓存自动恢复到 mutation 前的状态
+        → Media:id=42 → { favorite: false } （原始值）
+        → 所有观察该 Media 的组件自动回滚
+```
+
+### 11.3 Rollback 的责任归属
+
+**谁负责 rollback？——Apollo Client 自动完成，无需业务代码介入。**
+
+Apollo 的乐观更新基于**分层缓存**架构：
+
+```
+┌──────────────────────────────┐
+│ Optimistic Layer (临时)       │  ← mutation 发出时创建
+│ Media:42 → favorite: true   │
+├──────────────────────────────┤
+│ Main Cache Layer (持久)       │  ← 真实数据
+│ Media:42 → favorite: false  │
+└──────────────────────────────┘
+
+读取时：optimistic layer 优先 → 返回 favorite: true
+失败时：丢弃 optimistic layer → 只剩 main cache → 返回 favorite: false
+成功时：合并真实数据到 main cache → 丢弃 optimistic layer → 返回 favorite: true
+```
+
+**关键代码验证**：`toggleFavoriteAction` 没有提供 `onError` 回调，也没有任何手动缓存修复逻辑。这证实了 rollback 完全依赖 Apollo 内部机制。
+
+### 11.4 失败场景下的完整影响链
+
+```
+用户点击收藏星标
+        │
+        ▼
+toggleFavoriteAction → markFavorite({ optimisticResponse })
+        │
+        ├─ UI 立即显示已收藏（星标高亮）
+        │
+        ▼
+HTTP 请求发出 → 服务器返回错误
+        │
+        ├─ linkError (apolloClient.ts:68-136) 拦截错误
+        │     ├─ GraphQL error → 显示 MessageState 错误通知
+        │     └─ Network error → clearTokenCookie + 显示错误通知
+        │
+        ├─ Apollo 自动丢弃 optimistic layer
+        │
+        └─ UI 自动回滚到未收藏状态（星标取消高亮）
+```
+
+### 11.5 其他 Mutation 的错误处理模式
+
+项目中不使用乐观更新的 Mutation 采用了两种错误处理策略：
+
+**策略 A：refetchQueries（让服务端数据覆盖本地）**
+
+```typescript
+// Sharing.tsx:176-188
+const [setPassword] = useMutation(PROTECT_SHARE_MUTATION, {
+  refetchQueries: [{ query, variables: { id } }],
+  onCompleted: data => { hidePassword(data.protectShareToken.hasPassword) },
+})
+```
+
+Mutation 成功后 refetch 相关查询，失败时什么都不做（本地没有提前修改，无需回滚）。
+
+**策略 B：onCompleted + onError 回调**
+
+```typescript
+// AddUserRow.tsx:54-64
+const [addRootPath] = useMutation(USER_ADD_ROOT_PATH_MUTATION, {
+  onCompleted: () => { finished() },
+  onError: () => { finished() },  // 失败也调用 finished() 关闭表单
+})
+```
+
+无论成功失败都执行清理逻辑，因为没有乐观更新，缓存不受影响。
+
+---
+
+## 十二、退出登录 / 切换用户时 Sidebar 的清理触发点
+
+### 12.1 Sidebar 的生命周期与清理时机
+
+Sidebar 的状态存储在 `SidebarProvider` 的 `useState` 中：
+
+```typescript
+// Sidebar.tsx:35-68
+export const SidebarProvider = ({ children }) => {
+  const [state, setState] = useState<{
+    content: React.ReactNode | null
+    pinned: boolean
+  }>({
+    content: null,
+    pinned: false,
+  })
+  // ...
+}
+```
+
+Sidebar 不随路由变化自动重置，它的清理完全依赖**显式调用 `updateSidebar(null)`**。
+
+### 12.2 全部 updateSidebar 调用点盘点
+
+| 位置 | 触发场景 | 传入值 |
+|------|---------|-------|
+| `MediaGallery.tsx:85` | 用户点击缩略图 | `<MediaSidebar media={...} />` |
+| `TimelineGroupAlbum.tsx:54` | 用户点击 Timeline 缩略图 | `<MediaSidebar media={...} />` |
+| `MediaSharePage.tsx:34` | Share 页面展示媒体 | `<MediaSidebar media={...} hidePreview />` |
+| `AlbumTitle.tsx:112` | 用户点击齿轮按钮 | `<AlbumSidebar albumId={...} />` |
+| `SidebarHeader.tsx:22` | 用户点击关闭按钮 | `null` |
+| `MediaSidebar.tsx:195` | album path 链接点击时 | `null` |
+
+### 12.3 登出时 Sidebar 的清理路径
+
+```
+用户访问 /logout
+        │
+        ▼
+LogoutPage (Routes.tsx:151-155)
+        │ clearTokenCookie()
+        │ navigate('/')
+        │
+        ▼
+IndexPage 检测无 token → Navigate /login
+        │
+        ▼
+LoginPage 渲染
+```
+
+**关键发现：登出流程中没有任何代码调用 `updateSidebar(null)`。**
+
+这意味着：
+1. 用户在 Album 页面点击齿轮按钮 → Sidebar 展示 AlbumSidebar
+2. 用户导航到 `/logout` → `clearTokenCookie()` + `navigate('/')`
+3. 路由跳转到 `/login` → LoginPage 渲染
+4. **Sidebar 仍然显示旧的 AlbumSidebar 内容**（包含旧用户的相册信息）
+5. Sidebar 组件内部的 `useQuery` 因 `authToken()` 返回 null，部分组件（如 `AlbumSidebar`）不会发起新请求，但**旧内容仍在 DOM 中**
+
+### 12.4 为什么视觉上不会出问题？
+
+Sidebar 的可见性由 CSS `translate-x-full` / `translate-x-0` 控制：
+
+```typescript
+// Sidebar.tsx:93
+className={`... ${content == null && !pinned ? 'translate-x-full' : 'translate-x-0'} ...`}
+```
+
+当 `content != null` 且 `pinned == false` 时，Sidebar 在移动端全屏滑出、桌面端以阴影浮层显示。但在 LoginPage 上：
+- 没有 `Header` 组件中的 `SearchBar` 可能触发 sidebar
+- 没有 `MainMenu` 渲染（因为 `Authorized` 检查 token）
+- 用户不会主动打开 sidebar
+
+所以虽然 **state 未清理**，但用户不太可能注意到残留数据。
+
+### 12.5 登录（用户切换）时的清理路径
+
+```
+LoginPage authorize mutation 成功
+        │
+        ▼
+onCompleted: data => { if (success && token) login(token) }
+        │
+        ▼
+login(token) (loginUtilities.tsx:13-16)
+        │ saveTokenCookie(token)
+        │ window.location.href = '/'  ← 硬刷新！
+        │
+        ▼
+浏览器整页重载
+        │
+        └─ SidebarProvider 重新创建 → useState 初始值 { content: null, pinned: false }
+```
+
+**登录使用硬刷新，Sidebar state 自然清空**。这是唯一可靠的清理路径。
+
+### 12.6 Sidebar 清理缺失的完整影响矩阵
+
+| 场景 | Sidebar 是否清理 | 清理方式 | 风险 |
+|------|-----------------|---------|------|
+| 登录新用户 | ✅ 清理 | `window.location.href` 硬刷新，SidebarProvider 重建 | 无 |
+| 登出 | ❌ 不清理 | 仅 `clearTokenCookie` + `navigate('/')` | 旧用户数据残留在 sidebar state |
+| Session 过期 (linkError) | ❌ 不清理 | `clearTokenCookie()` 但无 `updateSidebar(null)` | Sidebar 内容可能引用已无权限的数据 |
+| Token 变为无效 | ❌ 不清理 | 后续 useQuery 返回错误，但 sidebar 不自动关闭 | Sidebar 中显示错误信息 |
+
+### 12.7 对比：App.tsx 路由变化时的副作用
+
+文件：`ui/src/App.tsx:15-19`
+
+```typescript
+useEffect(() => {
+  window.scrollTo(0, 0)
+  if (document.activeElement != document.body)
+    (document.activeElement as HTMLInputElement).blur()
+}, [pathname])
+```
+
+App 组件监听 `pathname` 变化做了滚动重置和焦点释放，但**没有重置 Sidebar**。如果在这里加入 `updateSidebar(null)` 的调用，可以彻底解决残留问题，但需要将 `updateSidebar` 从 Context 提升到 App 层或通过全局事件总线调用。
+
+---
+
+## 十三、路由切换时的全局副作用
 
 文件：`ui/src/App.tsx:15-19`
 
@@ -685,7 +1034,7 @@ useEffect(() => {
 
 ---
 
-## 十二、SearchBar 的延迟查询
+## 十四、SearchBar 的延迟查询
 
 文件：`ui/src/components/header/Searchbar.tsx`
 
@@ -708,7 +1057,7 @@ useEffect(() => {
 
 ---
 
-## 十三、关键代码位置速查
+## 十五、关键代码位置速查
 
 | 功能模块 | 文件路径 | 关键行 |
 |---------|---------|-------|
@@ -732,18 +1081,28 @@ useEffect(() => {
 | ProtectedMedia URL 重写 | `ui/src/components/photoGallery/ProtectedMedia.tsx` | 13-25 |
 | 路由切换滚动重置 | `ui/src/App.tsx` | 15-19 |
 | SearchBar 延迟查询 | `ui/src/components/header/Searchbar.tsx` | 46-186 |
+| Subscription 数据消费 | `ui/src/components/messages/SubscriptionsHook.ts` | 43-122 |
+| 后端通知广播 | `api/scanner/scanner_tasks/notification_task.go` | 30-78 |
+| 后端 Subscription resolver | `api/graphql/resolvers/notification.go` | 18-34 |
+| Notification 后端模型 | `api/graphql/models/generated.go` | 37-50 |
+| Notification GraphQL schema | `api/graphql/resolvers/notification.graphql` | 全文 |
+| 登出路由 (无 Sidebar 清理) | `ui/src/components/routes/Routes.tsx` | 151-155 |
+| Mutation 错误处理 (linkError) | `ui/src/apolloClient.ts` | 68-136 |
 
 ---
 
-## 十四、潜在问题与设计权衡
+## 十六、潜在问题与设计权衡
 
 | 现象 | 原因 | 影响 |
 |------|------|------|
 | 登出不清缓存 | `navigate()` 而非硬刷新，`client` 不重建 | 内存中残留旧数据，但 Cookie 清除后请求 401 会触发清 Cookie |
+| 登出不清 Sidebar | LogoutPage 只调 `clearTokenCookie` + `navigate` | 旧用户 Sidebar 内容残留，含已无权限的数据 |
+| Session 过期不清 Sidebar | linkError 只调 `clearTokenCookie` | Sidebar 仍在展示，内部 useQuery 报错 |
 | Timeline 切年份清全部缓存 | `client.resetStore()` 是全局操作 | 其他页面已加载数据也被清空，需重新请求 |
-| 扫描后列表不更新 | Subscription 不写缓存 | 用户需手动刷新页面 |
+| 扫描后列表不更新 | Subscription 不写缓存，Notification 无 keyFields | 用户需手动刷新页面；通知仅进 Messages state，不 normalize 进 store |
 | Album 收藏切换手动标记 | 模块级变量 `refetchNeededXxx` | 多个 AlbumPage 实例间标记冲突（但实际同一时间只打开一个） |
 | Present Mode 不写入 URL | 仅使用 history state | 刷新页面后 Present Mode 丢失，无法分享链接 |
 | Sidebar 不随路由自动关闭 | SidebarContext 是全局状态 | 必须在每个跳转入口手动 `updateSidebar(null)`，遗漏会导致旧内容残留 |
 | SearchBar 结果无清除缓存策略 | 搜索结果写入 Apollo 标准化缓存 | 低频搜索的 Album/Media 条目永久留在缓存中，可能占用内存 |
 | Share 页面与主应用共享缓存 | 共用同一个 Apollo Client | Share 页面查询的 Album/Media 对象会与主应用查询合并，可能产生字段覆盖（如 Share 查询含 downloads 字段而主查询不含） |
+| Notification 写入 store 但无效 | 无 `keyFields` 配置且无 `id` 字段 | 每次 subscription 推送都创建无法复用的缓存实体，造成内存浪费 |
