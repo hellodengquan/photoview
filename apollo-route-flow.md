@@ -1178,9 +1178,447 @@ Apollo Client 3.4+ 引入的缓存管理工具（但本项目未显式使用）�
 
 ---
 
-## 十四、Mutation 乐观更新的 Rollback 链路
+## 十四、离线断网与 localStorage Persist 协同恢复路径
 
-### 14.1 唯一使用 optimisticResponse 的 Mutation
+### 14.1 缓存持久化技术栈盘点
+
+项目中涉及持久化的三层技术：
+
+| 层级 | 技术 | 用途 | 与 Apollo 的关系 |
+|------|------|------|-----------------|
+| 静态资源层 | Service Worker (Workbox) | 缓存 HTML/JS/CSS/PNG | 独立运行，不感知 Apollo |
+| 认证层 | js-cookie (Cookie) | 存储 auth-token (14 天过期) | Apollo 的 HttpLink 自动携带 |
+| 主题层 | localStorage | 存储 theme 偏好 | 与 Apollo 完全无关 |
+
+**关键事实：项目没有使用 `apollo3-cache-persist` 或任何其他 Apollo 缓存持久化库。**
+
+验证：
+- `package.json` dependencies 中没有 `apollo3-cache-persist`
+- `package.json` 中没有任何 `redux-persist`、`localForage` 等持久化库
+- 代码中搜索 `persist` 只有 `Searchbar.tsx:70` 的 React 合成事件 `e.persist()`（与持久化无关）和 service worker 注释
+
+### 14.2 Apollo InMemoryCache 的纯内存特性
+
+文件：`ui/src/apolloClient.ts:161-194`
+
+```typescript
+const memoryCache = new InMemoryCache({
+  typePolicies: { ... },          // 只有类型策略，没有持久化配置
+})
+
+const client = new ApolloClient({
+  link: ApolloLink.from([linkError, link]),
+  cache: memoryCache,              // 纯内存缓存实例
+})
+```
+
+Apollo Client 3.x 的 `InMemoryCache` 默认是**纯内存存储**：
+- 所有缓存数据保存在 JavaScript 堆中
+- 浏览器刷新 / 标签页关闭 → 内存释放 → 缓存完全丢失
+- 同一浏览器的不同标签页 → 各自独立的 Apollo Client 实例 → 缓存不共享
+
+### 14.3 Service Worker 缓存的边界
+
+文件：`ui/src/service-worker.ts`
+
+Service Worker 使用 Workbox，缓存策略分为两部分：
+
+**Precache（构建时注入）**：
+```typescript
+precacheAndRoute(self.__WB_MANIFEST)
+```
+自动缓存 Vite 构建产出的所有静态资源（HTML、JS、CSS、字体等）。这些是应用壳资源，与 Apollo 数据缓存完全无关。
+
+**App Shell 路由缓存**：
+```typescript
+registerRoute(
+  ({ request, url }) => {
+    if (request.mode !== 'navigate') return false
+    if (url.pathname.startsWith('/_')) return false
+    if (url.pathname.startsWith('/api/')) return false  // ★ API 请求明确排除
+    // ...
+    return true
+  },
+  createHandlerBoundToURL(import.meta.env.BASE_URL + 'index.html')
+)
+```
+所有非 API 的导航请求返回 `index.html`，实现 SPA 的离线访问壳。但**GraphQL 请求走 `/api/graphql`，被明确排除在 Service Worker 缓存之外**。
+
+**PNG 运行时缓存**：
+```typescript
+registerRoute(
+  ({ url }) =>
+    url.origin === self.location.origin && url.pathname.endsWith('.png'),
+  new StaleWhileRevalidate({
+    cacheName: 'images',
+    plugins: [new ExpirationPlugin({ maxEntries: 50 })],
+  })
+)
+```
+只缓存同源 PNG 图片（如图标），不缓存 `/api/photo/...` 这样的照片 URL。
+
+**结论**：Service Worker 只缓存应用壳和静态资源，GraphQL 数据和用户照片都不在 Service Worker 缓存中。
+
+### 14.4 离线场景下的完整行为链
+
+```
+用户断网 (navigator.onLine = false)
+        │
+        ▼
+用户已登录，在 Timeline 页面滚动浏览
+        │
+        ├─ 已加载的照片（HTML <img> 标签）→ 浏览器 HTTP 缓存可能命中
+        │    └─ Apollo 缓存中已有 Media 元数据 → 正常展示
+        │
+        ├─ 触发 fetchMore 加载下一页 → HttpLink 发起 fetch 请求
+        │     │
+        │     ├─ fetch 失败 → network error
+        │     │
+        │     ├─ linkError (apolloClient.ts:68-136) 拦截错误
+        │     │     ├─ networkError 分支 → clearTokenCookie()
+        │     │     │     │
+        │     │     │     └─ ★ 误判：断网 ≠ 未授权，但代码将所有 network error 都清 Cookie
+        │     │     │
+        │     │     └─ MessageState 添加错误通知
+        │     │
+        │     └─ useQuery 返回 { error: ApolloError, loading: false }
+        │           │
+        │           └─ TimelineGallery.tsx:156-158 → 渲染 <div>{error.message}</div>
+        │
+        ▼
+Cookie 被清空后
+        │
+        └─ 用户下一次路由切换 → AuthorizedRoute 检测不到 token
+              └─ Navigate('/login') → 强制登出
+```
+
+### 14.5 离线恢复（重新联网）路径
+
+```
+用户重新联网
+        │
+        ├─ Service Worker 重新可用 → 静态资源恢复正常
+        │
+        ├─ Apollo 缓存状态：
+        │     ├─ 如果用户没刷新页面 → 缓存仍在内存中，保留断网前的数据
+        │     └─ 如果用户刷新了页面 → Apollo Client 重建，缓存完全丢失
+        │
+        └─ 但 Cookie 可能已被 linkError 清掉（如果断网期间触发过请求失败）
+              └─ 用户会被踢到登录页，需要重新登录
+```
+
+### 14.6 Cookie 与 Apollo 缓存的生命周期对比
+
+| 存储 | 持久化介质 | 过期策略 | 跨标签页共享 | 刷新后保留 |
+|------|-----------|---------|-------------|-----------|
+| auth-token Cookie | HTTP Cookie | 14 天 | ✅ | ✅ |
+| theme localStorage | localStorage | 永久 | ✅ | ✅ |
+| Apollo InMemoryCache | JS 堆内存 | 页面生命周期 | ❌ | ❌ |
+| Service Worker precache | 浏览器 Cache API | Workbox 版本控制 | ✅ | ✅ |
+
+**关键脱节**：用户的登录态（Cookie）可以保留 14 天，但 Apollo 数据缓存一刷新就丢。这意味着用户每天第一次打开应用时，即使 Cookie 还有效，也需要重新拉取所有相册、时间线、人脸等数据。
+
+---
+
+## 十五、ErrorBoundary 与 useQuery 错误传播、组件树回滚
+
+### 15.1 结论先行：项目中没有 ErrorBoundary
+
+搜索整个 `ui/src` 目录，结果如下：
+- `ErrorBoundary`：0 结果
+- `componentDidCatch`：0 结果
+- `getDerivedStateFromError`：0 结果
+- `react-error-boundary`：`package.json` 中无此依赖
+
+整个应用从 `index.tsx` 的 `createRoot` 到各个页面组件，**完全没有任何一层错误边界保护**。
+
+### 15.2 useQuery 的错误不会 throw
+
+Apollo Client 3.x 的 `useQuery` hook 采用**错误返回值模式**，而非抛出异常：
+
+```typescript
+// TimelineGallery.tsx:96-158
+const { data, error, loading, refetch, fetchMore } = useQuery<...>(MY_TIMELINE_QUERY, { ... })
+
+// ...
+
+if (error) {
+  return <div>{error.message}</div>   // 组件自行处理
+}
+```
+
+**错误传播路径**：
+
+```
+GraphQL 请求失败
+        │
+        ▼
+Apollo Link 管道处理
+        │
+        ├─ linkError (onError)
+        │     ├─ 错误日志 (console.log)
+        │     ├─ unauthorized → clearTokenCookie
+        │     ├─ network error → clearTokenCookie
+        │     └─ MessageState 添加通知 → Messages 组件渲染错误浮层
+        │
+        └─ useQuery 返回 { error: ApolloError }
+              │
+              └─ 每个组件自行判断 `if (error) return <div>...</div>`
+```
+
+### 15.3 所有组件级错误处理盘点
+
+项目中共有 **26 处** `if (error)` 处理，模式高度统一：
+
+| 组件 | 文件位置 | 错误展示 |
+|------|---------|---------|
+| TimelineGallery | `components/timelineGallery/TimelineGallery.tsx:156-158` | `<div>{error.message}</div>` |
+| AlbumPage | `Pages/AlbumPage/AlbumPage.tsx:93` | `<div>Error</div>` |
+| AlbumsPage (AlbumBoxes) | `components/albumGallery/AlbumBoxes.tsx:12` | `<div>Error {error.message}</div>` |
+| MediaSidebar | `components/sidebar/MediaSidebar/MediaSidebar.tsx:299` | `<div>{error.message}</div>` |
+| AlbumSidebar | `components/sidebar/AlbumSidebar.tsx:36` | `<div>{error.message}</div>` |
+| SubscriptionsHook | `components/messages/SubscriptionsHook.ts:56-71` | MessageState 添加错误通知 |
+| SharePage (两次) | `Pages/SharePage/SharePage.tsx:111, 169-184` | `<div>{error.message}</div>`，特殊处理 "share not found" |
+| AlbumSharePage | `Pages/SharePage/AlbumSharePage.tsx:131-132` | `<div>{error.message}</div>` |
+| UsersTable | `Pages/SettingsPage/Users/UsersTable.tsx:41-42` | `<div>Users table error: ${error.message}</div>` |
+| UserPreferences | `Pages/SettingsPage/UserPreferences.tsx:119-120` | `<div>{error.message}</div>` |
+| MapPresentMarker | `Pages/PlacesPage/MapPresentMarker.tsx:47` | 内部处理，未展开 |
+| SingleFaceGroup | `Pages/PeoplePage/SingleFaceGroup/SingleFaceGroup.tsx:86-87` | `<div>{error.message}</div>` |
+| PeoplePage | `Pages/PeoplePage/PeoplePage.tsx:275-276` | `<div>{error.message}</div>` |
+
+**共同点**：都是将错误信息渲染为纯文本 `<div>`，不会影响父组件，不会触发组件树回滚。
+
+### 15.4 真正 throw 的错误（无捕获）
+
+项目中共有 **17 处** `throw new Error(...)`，这些错误**没有任何一层 try/catch 或 ErrorBoundary 捕获**：
+
+| 位置 | 触发条件 |
+|------|---------|
+| `apolloClient.ts:155` | `paginateCache` merge 时缺少 `args.paginate` 参数 |
+| `Pages/AlbumPage/AlbumPage.tsx:39` | `useParams()` 返回的 `id` 为 null |
+| `Pages/SharePage/SharePage.tsx:91, 118` | 路由参数 `token` / `subAlbum` 缺失 |
+| `Pages/PeoplePage/PeoplePage.tsx:345` | URL 参数 `person` 缺失 |
+| `Pages/PeoplePage/SingleFaceGroup/*.tsx` | 预期的 data 为 null |
+| `components/sidebar/SidebarDownloadMedia.tsx` | 字节解析错误 / download reader 为 null |
+| `components/sidebar/MediaSidebar/MediaSidebarPeople.tsx:113` | mutation 返回 data 为 null |
+| `components/messages/Messages.tsx:81` | 无效的 NotificationType |
+| `helpers/utils.ts:44` | exhaustive check 失败（discriminated union 穷举检查） |
+
+**这些 throw 的完整影响链**：
+
+```
+组件渲染或 useEffect 中 throw new Error(...)
+        │
+        ▼
+React 18 捕获到未处理的异常
+        │
+        ├─ 开发模式 → React 显示红色错误覆盖层 (Error Overlay)
+        │
+        └─ 生产模式 → React 卸载整个组件树，从根节点开始
+              │
+              └─ 页面白屏（createRoot 渲染的 <Main /> 被完全卸载）
+                    │
+                    └─ 用户只能手动刷新页面恢复
+```
+
+**没有任何组件树回滚**。React 不会回滚到前一个有效状态，只会卸载出错的子树。在没有 ErrorBoundary 的情况下，整个应用崩溃。
+
+### 15.5 useQuery 错误 vs throw 错误的对比
+
+| 维度 | useQuery `{ error }` | `throw new Error()` |
+|------|---------------------|---------------------|
+| 触发方式 | Apollo 返回值 | JS throw 语句 |
+| 捕获方式 | 组件 `if (error)` 判断 | 无（除非有 ErrorBoundary） |
+| 影响范围 | 当前组件返回错误 UI | 整个组件树卸载 |
+| 组件树回滚 | 无（只是分支渲染） | 无（直接卸载） |
+| 用户体验 | 局部错误提示 | 白屏崩溃 |
+| 出现次数 | 26 处 | 17 处 |
+
+### 15.6 linkError 与组件错误处理的分工
+
+```
+GraphQL / 网络错误
+        │
+        ├─ linkError (全局拦截层)
+        │     ├─ 所有错误都经过这里
+        │     ├─ 日志输出 (console.log)
+        │     ├─ unauthorized / network error → clearTokenCookie
+        │     └─ 构造 MessageState 通知 → 全局浮层展示
+        │
+        └─ useQuery / useMutation 返回值
+              └─ 组件自行 if (error) → 局部错误 UI
+```
+
+**双重展示问题**：当一个查询失败时，用户会看到
+1. 全局浮层（MessageState）——右上角的错误通知
+2. 局部错误 UI——页面中间的 `<div>Error: ...</div>`
+
+两条信息可能重复或不一致。
+
+---
+
+## 十六、分页缓存 evict 与内存压力触发路径
+
+### 16.1 `paginateCache` 的数据结构
+
+文件：`ui/src/apolloClient.ts:138-159`
+
+```typescript
+const paginateCache = (keyArgs: string[]) =>
+  ({
+    keyArgs,
+    merge(existing, incoming, { args, fieldName }) {
+      const merged = existing ? existing.slice(0) : []
+      if (args?.paginate) {
+        const { offset = 0 } = args.paginate as { offset: number }
+        for (let i = 0; i < incoming.length; ++i) {
+          merged[offset + i] = incoming[i]
+        }
+      } else {
+        throw new Error(`Paginate argument is missing for query: ${fieldName}`)
+      }
+      return merged
+    },
+  } as PaginateCacheType)
+```
+
+缓存中的分页数据结构：
+
+```
+InMemoryCache
+  └── ROOT_QUERY
+        ├── myTimeline({"onlyFavorites":false})
+        │     └── [
+        │           0: { __ref: "Media:1" },
+        │           1: { __ref: "Media:2" },
+        │           2: { __ref: "Media:3" },
+        │           ...
+        │           199: { __ref: "Media:200" },  ← 第一页
+        │           200: { __ref: "Media:201" },  ← 第二页
+        │           ...                             ← 无限追加
+        │         ]
+        │
+        ├── myTimeline({"onlyFavorites":true})
+        │     └── [...]  （独立的收藏分页数组）
+        │
+        └── Album:42
+              └── media({"onlyFavorites":false,"order":{"mediaOrderBy":"date","orderDirection":"desc"}})
+                    └── [...]  （每个相册 × 每种排序 × 每个收藏筛选 = 独立分页数组）
+```
+
+**关键点**：每个 `keyArgs` 组合对应一个独立的数组，数组通过**索引位置**合并，可以无限增长。
+
+### 16.2 Apollo 3.6 的缓存 evict 能力（项目未使用）
+
+Apollo Client 3.4+ 提供了三个缓存管理 API：
+
+| API | 作用 | 本项目是否调用 |
+|-----|------|---------------|
+| `cache.evict(options)` | 从缓存中移除指定实体或字段 | ❌ 未调用 |
+| `cache.modify(options)` | 直接修改缓存中实体的字段 | ❌ 未调用 |
+| `cache.gc()` | 垃圾回收：移除所有不可达（无引用）的实体 | ❌ 未调用 |
+
+搜索整个项目，`cache.evict` / `cache.modify` / `cache.gc` 的结果均为 0。
+
+### 16.3 项目中唯一的主动清空：resetStore
+
+文件：`ui/src/components/timelineGallery/TimelineGallery.tsx:125-137`
+
+```typescript
+useEffect(() => {
+  ;(async () => {
+    await client.resetStore()   // ★ 全局清空
+    await refetch({ ... })     // 重新拉取当前页面数据
+  })()
+}, [filterDate])
+```
+
+`client.resetStore()` 的行为：
+1. 清空整个 `InMemoryCache`（所有实体、所有分页、所有查询）
+2. 重新执行所有**活跃**查询（当前有订阅者的 useQuery）
+3. 丢弃所有非活跃查询的数据
+
+**这是一个极其粗暴的操作**——用户只是切换了时间线的年份筛选，却把所有相册、人脸、搜索结果等缓存全部清空。
+
+### 16.4 内存压力下的实际行为
+
+Apollo Client 3.6 **没有任何内置的内存压力感知机制**。它不会：
+- 监听浏览器内存事件（`performance.memory` 是非标准 API，Apollo 不使用）
+- 监控缓存实体数量
+- 在达到阈值时自动 evict 旧分页
+- 实现 LRU / LFU 等淘汰策略
+
+**完整行为链**：
+
+```
+用户持续滚动浏览 Timeline
+        │
+        ▼
+fetchMore 持续触发
+        │
+        ▼
+paginateCache merge 在索引位置追加
+        │
+        ├─ Query.myTimeline 数组越来越长（存的是 { __ref } 引用）
+        │
+        ├─ Media 实体越来越多（每个 Media 对象存元数据）
+        │
+        ├─ MediaURL 实体越来越多（每个 Media 有多个尺寸 URL）
+        │
+        ▼
+内存持续增长
+        │
+        ├─ 浏览器 V8 GC 回收不可达对象
+        │     └─ 但 Apollo 的 Map 持有所有缓存引用 → 全部可达 → GC 不回收
+        │
+        └─ 用户触发以下操作时缓存才被清空
+              ├─ 切换 Timeline 年份 → resetStore()
+              ├─ 登录新用户 → 页面硬刷新
+              ├─ 用户手动 F5 刷新
+              └─ 关闭标签页
+```
+
+### 16.5 `existing.slice(0)` 的隐含行为
+
+```typescript
+const merged = existing ? existing.slice(0) : []
+```
+
+`slice(0)` 创建了一个浅拷贝的新数组。这意味着：
+1. 每次 merge 都会分配新数组内存
+2. 旧数组在没有引用后会被 V8 GC 回收
+3. 但数组中的 `{ __ref: 'Media:123' }` 对象仍然指向同一个引用
+4. Media 实体本身不会被回收，因为它们被 Apollo 的 `data` Map 持有
+
+所以分页数组本身的内存占用增长有限（只是引用数组），真正占用内存的是 Media、MediaURL 等标准化实体。
+
+### 16.6 不同分页场景的内存增长对比
+
+| 分页字段 | keyArgs | 可能的数组数量 | 单个数组长度上限 |
+|---------|---------|--------------|---------------|
+| `Query.myTimeline` | `['onlyFavorites']` | 2 个（全部/仅收藏） | 几万（全部照片） |
+| `Album.media` | `['onlyFavorites', 'order']` | N × 排序数 × 2 | 几千（单相册照片数） |
+| `Query.myFaceGroups` | `[]` | 1 个 | 几千（人脸组数） |
+| `FaceGroup.imageFaces` | `[]` | N 个（每人脸组一个） | 几十到几千 |
+
+**最大风险点**：`Query.myTimeline`，如果用户一直滚动到底加载下一页，最终会把所有照片的引用都加载到同一个数组中。
+
+### 16.7 与 Service Worker ExpirationPlugin 的对比
+
+项目中有两处使用了限制策略，但都不在 Apollo 层：
+
+| 缓存层 | 淘汰策略 | 上限 |
+|--------|---------|------|
+| Service Worker PNG 缓存 | Workbox `ExpirationPlugin` | `maxEntries: 50` |
+| Apollo InMemoryCache | ❌ 无任何策略 | ∞ 无限增长 |
+
+Service Worker 知道要限制图片缓存到 50 条，但 Apollo 层对自己的缓存增长完全放任自流。
+
+---
+
+## 十七、Mutation 乐观更新的 Rollback 链路
+
+### 17.1 唯一使用 optimisticResponse 的 Mutation
 
 文件：`ui/src/components/photoGallery/photoGalleryMutations.ts:23-43`
 
@@ -1201,7 +1639,7 @@ export const toggleFavoriteAction = ({ media, markFavorite }) => {
 }
 ```
 
-### 14.2 Apollo 乐观更新的内部写入机制
+### 17.2 Apollo 乐观更新的内部写入机制
 
 当 `markFavorite` 被调用时，Apollo Client 执行以下步骤：
 
@@ -1232,7 +1670,7 @@ export const toggleFavoriteAction = ({ media, markFavorite }) => {
         → 所有观察该 Media 的组件自动回滚
 ```
 
-### 14.3 Rollback 的责任归属
+### 17.3 Rollback 的责任归属
 
 **谁负责 rollback？——Apollo Client 自动完成，无需业务代码介入。**
 
@@ -1254,7 +1692,7 @@ Apollo 的乐观更新基于**分层缓存**架构：
 
 **关键代码验证**：`toggleFavoriteAction` 没有提供 `onError` 回调，也没有任何手动缓存修复逻辑。这证实了 rollback 完全依赖 Apollo 内部机制。
 
-### 14.4 失败场景下的完整影响链
+### 17.4 失败场景下的完整影响链
 
 ```
 用户点击收藏星标
@@ -1276,7 +1714,7 @@ HTTP 请求发出 → 服务器返回错误
         └─ UI 自动回滚到未收藏状态（星标取消高亮）
 ```
 
-### 14.5 其他 Mutation 的错误处理模式
+### 17.5 其他 Mutation 的错误处理模式
 
 项目中不使用乐观更新的 Mutation 采用了两种错误处理策略：
 
@@ -1306,9 +1744,9 @@ const [addRootPath] = useMutation(USER_ADD_ROOT_PATH_MUTATION, {
 
 ---
 
-## 十五、退出登录 / 切换用户时 Sidebar 的清理触发点
+## 十八、退出登录 / 切换用户时 Sidebar 的清理触发点
 
-### 15.1 Sidebar 的生命周期与清理时机
+### 18.1 Sidebar 的生命周期与清理时机
 
 Sidebar 的状态存储在 `SidebarProvider` 的 `useState` 中：
 
@@ -1328,7 +1766,7 @@ export const SidebarProvider = ({ children }) => {
 
 Sidebar 不随路由变化自动重置，它的清理完全依赖**显式调用 `updateSidebar(null)`**。
 
-### 15.2 全部 updateSidebar 调用点盘点
+### 18.2 全部 updateSidebar 调用点盘点
 
 | 位置 | 触发场景 | 传入值 |
 |------|---------|-------|
@@ -1339,7 +1777,7 @@ Sidebar 不随路由变化自动重置，它的清理完全依赖**显式调用 
 | `SidebarHeader.tsx:22` | 用户点击关闭按钮 | `null` |
 | `MediaSidebar.tsx:195` | album path 链接点击时 | `null` |
 
-### 15.3 登出时 Sidebar 的清理路径
+### 18.3 登出时 Sidebar 的清理路径
 
 ```
 用户访问 /logout
@@ -1365,7 +1803,7 @@ LoginPage 渲染
 4. **Sidebar 仍然显示旧的 AlbumSidebar 内容**（包含旧用户的相册信息）
 5. Sidebar 组件内部的 `useQuery` 因 `authToken()` 返回 null，部分组件（如 `AlbumSidebar`）不会发起新请求，但**旧内容仍在 DOM 中**
 
-### 15.4 为什么视觉上不会出问题？
+### 18.4 为什么视觉上不会出问题？
 
 Sidebar 的可见性由 CSS `translate-x-full` / `translate-x-0` 控制：
 
@@ -1381,7 +1819,7 @@ className={`... ${content == null && !pinned ? 'translate-x-full' : 'translate-x
 
 所以虽然 **state 未清理**，但用户不太可能注意到残留数据。
 
-### 15.5 登录（用户切换）时的清理路径
+### 18.5 登录（用户切换）时的清理路径
 
 ```
 LoginPage authorize mutation 成功
@@ -1402,7 +1840,7 @@ login(token) (loginUtilities.tsx:13-16)
 
 **登录使用硬刷新，Sidebar state 自然清空**。这是唯一可靠的清理路径。
 
-### 15.6 Sidebar 清理缺失的完整影响矩阵
+### 18.6 Sidebar 清理缺失的完整影响矩阵
 
 | 场景 | Sidebar 是否清理 | 清理方式 | 风险 |
 |------|-----------------|---------|------|
@@ -1411,7 +1849,7 @@ login(token) (loginUtilities.tsx:13-16)
 | Session 过期 (linkError) | ❌ 不清理 | `clearTokenCookie()` 但无 `updateSidebar(null)` | Sidebar 内容可能引用已无权限的数据 |
 | Token 变为无效 | ❌ 不清理 | 后续 useQuery 返回错误，但 sidebar 不自动关闭 | Sidebar 中显示错误信息 |
 
-### 15.7 对比：App.tsx 路由变化时的副作用
+### 18.7 对比：App.tsx 路由变化时的副作用
 
 文件：`ui/src/App.tsx:15-19`
 
@@ -1427,7 +1865,7 @@ App 组件监听 `pathname` 变化做了滚动重置和焦点释放，但**没�
 
 ---
 
-## 十六、路由切换时的全局副作用
+## 十九、路由切换时的全局副作用
 
 文件：`ui/src/App.tsx:15-19`
 
@@ -1447,7 +1885,7 @@ useEffect(() => {
 
 ---
 
-## 十七、SearchBar 的延迟查询
+## 二十、SearchBar 的延迟查询
 
 文件：`ui/src/components/header/Searchbar.tsx`
 
@@ -1470,7 +1908,7 @@ useEffect(() => {
 
 ---
 
-## 十八、关键代码位置速查
+## 二十一、关键代码位置速查
 
 | 功能模块 | 文件路径 | 关键行 |
 |---------|---------|-------|
@@ -1508,10 +1946,17 @@ useEffect(() => {
 | WebSocketLink 配置 | `ui/src/apolloClient.ts` | 38-53 |
 | InMemoryCache 配置 | `ui/src/apolloClient.ts` | 161-188 |
 | 分页缓存合并函数 | `ui/src/apolloClient.ts` | 144-159 |
+| Service Worker 注册 | `ui/src/serviceWorkerRegistration.ts` | 28-64 |
+| Service Worker 缓存策略 | `ui/src/service-worker.ts` | 11-86 |
+| Auth Cookie 存取 | `ui/src/helpers/authentication.ts` | 全文 |
+| linkError 全局错误拦截 | `ui/src/apolloClient.ts` | 68-136 |
+| 主题 localStorage | `ui/src/theme.ts` | 3-29 |
+| 应用根节点 (无 ErrorBoundary) | `ui/src/index.tsx` | 17-28 |
+| throw 错误穷举检查 | `ui/src/helpers/utils.ts` | 44 |
 
 ---
 
-## 十九、潜在问题与设计权衡
+## 二十二、潜在问题与设计权衡
 
 | 现象 | 原因 | 影响 |
 |------|------|------|
@@ -1530,3 +1975,8 @@ useEffect(() => {
 | 路由切换时 in-flight query 不取消 | fetch API 原生不支持取消，项目未用 AbortController | 快速切换页面时后台仍在跑请求，浪费带宽；响应仍写入缓存 |
 | 缓存无 GC 机制无限增长 | InMemoryCache 无大小限制、无 TTL、无自动回收 | 长会话下缓存持续膨胀，只有 resetStore/页面刷新才能清空 |
 | 分页数组无上限 | `paginateCache` 按索引合并，理论上可无限追加 | 用户一直滚动浏览会导致分页数组越来越长 |
+| 断网误判为未授权清 Cookie | linkError 将所有 network error 都执行 clearTokenCookie | 用户只是断网，但被强制登出，下次路由切换跳登录页 |
+| Apollo 缓存无持久化 | 未使用 apollo3-cache-persist，InMemoryCache 纯内存 | 用户每天第一次打开应用即使 Cookie 有效，也要重新拉所有数据 |
+| 无 ErrorBoundary，throw 导致白屏 | 17 处 throw new Error 无任何捕获，应用无错误边界组件 | 任何一个 throw 都可能导致整页崩溃，用户只能手动刷新 |
+| 错误双重展示 | linkError 全局浮层 + 组件局部 `<div>Error</div>` | 用户同时看到两条可能重复或不一致的错误信息 |
+| Service Worker 不缓存用户照片 / GraphQL | 路由规则排除 /api/*，PNG 缓存只匹配同源非 API 路径 | 离线状态下已加载的照片元数据在 Apollo 缓存里，但图片二进制取决于浏览器 HTTP 缓存 |
