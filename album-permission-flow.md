@@ -1503,3 +1503,329 @@ Cache-Control: private, max-age=31536000, immutable
 3. **不可控**：客户端缓存本来就无法从服务器端强制失效（除非改 URL）
 4. **信任模型**：假设"已经下载的数据"用户已经可以保存到本地，服务器端缓存是否失效意义不大
 5. **自托管**：管理员可以手动清理 `media_cache` 目录，或通过反向代理实现更复杂的缓存策略
+
+---
+
+## 18. 大规模日访问下的审计记录分片存储：架构现状与边界
+
+### 18.1 结论先行：无内置分片/轮转机制
+
+经过对日志系统、数据库模型、部署配置的全面排查，**Photoview 没有任何内置的审计日志分片存储、按天轮转、分表分区机制**。
+
+日志以纯文本形式直接输出到 stdout，完全依赖部署环境（Docker、systemd、反向代理）来做持久化和轮转。
+
+### 18.2 日志系统的三层结构
+
+#### 第一层：slog 抽象层
+
+**文件**: `api/log/default.go` + `api/log/context.go`
+
+```go
+var defaultLogger *slog.Logger
+func init() {
+    defaultLogger = slog.Default()   // Go 标准库 slog，默认输出到 stderr
+}
+
+func Debug/Info/Warn/Error(ctx, msg, args...) {
+    getLogger(ctx).DebugContext/InfoContext/...(ctx, msg, args...)
+}
+```
+
+- 基于 Go 1.21+ 的 `log/slog` 标准库
+- 支持 context 传递 logger，可附加结构化字段（`log.WithAttrs`）
+- 但**默认配置就是 slog.Default()**，即文本格式输出到 stderr
+
+#### 第二层：HTTP 请求日志中间件
+
+**文件**: `api/server/logging.go` `LoggingMiddleware`
+
+```go
+fmt.Printf("%s %s %s %s %s\n", date, statusText, requestText, durationText, userText)
+```
+
+- 直接用 `fmt.Printf` 输出到 stdout，**不经过 slog 抽象层**
+- 非结构化文本，带 ANSI 颜色码
+- 只记录请求级别的信息，不记录具体的 ShareToken 值（query string 中的 token）
+
+#### 第三层：散落在各处的 fmt.Printf / log.Printf
+
+代码中还有大量直接使用的：
+- `fmt.Printf` — 主要在 `logging.go`、`downloads.go`
+- `log.Printf` — 主要在扫描器、清理任务中
+
+这些都不走 slog 的统一出口。
+
+### 18.3 为什么没有分片？——部署依赖设计
+
+Photoview 的设计哲学是**"应用不做日志管理，交给基础设施"**：
+
+| 部署方式 | 日志处理方式 |
+|---------|------------|
+| **Docker** | stdout/stderr → Docker 日志驱动 → journald / json-file / syslog |
+| **systemd** | stdout → journald → 日志轮转由 journald 配置 |
+| **手动部署** | 直接输出到终端，需自行重定向到文件 + logrotate |
+| **K8s** | stdout → 容器日志 → 集中式日志系统（ELK/Loki 等） |
+
+**代码证据**：
+- 没有任何 `os.OpenFile` 打开日志文件的代码
+- 没有任何 `logrotate`、文件大小检查、按天切分的逻辑
+- 环境变量中没有日志路径、日志级别、保留天数等配置项
+
+### 18.4 审计数据的"可扩展性"：零
+
+从代码来看，如果要实现"大规模日访问下的分片存储"，需要从零开始构建：
+
+1. **数据库审计表**：目前没有 `share_access_log` 之类的表
+2. **日志结构化**：HTTP 日志目前是 `fmt.Printf` 纯文本，需要改为结构化 JSON
+3. **异步写入**：目前是同步输出，高并发下可能阻塞
+4. **分片/分区**：需要按天分表或使用时序数据库
+5. **查询接口**：目前没有任何审计查询的 GraphQL API
+
+### 18.5 DataLoader 缓存：请求级别的 N+1 优化
+
+虽然不是审计分片，但值得一提的是 DataLoader 机制——这是 Photoview 中唯一的"批量 + 缓存"层。
+
+**文件**: `api/dataloader/loaders.go`
+
+```go
+func Middleware(db *gorm.DB) mux.MiddlewareFunc {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            ctx := context.WithValue(r.Context(), loadersKey, &Loaders{
+                MediaThumbnail:      NewThumbnailMediaURLLoader(db),
+                MediaHighres:        NewHighresMediaURLLoader(db),
+                MediaVideoWeb:       NewVideoWebMediaURLLoader(db),
+                UserFromAccessToken: NewUserLoaderByToken(db),
+                UserMediaFavorite:   NewUserFavoriteLoader(db),
+            })
+            r = r.WithContext(ctx)
+            next.ServeHTTP(w, r)
+        })
+    })
+}
+```
+
+**关键特征**：
+- **请求级生命周期**：每个 HTTP 请求创建一套新的 Loader，请求结束即销毁
+- **不是全局缓存**：请求之间不共享缓存数据
+- **作用**：解决 GraphQL 查询的 N+1 问题，批量加载数据
+- **与审计/分片无关**：完全是查询优化层
+
+**生成的 Loader 代码**（`gen_*loader.go`）包含：
+- `cache map[key]value` — 单次请求内的去重缓存
+- `Clear(key)` — 清除单个缓存
+- `Prime(key, value)` — 预热缓存
+
+但这些都是**单请求内的缓存**，不是全局缓存层。
+
+### 18.6 共享链接访问的可观测性现状
+
+总结一下，对于"谁在什么时候访问了哪个共享链接"这个问题：
+
+| 维度 | 现状 | 数据来源 |
+|------|------|---------|
+| 访问次数 | ⚠️ 可推断但困难 | HTTP 请求日志，需 grep `/share/` 路径 |
+| 访问者身份 | ❌ 匿名用户无法识别 | 日志只显示 "unauthenticated" |
+| 访问了哪些照片 | ❌ 无法精确追踪 | 日志不记录 query string 中的 token |
+| 失败原因（过期/密码错） | ❌ 无法区分 | 只有 403 状态码，无细分原因 |
+| IP 地址 | ❌ 不记录 | 日志不含 IP |
+| User-Agent | ❌ 不记录 | 日志不含 UA |
+| 按天统计 | ⚠️ 需外部工具 | 日志本身不分片，靠 grep + awk 统计 |
+
+### 18.7 规模化部署的补全建议（基于代码外推）
+
+如果要在 Photoview 上实现大规模审计，目前的架构需要借助外部工具：
+
+```
+Photoview stdout
+    │
+    ▼
+Docker / systemd 日志收集
+    │
+    ▼
+结构化日志管道 (vector / fluentd / logstash)
+    │
+    ├── 按天索引到 Elasticsearch / Loki
+    ├── 按 token 维度建立索引
+    └── 设置保留策略（如 90 天自动删除）
+```
+
+但这完全是**基础设施层的事情**，Photoview 应用代码本身没有任何支持。
+
+---
+
+## 19. Token 撤销后 CDN 与浏览器双层缓存失效协同
+
+### 19.1 结论先行：无 CDN 集成，无协同失效机制
+
+经过全面搜索，**Photoview 没有任何 CDN 集成代码**，没有 Cloudflare / Fastly / Akamai 的 Purge API 调用，没有 Cache-Tag / Surrogate-Key 响应头，也没有任何多层缓存失效协同逻辑。
+
+缓存策略是"单层、静态、写死的"：
+- 服务器端：文件系统缓存，仅在相册/媒体被删除时清理
+- 客户端：`Cache-Control` 头控制，有效期 1 年
+- CDN 层：完全不存在，靠用户自行在前面加反向代理
+
+### 19.2 当前缓存层次全景
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    浏览器 / 客户端                              │
+│  Cache: private, max-age=31536000, immutable (1年)            │
+│  不做条件请求，直接用本地缓存                                   │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    CDN / 反向代理 (用户自建)                    │
+│  无集成：无 Cache-Tag、无 Purge API、无 Surrogate-Key           │
+│  完全靠用户自行配置（Nginx / Cloudflare / CloudFront 等）        │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Photoview API Server                       │
+│  1. 内存中的 DataLoader 缓存（请求级，随请求销毁）              │
+│  2. 文件系统缓存 media_cache/{album_id}/{media_id}/           │
+│     - 仅在相册/媒体删除时清理（os.RemoveAll）                   │
+│     - ShareToken 撤销不影响缓存                                │
+│  3. GraphQL Query AST 缓存（LRU 1000）                        │
+│  4. APQ 持久化查询映射缓存（LRU 100）                          │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    数据库 (SQLite/MySQL/Postgres)              │
+│  ShareToken 表：存储 token 元数据 + 过期时间 + 密码              │
+│  撤销 = 从表中 DELETE 或设置 Expire 为过去                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 19.3 浏览器缓存：为什么"撤销后还能看"
+
+**文件**: `api/routes/photos.go:74` + `api/routes/videos.go:122`
+
+```go
+w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+```
+
+三个关键指令的含义：
+- `private`：只有最终用户的浏览器可以缓存，中间代理（CDN）不应缓存
+- `max-age=31536000`：缓存有效期 1 年
+- `immutable`：浏览器不会发送条件请求（`If-None-Match` / `If-Modified-Since`），直接使用本地缓存
+
+**immutable 的影响**：
+- 正常情况下，浏览器会在 max-age 过期后发条件请求验证资源是否变化
+- 加了 immutable 后，浏览器**永远不会**发验证请求，直接用本地副本
+- 这意味着：即使用户刷新页面，浏览器也不会重新请求图片
+
+**Token 撤销与浏览器缓存的关系**：
+- 图片 URL 是 `/api/photo/{media_url_name}?token={share_token}`
+- token 在 query string 中 → 不同 token 算不同 URL → 缓存 key 不同
+- 但同一个 token 被撤销后，URL 没变 → 浏览器继续用缓存
+- 用户的浏览器缓存中有多少张图，撤销后就能看多少张
+
+### 19.4 Service Worker：可选的第三层缓存
+
+**文件**: `ui/src/serviceWorkerRegistration.ts`
+
+```
+const swUrl = `${import.meta.env.BASE_URL}service-worker.js`
+// register() is not called by default.
+```
+
+**关键发现**：
+- 代码中有 Service Worker 注册逻辑，但**默认不调用 `register()`**
+- 注释说明："This lets the app load faster on subsequent visits in production, and gives it offline capabilities"
+- 这是 Create React App 自带的 PWA 模板代码，Photoview 没有启用
+
+如果启用了 SW，会增加一层缓存：
+- 离线可用
+- 缓存策略更复杂（Cache-First / Stale-While-Revalidate 等）
+- 撤销失效更困难
+
+但目前 Photoview 没有启用，所以不用考虑。
+
+### 19.5 服务器端缓存：仅绑定相册生命周期，与 Token 无关
+
+**文件**: `api/utils/media_cache.go` + 各清理触发点
+
+服务器端缓存目录 `media_cache/{album_id}/{media_id}/` 的清理仅发生在：
+1. `UserRemoveRootAlbum` → 删除相册 → 清缓存
+2. `DeleteUser` → 删除用户独有相册 → 清缓存
+3. `CleanupMedia` → 媒体文件消失 → 清缓存
+4. `DeleteOldUserAlbums` → 相册消失 → 清缓存
+
+**ShareToken 相关操作完全不触发缓存清理**：
+- `DeleteShareToken`：只 `db.Delete(&token)`，不动缓存
+- `ProtectShareToken`：只改 `token.Password`，不动缓存
+- `SetExpireShareToken`：只改 `token.Expire`，不动缓存
+
+原因很简单：缓存是按 `album_id/media_id` 组织的，一个相册可能有 N 个共享 token，撤销一个 token 不影响其他 token 和相册所有者的访问。如果撤销一个 token 就清缓存，代价太大。
+
+### 19.6 CDN 层：完全在代码之外
+
+代码中**没有任何 CDN 相关的**：
+- ❌ `Surrogate-Key` / `Cache-Tag` 响应头
+- ❌ Cloudflare / Fastly / Akamai API 调用
+- ❌ Purge / Ban / Soft Purge 逻辑
+- ❌ CDN 配置环境变量
+
+**`Cache-Control: private` 的含义**：
+- 这个指令明确告诉中间代理（包括 CDN）"不要缓存"
+- 所以即使前面架了 CDN，默认也不会缓存图片
+- 只有当用户主动修改 CDN 配置、忽略 `private` 指令时才会缓存
+
+这也意味着：
+- 撤销 token 后，CDN 层没有什么需要失效的（因为本来就没缓存）
+- 但如果用户自己配置了 CDN 缓存（覆盖了 `private`），那撤销后 CDN 上的副本仍然存在
+
+### 19.7 失效协同矩阵
+
+| 缓存层 | Token 撤销后是否失效？ | 失效机制 | 代码挂载点 |
+|--------|----------------------|---------|-----------|
+| 浏览器 HTTP 缓存 | ❌ 不失效 | URL 不变，缓存 key 不变；immutable 永不验证 | `photos.go:74`, `videos.go:122` |
+| Service Worker 缓存 | N/A（未启用） | CRA 模板代码，默认不 register | `serviceWorkerRegistration.ts` |
+| CDN 缓存 | N/A（无集成） | 代码中无 CDN 集成，Cache-Control: private 阻止代理缓存 | 无 |
+| DataLoader 内存缓存 | ⚠️ 请求结束自然失效 | 每个请求新建 loader，请求完销毁 | `dataloader/loaders.go:27` |
+| GraphQL Query 缓存 | ❌ 不失效 | LRU 缓存 AST，与 token 无关 | `graphql_endpoint.go:43` |
+| 服务器文件缓存 | ❌ 不失效 | 仅在相册/媒体删除时清理，与 token 无关 | `user.util.go:42`, `cleanup_media.go:44` |
+| 数据库记录 | ✅ 失效 | `db.Delete(&token)` 或设过期 | `share_token_actions.go:111` |
+
+### 19.8 如果要实现 CDN + 浏览器双层失效协同
+
+基于代码架构推测，如果要实现这个功能，需要：
+
+1. **给每个 token 生成唯一的图片 URL 前缀**，而不是把 token 放 query string 里
+   - 例如：`/share/{token_hash}/photo/{media_name}`
+   - 这样每个 token 的缓存 key 不同，撤销一个 token 不影响其他
+
+2. **添加 `Surrogate-Key` / `Cache-Tag` 响应头**
+   - 例如：`Surrogate-Key: share-token-{token_value} album-{album_id}`
+   - CDN 可以按 tag 批量失效
+
+3. **在 `DeleteShareToken` / `SetExpireShareToken` 中调用 CDN Purge API**
+   - 根据 token value 找到所有关联的媒体
+   - 调用 CDN 的 Purge API 失效这些 URL 或 tag
+
+4. **浏览器缓存的终极手段：改 URL**
+   - 撤销 token 后，如果还想让浏览器缓存也失效，只能改 URL
+   - 但这样需要服务端生成新的 token 签名或版本号
+
+5. **短 TTL + Stale-While-Revalidate**
+   - 不用长 cache，用短 TTL（如 5 分钟）+ SWR
+   - 撤销后最多 5 分钟就失效
+   - 但会增加服务器负载
+
+这些都是**代码中不存在的**，是根据架构外推的实现思路。
+
+### 19.9 设计哲学：为什么 Photoview 不做这些
+
+从代码来看，Photoview 的定位是**"轻量自托管照片应用"**，而不是企业级图片分享平台：
+
+1. **用户规模小**：自托管通常是个人/家庭/小团队，不需要大规模分片
+2. **信任模型简单**：共享链接是"知道的人才能看"，不需要审计追踪
+3. **部署依赖外部**：日志、CDN、缓存都交给运维/基础设施
+4. **代码量克制**：核心功能优先，非必要功能不加
+5. **性能靠缓存而非限流**：长 TTL + 浏览器缓存就是性能策略，不需要复杂的失效机制
+
+这不是缺陷，而是**设计取舍**——在简单性和功能丰富性之间选择了前者。
