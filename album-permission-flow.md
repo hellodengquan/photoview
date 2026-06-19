@@ -1245,3 +1245,261 @@ Content-Disposition: inline (默认)
 - 假设用户只会把链接发给信任的人，不会公开传播
 
 这是许多自建照片共享应用的通病——security by obscurity（隐蔽性安全），但在搜索引擎时代是不够的。
+
+---
+
+## 16. 共享链接访问审计记录：代码路径梳理
+
+### 16.1 结论先行：无专门的审计日志系统
+
+经过对日志系统、数据库模型、ShareToken 处理流程的全面排查，**Photoview 没有任何专门的"共享链接访问审计"机制**。没有审计日志表、没有访问历史记录、没有把 ShareToken 访问单独归类追踪。
+
+### 16.2 唯一的记录：通用 HTTP 请求日志
+
+**文件**: `api/server/logging.go` `LoggingMiddleware`
+
+这是代码中唯一记录请求的地方，但它是**通用请求日志**，不是共享链接审计：
+
+```go
+func LoggingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        next.ServeHTTP(statusWriter, r)
+        elapsed := time.Since(start)
+        
+        user := auth.UserFromContext(r.Context())
+        userText := "unauthenticated"
+        if user != nil {
+            userText = "user: " + user.Username
+        }
+        
+        // 输出到 stdout
+        fmt.Printf("%s %s %s %s %s\n", 
+            date, statusText, requestText, durationText, userText)
+    })
+}
+```
+
+**日志格式示例**:
+```
+2026/06/19 14:30:22 GET 200 example.com/api/photo/abc123 12.34ms unauthenticated
+2026/06/19 14:30:25 GET 200 example.com/share/AbCdEf12 45.67ms user: john
+```
+
+**日志包含的字段**:
+| 字段 | 说明 |
+|------|------|
+| 日期时间 | `2006/01/02 15:04:05` 格式 |
+| HTTP 方法 | GET/POST/OPTIONS 等，带颜色 |
+| 状态码 | 200/401/403/404 等，带颜色 |
+| Host + Path | 例如 `example.com/api/photo/abc123` |
+| 耗时 | 例如 `12.34ms` |
+| 用户 | `unauthenticated` 或 `user: <username>` |
+
+**关键缺失**：
+- ❌ 不记录 `?token=` 查询参数（虽然 URL path 中的 `/share/{token}` token 会被记录）
+- ❌ 不记录 ShareToken 的具体值（对于 `/api/photo/*?token=xxx` 不记录 token）
+- ❌ 不区分"匿名用户用共享 token 访问"和"完全未认证用户"
+- ❌ 不记录访问成功/失败的原因（如 token 过期、密码错误）
+- ❌ 不记录客户端 IP 地址
+- ❌ 不记录 User-Agent
+- ❌ 不持久化到数据库，仅输出到 stdout
+
+### 16.3 被注释掉的 ShareToken Debug 日志
+
+**文件**: `api/routes/authenticate_routes.go`
+
+代码中有大量被注释掉的 debug 日志：
+
+```go
+// log.Debug(nil, "Share token not found: %s", token)
+// log.Debug(nil, "Share token expired: %s", token)
+// log.Debug(nil, "Incorrect password for share token: %s", token)
+// log.Debug(nil, "Media share token does not match mediaID: %d != %d", ...)
+// log.Debug(nil, "Failed to find album for media %d: %v", ...)
+```
+
+这些日志覆盖了 ShareToken 验证的每一个失败分支，但全部被注释掉了。
+
+**推测**：开发者在调试阶段用这些日志追踪问题，生产环境中注释掉以减少日志噪音，但没有提供可配置的开关。
+
+### 16.4 GraphQL 层同样无审计
+
+- `ShareToken` query（`resolvers/share_token.go:74`）：成功返回 token，失败返回 error，**无日志**
+- `ShareTokenValidatePassword` query（`share_token.go:114`）：返回 true/false，**无日志**
+- 所有 Album / Media 查询通过 token 访问时：**无专门日志**
+
+### 16.5 日志中间件的挂载点
+
+**文件**: `api/server.go:77`
+
+```go
+rootRouter := mux.NewRouter()
+rootRouter.Use(dataloader.Middleware(db))
+rootRouter.Use(auth.Middleware(db))
+rootRouter.Use(server.LoggingMiddleware)    // ← 日志在这里
+rootRouter.Use(server.CORSMiddleware(devMode))
+```
+
+执行顺序：
+1. DataLoader 注入
+2. Auth 中间件（解析 AccessToken，填充 User）
+3. **LoggingMiddleware**（记录请求）
+4. CORS 中间件
+5. 实际 handler
+
+这意味着日志是在 Auth 之后、handler 之前包装的，所以能拿到 User 信息。
+
+### 16.6 审计场景的实际覆盖能力
+
+| 场景 | 能否从日志推断？ | 说明 |
+|------|-----------------|------|
+| 有人访问了 `/share/AbCdEf12` | ✅ 可以 | 路径中包含 token |
+| 有人用 token `XyZ` 访问 `/api/photo/abc?token=XyZ` | ❌ 不行 | 日志只显示路径 `/api/photo/abc`，不显示 query string |
+| 访问被拒（token 过期） | ⚠️ 间接推断 | 403 状态码，但不知道原因 |
+| 访问被拒（密码错误） | ⚠️ 间接推断 | 403 状态码，但不知道原因 |
+| 哪张照片被访问了 | ⚠️ 部分可以 | `media_url_name` 在路径中，但需要反查数据库 |
+| 访问者 IP | ❌ 不行 | 日志不记录 |
+| 访问次数统计 | ⚠️ 可以但困难 | 需要 grep 日志 + 计数 |
+
+### 16.7 为什么没有审计日志？——设计推测
+
+1. **性能优先**：共享图片访问是高频操作，写数据库日志会有性能开销
+2. **隐私考量**：记录谁访问了什么照片本身就是敏感数据
+3. **自托管假设**：假设管理员会自己配置反向代理（Nginx/Caddy）的访问日志
+4. **功能优先级**：审计被视为"高级功能"，不在核心路径上
+
+---
+
+## 17. Token 撤销后已下载缓存的失效机制
+
+### 17.1 结论先行：撤销后缓存完全不失效
+
+无论是服务器端的媒体缓存，还是客户端浏览器的缓存，**在 ShareToken 被删除/撤销/过期时，都不会有任何主动失效机制**。
+
+已下载的照片/视频会一直保留在缓存中，直到：
+- 服务器端：相册被删除、媒体文件被移除、或管理员手动清理缓存目录
+- 客户端：用户手动清除浏览器缓存、或缓存自然过期（1 年后）
+
+### 17.2 服务器端缓存目录结构
+
+**文件**: `api/utils/media_cache.go`
+
+```
+media_cache/                     ← 根目录（可配置 PHOTOVIEW_MEDIA_CACHE）
+└── {album_id}/                  ← 每个相册一个目录
+    └── {media_id}/              ← 每个媒体一个目录
+        ├── thumbnail.jpg        ← 缩略图
+        ├── highres.jpg          ← 高分辨率版本
+        ├── video_web.mp4        ← 视频转码版本
+        └── ...                  ← 其他衍生格式
+```
+
+**缓存路径生成** (`CachePathForMedia`):
+```go
+func CachePathForMedia(albumID int, mediaID int) (string, error) {
+    albumCachePath := path.Join(MediaCachePath(), strconv.Itoa(albumID))
+    photoCachePath := path.Join(albumCachePath, strconv.Itoa(mediaID))
+    // 确保目录存在
+    return photoCachePath, nil
+}
+```
+
+### 17.3 清缓存的触发场景（仅 4 种）
+
+经过全面搜索，**只有 4 种场景会触发缓存清理**，全部与"相册/媒体被删除"相关，与 ShareToken 无关：
+
+| 场景 | 触发点 | 清理范围 |
+|------|--------|----------|
+| **1. 用户删除相册** | `resolvers/user.go:239` `UserRemoveRootAlbum` → `clearCacheAndReloadFaces` | 被删相册的整个目录 `media_cache/{album_id}/` |
+| **2. 删除用户** | `actions/user_actions.go:57` `DeleteUser` → `cleanup(deletedAlbumIDs)` | 该用户独有的相册目录 |
+| **3. 媒体文件在磁盘消失** | `cleanup_media.go:17` `CleanupMedia`（扫描后） | 被删媒体的目录 `media_cache/{album_id}/{media_id}/` |
+| **4. 相册在磁盘消失** | `cleanup_media.go:68` `DeleteOldUserAlbums`（扫描后） | 被删相册的整个目录 |
+
+**`clearCacheAndReloadFaces` 实现** (`resolvers/user.util.go:36`):
+```go
+func clearCacheAndReloadFaces(db *gorm.DB, deletedAlbumIDs []int) error {
+    for _, id := range deletedAlbumIDs {
+        cacheAlbumPath := path.Join(utils.MediaCachePath(), strconv.Itoa(id))
+        if err := os.RemoveAll(cacheAlbumPath); err != nil {  // ← 递归删目录
+            return err
+        }
+    }
+    // 重新加载人脸检测器（因为图片可能被删了）
+    if face_detection.GlobalFaceDetector != nil {
+        face_detection.GlobalFaceDetector.ReloadFacesFromDatabase(db)
+    }
+    return nil
+}
+```
+
+### 17.4 ShareToken 撤销时完全不清缓存
+
+**`DeleteShareToken` 实现** (`actions/share_token_actions.go:105`):
+```go
+func DeleteShareToken(db *gorm.DB, userID int, tokenValue string) (*models.ShareToken, error) {
+    token, err := getUserToken(db, userID, tokenValue)  // 权限校验
+    if err != nil {
+        return nil, err
+    }
+    if err := db.Delete(&token).Error; err != nil {     // 仅从数据库删除
+        return nil, errors.Wrapf(err, "failed to delete share token (%s)", tokenValue)
+    }
+    return token, nil
+}
+```
+
+**关键观察**：只有 `db.Delete(&token)`，**没有任何缓存清理操作**。
+
+同理：
+- `ProtectShareToken`（设置密码）：仅 `db.Save(&token)`，不清缓存
+- `SetExpireShareToken`（设置过期）：仅 `db.Save(&token)`，不清缓存
+
+### 17.5 客户端缓存：完全不可控
+
+**文件**: `api/routes/photos.go:74` + `api/routes/videos.go:122`
+
+图片/视频响应头：
+```http
+Cache-Control: private, max-age=31536000, immutable
+```
+
+- `private`: 仅浏览器可缓存（代理不缓存）
+- `max-age=31536000`: 缓存有效期 **1 年**
+- `immutable`: 浏览器不会做条件请求（`If-Modified-Since` / `If-None-Match`），直接用本地缓存
+
+**后果**：
+1. 用户访问过一次共享相册后，所有图片都缓存在浏览器中
+2. 即使用户的 token 被撤销，只要 URL 不变，浏览器仍会从本地缓存加载图片
+3. 唯一能让客户端重新请求的方法：
+   - 用户手动清除浏览器缓存
+   - URL 变化（但 URL 是 `/api/photo/{name}?token=xxx`，撤销 token 不会改 URL）
+
+### 17.6 缓存失效的完整矩阵
+
+| 操作 | 服务器端缓存清理？ | 客户端缓存失效？ |
+|------|-------------------|-----------------|
+| DeleteShareToken | ❌ 不清理 | ❌ 不失效 |
+| SetExpireShareToken（设为过去） | ❌ 不清理 | ❌ 不失效 |
+| ProtectShareToken（加密码） | ❌ 不清理 | ❌ 不失效 |
+| UserRemoveRootAlbum（删相册） | ✅ `os.RemoveAll(album_dir)` | ⚠️ 浏览器仍有旧缓存，但 URL 访问会 404 |
+| DeleteUser（删用户） | ✅ 清理该用户独有相册 | ⚠️ 同上 |
+| CleanupMedia（媒体文件消失） | ✅ `os.RemoveAll(media_dir)` | ⚠️ 同上 |
+| ShareToken 自然过期 | ❌ 不清理 | ❌ 不失效 |
+
+### 17.7 安全风险场景
+
+1. **撤销后仍可查看**：管理员撤销了某个员工的共享访问，但该员工浏览器中已缓存的照片仍可离线查看
+2. **公共设备访问**：用户在网吧/图书馆访问共享相册后忘记清缓存，后续使用者可以直接从浏览器缓存中查看照片
+3. **取证风险**：即使 token 被撤销，服务器端和客户端的缓存中仍有完整的图片副本
+4. **URL 不变问题**：`/api/photo/{name}?token=xxx` 中的 `name` 是媒体 URL 的永久标识符，撤销 token 不会改变 URL，缓存 key 不变
+
+### 17.8 为什么没有缓存失效？——设计权衡
+
+从代码来看，这是一个**有意的设计决策**，而非疏忽：
+
+1. **性能**：图片缓存是性能关键，频繁清理会导致重新编码开销
+2. **复杂性**：要实现 token 级缓存失效，需要在缓存 key 中加入 token，但 token 可以多个，一个媒体可能有多个共享 token
+3. **不可控**：客户端缓存本来就无法从服务器端强制失效（除非改 URL）
+4. **信任模型**：假设"已经下载的数据"用户已经可以保存到本地，服务器端缓存是否失效意义不大
+5. **自托管**：管理员可以手动清理 `media_cache` 目录，或通过反向代理实现更复杂的缓存策略
