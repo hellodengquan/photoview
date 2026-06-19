@@ -391,7 +391,153 @@ func AuthWebsocketInit() func(context.Context, transport.InitPayload) (context.C
 }
 ```
 
-WebSocket 连接在初始化时完成一次 token 校验，**连接建立后不会重新校验 token**。即使 token 过期，已建立的 WebSocket 连接仍然有效，直到连接断开重连。
+### 3.7 WebSocket 订阅 Token 中途失效路径
+
+#### 3.7.1 WebSocket 连接配置
+
+**文件**: `api/graphql/endpoint/graphql_endpoint.go:31-35`
+
+```go
+graphqlServer.AddTransport(transport.Websocket{
+    KeepAlivePingInterval: 10 * time.Second,
+    Upgrader:              server.WebsocketUpgrader(utils.DevelopmentMode()),
+    InitFunc:              auth.AuthWebsocketInit(),
+})
+```
+
+#### 3.7.2 前端 WebSocket 建立与 Bearer Token 传递
+
+**文件**: `ui/src/apolloClient.ts:38-53`
+
+```typescript
+const wsLink = new WebSocketLink({
+  uri: websocketUri.toString(),
+  options: {
+    reconnect: true,
+    lazy: true,
+    connectionParams: () => {
+      const token = authToken()
+      if (token) {
+        return {
+          Authorization: `Bearer ${token}`  // 只在连接建立时传递一次
+        }
+      }
+      return {}
+    }
+  }
+})
+```
+
+#### 3.7.3 唯一的订阅：通知推送
+
+**文件**: `api/graphql/resolvers/notification.go:17-34`
+
+```go
+func (r *subscriptionResolver) Notification(ctx context.Context) (<-chan *models.Notification, error) {
+    user := auth.UserFromContext(ctx)
+    if user == nil {
+        return nil, auth.ErrUnauthorized
+    }
+
+    notificationChannel := make(chan *models.Notification, 1)
+    listenerID := notification.RegisterListener(user, notificationChannel)
+
+    go func() {
+        <-ctx.Done()  // 监听 context 取消（连接断开时触发）
+        notification.DeregisterListener(listenerID)
+    }()
+
+    return notificationChannel, nil
+}
+```
+
+**关键设计**:
+- `InitFunc` **只在连接建立时调用一次**，之后不再校验 token
+- `KeepAlivePingInterval: 10s` 只是心跳保活，**不做 token 校验**
+- 连接的生命周期绑定到 context，只有 `ctx.Done()` 时才会清理
+
+#### 3.7.4 Token 中途失效的完整路径
+
+```
+Token 中途失效路径（共 3 层，层层穿透）
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  第一层：数据库层面（token 自然过期或被删除）                          │
+│  access_tokens.expire < now 或记录被 DELETE                          │
+└───────────────────────────────────────┬───────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  第二层：服务端行为（完全无感知）                                      │
+│  ✅ 没有定时任务轮询 token 有效性                                      │
+│  ✅ KeepAlive ping 不校验 token                                        │
+│  ✅ context 没有过期时间，与 token 有效期无绑定                         │
+│  ✅ WebSocket 连接建立后，resolver 用的 user 存在 context 中，永不刷新  │
+│  ✅ 已注册的 notification listener 继续接收推送直到连接断开            │
+└───────────────────────────────────────┬───────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  第三层：客户端感知（只能靠重连触发）                                  │
+│  路径 A：连接自然断开（网络波动、页面刷新）→ 触发重连                  │
+│            → 重连时调用 connectionParams() 取最新 token              │
+│            → InitFunc 重新校验，发现 token 无效 → 返回错误            │
+│            → 前端 onError 捕获 → clearTokenCookie() → 重定向登录      │
+│                                                                     │
+│  路径 B：客户端主动刷新（没有机制）                                    │
+│            ❌ 没有定时重连逻辑                                        │
+│            ❌ 没有在 subscription error 时强制重连                     │
+│            ❌ 没有监听 token cookie 变化而重建连接                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.7.5 前端订阅错误处理
+
+**文件**: `ui/src/components/messages/SubscriptionsHook.ts:51-69`
+
+```typescript
+const { data, error } = useSubscription<notificationSubscription>(
+  NOTIFICATION_SUBSCRIPTION
+)
+
+useEffect(() => {
+  if (error) {
+    // 仅显示错误消息，不会触发重连或清 Cookie
+    setMessages(state => [...state, {
+      key: Math.random().toString(26),
+      type: NotificationType.Message,
+      props: {
+        header: 'Network error',
+        content: error.message,
+        negative: true,
+      },
+    }])
+  }
+}, [data, error])
+```
+
+**关键发现**：
+- ❌ **服务端不会主动断开已过期 token 的连接**
+- ❌ **客户端没有任何机制主动检测 token 失效**
+- ❌ **最长可达 14 天 + WebSocket 连接保持时间**（理论上无限期，只要不断开）
+- ❌ **修改密码或吊销 token 对已建立的 WebSocket 连接完全无影响**
+- ✅ **唯一失效时机：连接断开后的重连阶段**
+
+#### 3.7.6 服务端主动断开的唯一触发点
+
+唯一能让服务端主动断开连接的机制是通过 `notification.DeregisterListener`，但这只有在：
+1. `ctx.Done()` 触发（客户端断开连接）
+2. 服务进程重启
+3. 内存中 listener 列表被清空（如用户被删除）
+
+**文件**: `api/graphql/notification/notification.go:28-31`
+
+```go
+go func() {
+    <-ctx.Done()
+    notification.DeregisterListener(listenerID)
+}()
+```
 
 ---
 
@@ -878,26 +1024,272 @@ extend type Mutation {
 
 ### 9.2 Token 管理的安全隐患
 
-1. **无强制失效机制**:
-   - 修改用户密码不会使已有的 AccessToken 失效
+#### 9.2.1 修改密码不失效旧 Token（安全漏洞）
+
+**当前实现**（`api/graphql/resolvers/user.go:110-145`）：
+
+```go
+func (r *mutationResolver) UpdateUser(ctx context.Context, id int, username *string, password *string, admin *bool) (*models.User, error) {
+    db := r.DB(ctx)
+
+    var user models.User
+    if err := db.First(&user, id).Error; err != nil {
+        return nil, err
+    }
+
+    // ... 更新 username、admin 字段
+
+    if password != nil {
+        // 只更新密码哈希，不触及 access_tokens 表
+        hashedPassBytes, err := bcrypt.GenerateFromPassword([]byte(*password), 12)
+        hashedPass := string(hashedPassBytes)
+        user.Password = &hashedPass
+    }
+
+    if err := db.Save(&user).Error; err != nil {  // 只 UPDATE users 表
+        return nil, fmt.Errorf("failed to update user: %w", err)
+    }
+
+    return &user, nil
+}
+```
+
+**问题分析**：
+- ❌ `db.Save(&user)` 只更新 `users` 表的记录
+- ❌ **完全没有** `DELETE FROM access_tokens WHERE user_id = ?`
+- ❌ 该用户的所有 AccessToken（可能分布在多个设备）继续有效直到 14 天自然过期
+- ❌ 已建立的 WebSocket 连接继续有效直到断开
+
+**攻击场景**：
+1. 用户在公共设备登录，忘记 Logout，只在个人设备修改密码
+2. 攻击者窃取了用户的 token（通过 XSS、本地文件泄露等）
+3. 用户修改密码试图保护账号
+4. 攻击者持有的旧 token 继续有效最长 14 天
+
+#### 9.2.2 修复方案（具体改造点）
+
+```go
+// 改造后的 UpdateUser
+func (r *mutationResolver) UpdateUser(ctx context.Context, id int, username *string, password *string, admin *bool) (*models.User, error) {
+    db := r.DB(ctx)
+
+    var user models.User
+    if err := db.First(&user, id).Error; err != nil {
+        return nil, err
+    }
+
+    // ... 其他字段更新 ...
+
+    if password != nil {
+        hashedPassBytes, err := bcrypt.GenerateFromPassword([]byte(*password), 12)
+        if err != nil {
+            return nil, err
+        }
+        hashedPass := string(hashedPassBytes)
+        user.Password = &hashedPass
+    }
+
+    err := db.Transaction(func(tx *gorm.DB) error {
+        if err := tx.Save(&user).Error; err != nil {
+            return err
+        }
+
+        // ===== 新增：修改密码时清除该用户的所有 AccessToken =====
+        if password != nil {
+            if err := tx.Where("user_id = ?", id).Delete(&models.AccessToken{}).Error; err != nil {
+                return fmt.Errorf("failed to revoke access tokens: %w", err)
+            }
+
+            // 可选：广播通知所有已连接的 WebSocket 客户端需要重新认证
+            // notification.BroadcastNotification(&models.Notification{...})
+        }
+
+        return nil
+    })
+
+    return &user, nil
+}
+```
+
+#### 9.2.3 补充：缺少的 Token 管理 API
+
+除了修改密码时的自动清除，还缺少以下 Token 管理能力：
+
+| 缺失功能 | 建议的 GraphQL Schema | 实现要点 |
+|---------|----------------------|---------|
+| 查看当前用户的所有活跃会话 | `myAccessTokens: [AccessToken!]! @isAuthorized` | 查询 `access_tokens` 表，过滤 `expire > now` |
+| 吊销特定会话 | `revokeAccessToken(token: String!): Boolean! @isAuthorized` | `DELETE FROM access_tokens WHERE value = ? AND user_id = ?` |
+| 吊销除当前会话外的所有会话 | `revokeOtherAccessTokens(currentToken: String!): Int! @isAuthorized` | `DELETE FROM access_tokens WHERE user_id = ? AND value != ?` |
+| 管理员吊销特定用户所有会话 | `revokeAllUserAccessTokens(userId: ID!): Int! @isAdmin` | `DELETE FROM access_tokens WHERE user_id = ?` |
+| 定期清理过期 Token | 后台 cron job | `DELETE FROM access_tokens WHERE expire < NOW() - INTERVAL '1 day'` |
+
+#### 9.2.4 其他 Token 管理隐患
+
+2. **无强制失效机制**:
    - 管理员无法吊销特定设备的登录会话
    - 数据库中过期 token 永远堆积，无清理任务
 
-2. **WebSocket 会话窗口**:
+3. **WebSocket 会话窗口**:
    - WebSocket 连接建立时校验一次 token，之后即使 token 过期连接仍然有效
    - 最长可达 14 天 + 连接保持时间
+   - 建议改造：在 KeepAlive ping 时附加 token 校验，或者给 context 绑定过期时间
 
-3. **Share Token 安全**:
+4. **Share Token 安全**:
    - Share Token 仅 8 位字符（AccessToken 是 24 位），熵值较低
    - 建议：总是给 Share Token 设置密码和过期时间
+   - 同样缺少定期清理过期 Share Token 的后台任务
 
-### 9.3 现有安全机制
+### 9.3 Cookie SameSite 与 CSRF 防护协同
+
+#### 9.3.1 Cookie SameSite 配置
+
+**文件**: `ui/src/helpers/authentication.ts`
+
+```typescript
+const AUTH_TOKEN_COOKIE_NAME = 'auth-token'
+
+export function saveTokenCookie(token: string) {
+  const options = {
+    path: '/',
+    sameSite: 'Lax',       // 关键：Lax 模式
+    expires: AUTH_TOKEN_MAX_AGE_IN_DAYS,
+  }
+  Cookies.set(AUTH_TOKEN_COOKIE_NAME, token, options)
+}
+```
+
+**SameSite=Lax 的行为**：
+- ✅ 同站请求：携带 Cookie
+- ✅ 跨站顶级导航（GET，如点击链接跳转）：携带 Cookie
+- ❌ 跨站 POST 请求：**不携带** Cookie
+- ❌ 跨站 iframe、图片、AJAX：**不携带** Cookie
+
+#### 9.3.2 CORS 配置
+
+**文件**: `api/server/cors_middleware.go:12-55`
+
+```go
+func CORSMiddleware(devMode bool) mux.MiddlewareFunc {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+            if devMode {
+                // 开发模式：允许任意来源
+                w.Header().Set("Access-Control-Allow-Origin", req.Header.Get("origin"))
+            } else {
+                // 生产模式：仅允许 PHOTOVIEW_UI_ENDPOINT
+                uiEndpoint := utils.UiEndpointUrl()
+                if uiEndpoint != nil {
+                    w.Header().Set("Access-Control-Allow-Origin",
+                        uiEndpoint.Scheme+"://"+uiEndpoint.Host)
+                }
+            }
+
+            w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            w.Header().Set("Access-Control-Allow-Headers",
+                "authorization, content-type, content-length, TokenPassword")
+            w.Header().Set("Access-Control-Allow-Credentials", "true")
+        })
+    }
+}
+```
+
+#### 9.3.3 WebSocket 跨站防护
+
+**文件**: `api/server/websocket.go:12-47`
+
+```go
+func WebsocketUpgrader(devMode bool) websocket.Upgrader {
+    return websocket.Upgrader{
+        CheckOrigin: func(r *http.Request) bool {
+            if devMode {
+                return true  // 开发模式允许任意来源
+            } else {
+                uiEndpoint := utils.UiEndpointUrl()
+                if uiEndpoint == nil || r.Header.Get("origin") == "" {
+                    return true
+                }
+                originURL, _ := url.Parse(r.Header.Get("origin"))
+                return isUIOnSameHost(uiEndpoint, originURL)
+            }
+        },
+    }
+}
+```
+
+#### 9.3.4 CSRF 防护协同机制
+
+```
+CSRF 防护三层协同
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│  第一层：SameSite=Lax Cookie（被动防护）                              │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │ 攻击者站点 evil.com 发起跨站 POST 到 photoview.com/api/graphql  │ │
+│  │ → SameSite=Lax 阻止 auth-token Cookie 被携带                     │ │
+│  │ → auth.Middleware 查不到 Cookie → user == nil                     │ │
+│  │ → GraphQL directive @isAuthorized 返回 "unauthorized"            │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  第二层：CORS Origin 校验（主动防护）                                │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │ 跨站请求 Origin: evil.com 到达服务器                              │ │
+│  │ → 生产模式下 Origin 必须精确匹配 PHOTOVIEW_UI_ENDPOINT            │ │
+│  │ → 不匹配则不设置 Access-Control-Allow-Origin                     │ │
+│  │ → 浏览器拦截响应，前端拿不到数据                                  │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  第三层：WebSocket Origin 校验                                      │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │ 跨站 WebSocket 握手请求 Origin: evil.com                         │ │
+│  │ → CheckOrigin 校验不通过                                         │ │
+│  │ → 服务端直接拒绝连接升级，返回 403                                │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.3.5 CSRF 防护的例外
+
+1. **HTTP GET 请求**：SameSite=Lax 允许顶级导航的 GET 请求携带 Cookie
+   - 但 `shareToken` 和 `shareTokenValidatePassword` 是 Query，不是 Mutation，无法修改数据
+   - 媒体访问 `/photo/{name}` 是 GET，但需要 `?token=` Query 参数，攻击者无法伪造有效 token
+
+2. **`credentials: 'include'`**：
+   - **文件**: `ui/src/apolloClient.ts:26-29`
+   ```typescript
+   const httpLink = new HttpLink({
+     uri: GRAPHQL_ENDPOINT,
+     credentials: 'include',  // 允许跨站请求携带 Cookie（配合 CORS 使用）
+   })
+   ```
+   - 这是为了支持前端部署在不同域名（如 CDN）的场景
+   - 但 CORS 中间件严格限制了 Origin，只有白名单域名才能实际生效
+
+#### 9.3.6 OIDC 集成对 CSRF 防护的影响
+
+集成反向代理 OIDC 后，CSRF 防护栈变化：
+
+| 场景 | 原生 Photoview | 反向代理 OIDC 模式 |
+|------|---------------|-------------------|
+| SameSite Cookie | Lax | Lax（不变） |
+| CORS Origin 校验 | UI_ENDPOINT | 需要允许反向代理域名 |
+| WebSocket Origin 校验 | UI_ENDPOINT | 需要允许反向代理域名 |
+| 新增风险 | - | 反向代理本身可能引入 CSRF 漏洞 |
+
+**注意**：反向代理（如 Nginx、Traefik）在转发请求时会修改 Origin header，需要确保：
+1. 反向代理正确传递 `Origin` header
+2. 反向代理自身有 CSRF 防护
+3. `PHOTOVIEW_UI_ENDPOINT` 设置为反向代理的域名
+
+### 9.4 现有安全机制
 
 - 密码使用 bcrypt 哈希存储（cost=12）
 - AccessToken 为 24 位加密安全随机字符串
 - Cookie 使用 `SameSite: Lax` 防止 CSRF
 - 所有媒体资源访问都经过鉴权中间件
 - Share Token 密码同样使用 bcrypt 哈希
+- CORS Origin 严格校验
+- WebSocket Origin 严格校验
 
 ---
 
@@ -910,8 +1302,15 @@ extend type Mutation {
 | 认证中间件（Cookie 校验） | `api/graphql/auth/auth.go` |
 | Token Dataloader（过期检查） | `api/dataloader/userLoader.go` |
 | 用户名密码登录 Resolver | `api/graphql/resolvers/user.go` |
+| 更新用户/密码 Resolver | `api/graphql/resolvers/user.go:110-145` |
 | Share Token Resolver | `api/graphql/resolvers/share_token.go` |
 | Share Token Actions | `api/graphql/models/actions/share_token_actions.go` |
+| 用户操作 Actions | `api/graphql/models/actions/user_actions.go` |
+| 通知订阅 Resolver | `api/graphql/resolvers/notification.go` |
+| 通知广播中心 | `api/graphql/notification/notification.go` |
+| GraphQL 端点配置 | `api/graphql/endpoint/graphql_endpoint.go` |
+| WebSocket 升级器与 Origin 校验 | `api/server/websocket.go` |
+| CORS 中间件 | `api/server/cors_middleware.go` |
 | 媒体/相册 HTTP 鉴权 | `api/routes/authenticate_routes.go` |
 | 照片路由 | `api/routes/photos.go` |
 | 下载路由 | `api/routes/downloads.go` |
@@ -919,12 +1318,14 @@ extend type Mutation {
 | 前端登录页 | `ui/src/Pages/LoginPage/LoginPage.tsx` |
 | Share 页面 | `ui/src/Pages/SharePage/SharePage.tsx` |
 | Share 密码保护页 | `ui/src/Pages/SharePage/PasswordProtectedShare.tsx` |
+| 通知订阅 Hook | `ui/src/components/messages/SubscriptionsHook.ts` |
 | 认证 Cookie 辅助函数 | `ui/src/helpers/authentication.ts` |
 | 路由与 Logout 页面 | `ui/src/components/routes/Routes.tsx` |
 | 受保护路由组件 | `ui/src/components/routes/AuthorizedRoute.tsx` |
 | 用户设置页 Logout 按钮 | `ui/src/Pages/SettingsPage/UserPreferences.tsx` |
 | GraphQL Schema（用户） | `api/graphql/resolvers/user.graphql` |
 | GraphQL Schema（Share） | `api/graphql/resolvers/share_token.graphql` |
+| GraphQL Schema（通知） | `api/graphql/resolvers/notification.graphql` |
 | GraphQL 认证指令 | `api/graphql/directive.go` |
 | 服务器入口（中间件注册） | `api/server.go` |
 | 环境变量 | `api/utils/environment_variables.go` |
@@ -934,14 +1335,40 @@ extend type Mutation {
 
 ## 十一、总结
 
-Photoview 的代码架构为 OIDC 集成提供了良好的基础，但在 Token 生命周期和多设备管理上有明显缺失：
+Photoview 的代码架构为 OIDC 集成提供了良好的基础，但在 Token 生命周期、多设备管理、WebSocket 安全上有明显缺失：
 
 ### 已有的基础能力
 1. ✅ **用户模型支持无密码用户**：`Password *string` 字段设计是 OIDC 集成的关键
-2. ✅ **三条鉴权入口完全解耦**：用户名密码登录、Share 匿名访问、反向代理 Header 认证互补干扰
+2. ✅ **三条鉴权入口完全解耦**：用户名密码登录、Share 匿名访问、反向代理 Header 认证互不干扰
 3. ✅ **统一的会话机制**：基于 `auth-token` Cookie 的认证对所有登录方式透明
 4. ✅ **Share 链接独立鉴权体系**：独立的 Token、密码、过期时间、路由保护
 5. ✅ **清晰的权限体系**：`IsAuthorized` 和 `IsAdmin` 指令与认证方式解耦
+6. ✅ **CSRF 三层防护协同**：SameSite Cookie + CORS Origin 校验 + WebSocket Origin 校验
+7. ✅ **通知订阅体系完整**：WebSocket 订阅用于扫描进度等实时通知
+
+### 本次补充的核心发现
+
+#### WebSocket 订阅 Token 失效
+- ❌ **InitFunc 只在连接建立时校验一次 token**，之后永不重新校验
+- ❌ **KeepAlive 10 秒心跳不做 token 校验**，仅用于保持连接
+- ❌ **服务端不会主动断开已过期 token 的连接**
+- ❌ **修改密码、吊销 token 对已建立的 WebSocket 连接完全无影响**
+- ✅ **唯一失效时机**：连接断开后的重连阶段才会重新校验 token
+- ⚠️ **最长会话窗口**：14 天 + WebSocket 连接保持时间（理论上无限期）
+
+#### Cookie SameSite 与 CSRF 防护协同
+- ✅ **SameSite=Lax**：阻止跨站 POST 请求携带 Cookie，是 CSRF 的第一道防线
+- ✅ **CORS 严格校验 Origin**：生产模式下只允许 `PHOTOVIEW_UI_ENDPOINT` 域名
+- ✅ **WebSocket CheckOrigin**：同样校验 Origin，防止跨站 WebSocket 劫持
+- ✅ **三层防护协同**：任意一层不通过都会阻止攻击
+- ⚠️ **OIDC 集成注意**：反向代理转发时需正确传递 Origin header，需将 `PHOTOVIEW_UI_ENDPOINT` 设为反向代理域名
+
+#### 修改密码不失效旧 Token（安全漏洞）
+- ❌ **`UpdateUser` 只 UPDATE `users` 表**，完全不触及 `access_tokens` 表
+- ❌ 该用户的**所有设备**上的 token 继续有效直到 14 天自然过期
+- ❌ 已建立的 WebSocket 连接继续有效直到断开
+- ✅ **修复方案明确**：在事务中更新密码后追加 `DELETE FROM access_tokens WHERE user_id = ?`
+- ✅ **提供了完整的改造代码示例**和缺失的 Token 管理 API 建议
 
 ### 需要补齐的能力
 1. ⚠️ **缺少 OIDC 中间件**：需要自行实现反向代理 Header 的解析和自动登录逻辑
@@ -950,6 +1377,8 @@ Photoview 的代码架构为 OIDC 集成提供了良好的基础，但在 Token 
 4. ❌ **没有会话管理功能**：无法查看、吊销特定设备的登录会话
 5. ❌ **没有过期 Token 清理任务**：AccessToken 和 ShareToken 过期后永远留在数据库
 6. ❌ **Logout 只清前端 Cookie**：不影响服务端和其他设备的会话
-7. ❌ **修改密码不失效旧 Token**：安全漏洞，密码泄露后旧 token 仍可使用到 14 天
+7. ❌ **修改密码不失效旧 Token**：安全漏洞，需在 UpdateUser 中追加 DELETE access_tokens
+8. ❌ **WebSocket 无 token 周期校验**：需在心跳或 context 中绑定过期时间
+9. ❌ **OIDC Logout 未联动**：清除本地 Cookie 后需同步跳转到 OIDC Provider 登出
 
 OIDC 与本地账号鉴权是**并行关系**，通过 `Password` 字段是否为 `nil` 来区分。Share 链接是完全独立的第三条鉴权路径。三条路径最终都依赖相同的媒体访问控制层（`authenticateMedia`/`authenticateAlbum`），但在入口认证和会话保持上各自独立。
