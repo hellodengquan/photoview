@@ -1383,7 +1383,572 @@ OIDC 规范定义了 **Back-Channel Logout** 机制：当用户在 OIDC Provider
 
 ---
 
-## 八、GraphQL 认证指令
+## 八、GraphQL Mutation 鉴权错误返回路径
+
+### 8.1 鉴权失败的三层触发点
+
+Photoview 的 GraphQL 请求有三个可能触发鉴权失败的位置，各自有不同的返回路径：
+
+```
+鉴权失败返回路径全景
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  入口：HTTP 请求到达                                                     │
+│  POST /api/graphql                                                       │
+│  Cookie: auth-token=xxx                                                  │
+└──────────────────────────────┬────────────────────────────────────────────┘
+                               │
+         ┌─────────────────────┼─────────────────────┐
+         ▼                     ▼                     ▼
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ auth.Middleware  │  │  GraphQL         │  │  Resolver        │
+│ (HTTP 层)        │  │  directive       │  │  内部鉴权        │
+│                  │  │  (@isAdmin,      │  │  (手动检查)      │
+│                  │  │   @isAuthorized) │  │                  │
+└────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
+         │                     │                     │
+         ▼                     ▼                     ▼
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ HTTP 401         │  │ GraphQL errors   │  │ GraphQL errors   │
+│ text/plain       │  │  array           │  │  array           │
+│ "invalid authori│  │ {"errors":[{"mes│  │ {"errors":[{"mes│
+│ zation token"}  │  │ sage":"unauthori│  │ sage":"user must │
+│                  │  │ zed","path":["up│  │ be admin","path":│
+│                  │  │ dateUser"]}]}    │  │ ["updateUser"]}  │
+└────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
+         │                     │                     │
+         └─────────────────────┼─────────────────────┘
+                               ▼
+                    ┌──────────────────┐
+                    │ 前端 apolloClient│
+                    │ onError link     │
+                    │ - message ==     │
+                    │   "unauthorized" │
+                    │   → clearToken() │
+                    │ - networkError   │
+                    │   → clearToken() │
+                    └──────────────────┘
+```
+
+### 8.2 第一层：auth.Middleware 失败
+
+**文件**: `api/graphql/auth/auth.go:30-70`
+
+```go
+func Middleware(db *gorm.DB) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            if tokenCookie, err := r.Cookie("auth-token"); err == nil {
+                loaders := dataloader.For(r.Context())
+                user, err := loaders.UserFromAccessToken.Load(tokenCookie.Value)
+                
+                // 情况 A：Dataloader 返回错误（数据库失败）
+                if err != nil {
+                    http.Error(w, INVALID_AUTH_TOKEN, http.StatusUnauthorized)
+                    return
+                }
+                
+                // 情况 B：Token 不存在或已过期（返回 nil user）
+                if user == nil {
+                    http.Error(w, INVALID_AUTH_TOKEN, http.StatusUnauthorized)
+                    return
+                }
+                
+                ctx := AddUserToContext(r.Context(), user)
+                r = r.WithContext(ctx)
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+```
+
+**返回格式**（HTTP 401 Unauthorized）：
+```
+HTTP/1.1 401 Unauthorized
+Content-Type: text/plain; charset=utf-8
+Content-Length: 29
+
+invalid authorization token
+```
+
+**前端处理**（`ui/src/apolloClient.ts:104-107`）：
+```typescript
+if (networkError) {
+    console.log(`[Network error]: ${JSON.stringify(networkError)}`)
+    clearTokenCookie()  // ← 直接清除 Cookie
+}
+```
+这被识别为 `networkError`（HTTP 状态码 401），**立即清除 Cookie**，但**不会**自动重定向，需等下一次路由跳转时触发。
+
+### 8.3 第二层：GraphQL Directive 失败
+
+**文件**: `api/graphql/directive.go:11-27`
+
+```go
+func IsAdmin(ctx context.Context, obj interface{}, next graphql.Resolver) (res interface{}, err error) {
+    user := auth.UserFromContext(ctx)
+    if user == nil || user.Admin == false {
+        return nil, errors.New("user must be admin")
+    }
+    return next(ctx)
+}
+
+func IsAuthorized(ctx context.Context, obj interface{}, next graphql.Resolver) (res interface{}, err error) {
+    user := auth.UserFromContext(ctx)
+    if user == nil {
+        return nil, auth.ErrUnauthorized  // "unauthorized"
+    }
+    return next(ctx)
+}
+```
+
+**返回格式**（HTTP 200 OK，但带有 errors 数组）：
+```json
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "errors": [
+    {
+      "message": "unauthorized",
+      "path": ["updateUser"],
+      "extensions": {
+        "code": "INTERNAL_SERVER_ERROR"
+      }
+    }
+  ],
+  "data": null
+}
+```
+
+**gqlgen 内部处理**：
+- directive 返回 `(nil, err)` 时，gqlgen 自动将错误包装成 `GraphQLError`
+- `path` 字段包含字段路径（如 `["updateUser"]`）
+- HTTP 状态码始终为 **200 OK**（GraphQL 规范）
+
+**前端处理**（`ui/src/apolloClient.ts:97-101`）：
+```typescript
+if (graphQLErrors.find(x => x.message == 'unauthorized')) {
+    console.log('Unauthorized, clearing token cookie')
+    clearTokenCookie()
+    // location.reload()  // ← 被注释掉了！
+}
+```
+**关键发现**：`location.reload()` 被注释掉了，所以只会清除 Cookie，**不会立即刷新页面或重定向**。
+
+### 8.4 第三层：Resolver 内部手动鉴权失败
+
+**文件**: `api/graphql/resolvers/share_token.go:98-103`
+
+```go
+// 验证 Share Token 密码
+if token.Password != nil {
+    if err := bcrypt.CompareHashAndPassword([]byte(*token.Password), []byte(*credentials.Password)); err != nil {
+        return nil, errors.New("unauthorized")
+    }
+}
+```
+
+**文件**: `api/graphql/resolvers/album.go:120-122`
+
+```go
+// 检查用户是否有权访问该相册
+hasAccess, err := user.OwnsAlbum(db, album)
+if !hasAccess {
+    return nil, errors.New("unauthorized")
+}
+```
+
+这一层返回格式与 directive 完全相同（因为都是通过 gqlgen 的错误处理链路），前端处理逻辑也相同。
+
+### 8.5 鉴权错误格式对比
+
+| 触发层 | HTTP 状态码 | Content-Type | 错误消息 | 前端清除 Cookie | 前端重定向 |
+|--------|------------|--------------|---------|----------------|-----------|
+| auth.Middleware | 401 | text/plain | "invalid authorization token" | ✅（networkError） | ❌ |
+| @isAuthorized directive | 200 | application/json | "unauthorized" | ✅（匹配 message） | ❌（reload 被注释） |
+| @isAdmin directive | 200 | application/json | "user must be admin" | ❌ | ❌ |
+| Resolver 内部 | 200 | application/json | "unauthorized" | ✅（匹配 message） | ❌ |
+
+**注意**：`@isAdmin` 失败时返回的错误消息是 `"user must be admin"`，**不会**触发前端 `clearTokenCookie()`，因为前端只匹配 `"unauthorized"` 字符串。这意味着管理员会话失效后，如果访问 `@isAdmin` 保护的接口，只会显示错误消息但不会自动注销。
+
+---
+
+## 九、UpdateUser 接口 Self vs Admin 权限分流
+
+### 9.1 Schema 层面的权限定义
+
+**文件**: `api/graphql/resolvers/user.graphql:72-78`
+
+```graphql
+extend type Mutation {
+  "Update a user, fields left as `null` will not be changed"
+  updateUser(
+    id: ID!
+    username: String
+    password: String
+    admin: Boolean
+  ): User! @isAdmin
+}
+```
+
+**关键发现**：`updateUser` 直接挂了 `@isAdmin` directive，意味着：
+- ❌ **普通用户无法调用此接口**，即使更新的是自己的信息
+- ❌ **没有 `@isAuthorized` 版本的 UpdateUser** 供普通用户修改自己的密码
+- ✅ **只有管理员能调用**，包括修改其他用户的信息
+
+### 9.2 UpdateUser Resolver 实现（无 Self vs Admin 分流）
+
+**文件**: `api/graphql/resolvers/user.go:110-145`
+
+```go
+func (r *mutationResolver) UpdateUser(ctx context.Context, id int, username *string, password *string, admin *bool) (*models.User, error) {
+    db := r.DB(ctx)
+
+    if username == nil && password == nil && admin == nil {
+        return nil, errors.New("no updates requested")
+    }
+
+    var user models.User
+    if err := db.First(&user, id).Error; err != nil {
+        return nil, err
+    }
+
+    if username != nil {
+        user.Username = *username
+    }
+
+    if password != nil {
+        hashedPassBytes, err := bcrypt.GenerateFromPassword([]byte(*password), 12)
+        if err != nil {
+            return nil, err
+        }
+        hashedPass := string(hashedPassBytes)
+        user.Password = &hashedPass
+    }
+
+    if admin != nil {
+        user.Admin = *admin
+    }
+
+    if err := db.Save(&user).Error; err != nil {
+        return nil, fmt.Errorf("failed to update user: %w", err)
+    }
+
+    return &user, nil
+}
+```
+
+### 9.3 权限分析：三种调用场景
+
+```
+UpdateUser 调用场景分析
+
+场景 A：管理员调用 updateUser(userId=5) 修改其他用户
+┌─────────────────────────────────────────────────────────────┐
+│  @isAdmin directive 检查通过（调用者是 admin）                │
+│  Resolver 按 id 查询用户，更新字段                           │
+│  成功 ✅：管理员可以修改任何用户的 username、password、admin  │
+└─────────────────────────────────────────────────────────────┘
+
+场景 B：管理员调用 updateUser(userId=自己ID) 修改自己
+┌─────────────────────────────────────────────────────────────┐
+│  @isAdmin directive 检查通过（调用者是 admin）                │
+│  Resolver 按 id 查询用户（管理员自己），更新字段              │
+│  成功 ✅：没问题，但这不是普通用户的修改路径                   │
+└─────────────────────────────────────────────────────────────┘
+
+场景 C：普通用户调用 updateUser(userId=自己ID) 修改自己
+┌─────────────────────────────────────────────────────────────┐
+│  @isAdmin directive 检查失败（调用者不是 admin）              │
+│  返回错误：{ "message": "user must be admin" }              │
+│  失败 ❌：普通用户无法通过此接口修改自己的信息                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 9.4 普通用户如何修改自己的信息
+
+普通用户修改自己信息的路径是通过 **`changeUserPreferences`** mutation（但只能改语言偏好）：
+
+**文件**: `api/graphql/resolvers/user.graphql:98-99`
+
+```graphql
+extend type Mutation {
+  "Change user preferences for the logged in user"
+  changeUserPreferences(language: String): UserPreferences! @isAuthorized
+}
+```
+
+**文件**: `api/graphql/resolvers/user.go:247-273`
+
+```go
+func (r *mutationResolver) ChangeUserPreferences(ctx context.Context, language *string) (*models.UserPreferences, error) {
+    db := r.DB(ctx)
+    user := auth.UserFromContext(ctx)  // 从 context 取当前用户，不需要 id 参数
+    if user == nil {
+        return nil, auth.ErrUnauthorized
+    }
+    // ... 只修改 language
+    return &userPref, nil
+}
+```
+
+### 9.5 权限分流的缺失与问题
+
+| 功能 | 普通用户 | 管理员 |
+|------|---------|-------|
+| 修改自己的密码 | ❌ 无接口 | ✅ updateUser |
+| 修改自己的用户名 | ❌ 无接口 | ✅ updateUser |
+| 修改自己的语言偏好 | ✅ changeUserPreferences | ✅ changeUserPreferences |
+| 修改他人的密码 | ❌ | ✅ updateUser |
+| 修改他人的 admin 权限 | ❌ | ✅ updateUser |
+| 吊销自己的 token | ❌ | ❌（UpdateUser 不清除 token） |
+
+**问题总结**：
+1. ❌ 普通用户无法修改自己的密码，必须找管理员
+2. ❌ 修改密码不失效旧 token（前面已分析的安全漏洞）
+3. ❌ `@isAdmin` 错误消息 `"user must be admin"` 不会触发前端 `clearTokenCookie()`
+4. ❌ 普通用户想改密码只能通过 `AuthorizeUser` 重新登录？不，那是登录不是改密码
+
+### 9.6 建议的权限分流改造
+
+```go
+// 方案 1：新增 updateCurrentUser mutation（推荐）
+extend type Mutation {
+  # 普通用户修改自己的信息
+  updateCurrentUser(
+    username: String
+    password: String
+  ): User! @isAuthorized
+}
+
+// Resolver 实现
+func (r *mutationResolver) UpdateCurrentUser(ctx context.Context, username *string, password *string) (*models.User, error) {
+    db := r.DB(ctx)
+    currentUser := auth.UserFromContext(ctx)
+    if currentUser == nil {
+        return nil, auth.ErrUnauthorized
+    }
+    
+    var user models.User
+    if err := db.First(&user, currentUser.ID).Error; err != nil {
+        return nil, err
+    }
+    
+    // 只能改自己的 username 和 password，不能改 admin 权限
+    // ... 更新字段 ...
+    
+    // 同时清除该用户所有 access tokens（安全最佳实践）
+    if password != nil {
+        db.Where("user_id = ?", user.ID).Delete(&models.AccessToken{})
+    }
+    
+    return &user, nil
+}
+```
+
+---
+
+## 十、Dataloader 缓存对刚吊销 token 的延迟感知
+
+### 10.1 Dataloader 架构总览
+
+Photoview 使用 vektah/dataloaden 生成的 Dataloader，架构如下：
+
+```
+Dataloader 生命周期
+┌─────────────────────────────────────────────────────────────────┐
+│  每个 HTTP 请求创建新的 Loaders 实例                              │
+│  文件: api/dataloader/loaders.go:23-40                            │
+│                                                                   │
+│  dataloader.Middleware(db):                                        │
+│    ctx := context.WithValue(r.Context(), loadersKey, &Loaders{    │
+│      UserFromAccessToken: NewUserLoaderByToken(db),               │
+│      MediaThumbnail:      NewThumbnailMediaURLLoader(db),         │
+│      ...                                                           │
+│    })                                                              │
+│    r = r.WithContext(ctx)                                          │
+│    next.ServeHTTP(w, r)                                            │
+└──────────────────────┬────────────────────────────────────────────┘
+                       │
+┌──────────────────────▼────────────────────────────────────────────┐
+│  Loaders 实例包含：                                                 │
+│  - UserLoader: 按 token 查用户（我们关注的）                        │
+│  - 每个 Loader 有自己的 cache、batch、mutex                        │
+│  - Loaders 实例仅在当前 HTTP 请求有效，请求结束即销毁               │
+└──────────────────────┬────────────────────────────────────────────┘
+                       │
+┌──────────────────────▼────────────────────────────────────────────┐
+│  auth.Middleware 调用 loaders.UserFromAccessToken.Load(token)     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键性质 1**：Loaders 是 **per-request 实例**，每个 HTTP 请求都创建全新的 Dataloader，请求结束即销毁。缓存不会跨请求共享。
+
+### 10.2 UserLoader 缓存实现细节
+
+**文件**: `api/dataloader/gen_userloader.go:33-55`
+
+```go
+type UserLoader struct {
+    fetch    func(keys []string) ([]*models.User, []error)
+    wait     time.Duration   // 5ms
+    maxBatch int             // 100
+
+    // INTERNAL
+    cache map[string]*models.User  // ← 缓存！key=token, value=User
+    batch *userLoaderBatch
+    mu    sync.Mutex
+}
+```
+
+**Load 流程**（`api/dataloader/gen_userloader.go:73-112`）：
+
+```go
+func (l *UserLoader) LoadThunk(key string) func() (*models.User, error) {
+    l.mu.Lock()
+    
+    // Step 1：先查 cache
+    if it, ok := l.cache[key]; ok {
+        l.mu.Unlock()
+        return func() (*models.User, error) {
+            return it, nil  // 直接返回缓存结果，不查数据库
+        }
+    }
+    
+    // Step 2：cache miss，加入 batch，等待 5ms 窗口
+    if l.batch == nil {
+        l.batch = &userLoaderBatch{done: make(chan struct{})}
+    }
+    batch := l.batch
+    pos := batch.keyIndex(l, key)
+    l.mu.Unlock()
+    
+    // Step 3：等待 batch 完成，然后写 cache
+    return func() (*models.User, error) {
+        <-batch.done
+        // ... 从 batch.data 取结果
+        if err == nil {
+            l.mu.Lock()
+            l.unsafeSet(key, data)  // ← 写入 cache
+            l.mu.Unlock()
+        }
+        return data, err
+    }
+}
+```
+
+### 10.3 Dataloader 配置
+
+**文件**: `api/dataloader/userLoader.go:10-71`
+
+```go
+func NewUserLoaderByToken(db *gorm.DB) *UserLoader {
+    return &UserLoader{
+        maxBatch: 100,
+        wait:     5 * time.Millisecond,  // ← 5ms 等待窗口
+        fetch: func(tokens []string) ([]*models.User, []error) {
+            // 只查 expire > now 的 token
+            var accessTokens []*models.AccessToken
+            err := db.Where("expire > ?", time.Now()).Where("value IN (?)", tokens).Find(&accessTokens).Error
+            // ... 构建结果
+        },
+    }
+}
+```
+
+### 10.4 Token 吊销后的感知延迟场景
+
+```
+Token 吊销的三种场景与感知延迟
+
+场景 A：吊销后发起新的 HTTP 请求
+┌─────────────────────────────────────────────────────────────┐
+│  时间线：                                                      │
+│  t0: DELETE FROM access_tokens WHERE value = 'abc'            │
+│  t1: 新 HTTP 请求到达 → 创建全新 Loaders → cache 为空          │
+│  t2: auth.Middleware → Load(token='abc') → cache miss         │
+│  t3: fetch SQL 查询 → WHERE expire > now AND value='abc'     │
+│  t4: SQL 返回空集 → result[i]=nil → 返回 401                 │
+│                                                               │
+│  ⚡ 感知延迟：5ms (batch wait) + SQL 查询时间                  │
+│  ✅ 效果：新请求立即感知到 token 已吊销                        │
+└─────────────────────────────────────────────────────────────┘
+
+场景 B：同一个 HTTP 请求内多次调用 Load 同一个 token（缓存命中）
+┌─────────────────────────────────────────────────────────────┐
+│  时间线：                                                      │
+│  t0: auth.Middleware → Load('abc') → cache miss → fetch →    │
+│      SQL 返回 user → 写入 cache['abc'] = user                 │
+│  t1: DELETE access_tokens WHERE value = 'abc'                 │
+│  t2: 同一个 HTTP 请求内，某个 resolver 再次调用 Load('abc')   │
+│  t3: cache hit! → 直接返回 user，不查数据库                   │
+│                                                               │
+│  ⚡ 感知延迟：当前 HTTP 请求期间完全无感知，直到下一次请求      │
+│  ⚠️  注意：同一请求内 Dataloader 缓存不会失效                  │
+│  ❌ 影响：在同一个 GraphQL 请求的多个 resolver 中，吊销无效    │
+└─────────────────────────────────────────────────────────────┘
+
+场景 C：同一个 GraphQL 请求内的多个 resolver 共享 context
+┌─────────────────────────────────────────────────────────────┐
+│  复杂 GraphQL 查询可能触发多个 resolver：                      │
+│  query {                                                      │
+│    myUser { id username }                                     │
+│    myAlbums { id title photos { url } }                       │
+│  }                                                            │
+│  这两个 resolver 可能在不同 goroutine 中执行，共享同一个       │
+│  context 和同一个 Dataloader 实例                              │
+│                                                               │
+│  如果 myUser resolver 先 Load('abc') 写入缓存，               │
+│  然后其他 goroutine 刚好 DELETE 了这个 token，                 │
+│  myAlbums resolver 再 Load('abc') 会命中缓存，拿到已吊销的   │
+│  token 对应的 user                                            │
+│                                                               │
+│  ✅ 实际风险：很低，因为 auth.Middleware 已在请求开始时验证过   │
+│     且 HTTP 请求通常 <1s                                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 10.5 缓存补偿机制的缺失
+
+Dataloader 有 `Clear(key)` 和 `Prime(key, value)` 方法，但 Photoview **完全没有使用**：
+
+**文件**: `api/dataloader/gen_userloader.go:152-170`
+
+```go
+// Prime the cache with the provided key and value
+func (l *UserLoader) Prime(key string, value *models.User) bool { ... }
+
+// Clear the value at key from the cache
+func (l *UserLoader) Clear(key string) {
+    l.mu.Lock()
+    delete(l.cache, key)
+    l.mu.Unlock()
+}
+```
+
+**没有调用这些方法的代码**：
+- ❌ token 吊销后没有 `Clear(token)`
+- ❌ token 创建后没有 `Prime(token, user)`
+- ❌ 没有缓存失效机制（没有 TTL、没有主动刷新）
+
+### 10.6 实际影响与补偿建议
+
+| 场景 | 感知延迟 | 实际影响 |
+|------|---------|---------|
+| 新 HTTP 请求 | 5ms + SQL 时间 | 可忽略 |
+| 同一请求内多次 Load | 直到请求结束（通常 <1s） | 很低，因为 auth.Middleware 已验证 |
+| 主动注销后同请求其他 resolver | 直到请求结束 | 很低，通常注销后不会再有后续调用 |
+
+**补偿建议**：
+1. **无需修改**：在大多数场景下，per-request 的 Dataloader 架构足以保证吊销在新请求中立即生效
+2. **极端场景**：如果需要更强的一致性，可以在 DELETE access_tokens 后主动清除当前 Loaders 实例的缓存（但需要将 Loaders 暴露到 context 中）
+3. **最佳实践**：token 吊销是低频操作，且 5ms 延迟可以接受，不需要额外补偿
+
+---
+
+## 十一、GraphQL 认证指令
 
 **文件**: `api/graphql/directive.go`
 
@@ -1717,24 +2282,28 @@ CSRF 防护三层协同
 |---------|---------|
 | User 模型 | `api/graphql/models/user.go` |
 | AccessToken / ShareToken 模型 | `api/graphql/models/user.go` / `api/graphql/models/share_token.go` |
-| 认证中间件（Cookie 校验） | `api/graphql/auth/auth.go` |
-| Token Dataloader（过期检查） | `api/dataloader/userLoader.go` |
+| 认证中间件（Cookie 校验 + HTTP 401 返回） | `api/graphql/auth/auth.go` |
+| Token Dataloader（过期检查 + 缓存逻辑） | `api/dataloader/userLoader.go` |
+| Dataloader 生成代码（含缓存实现） | `api/dataloader/gen_userloader.go` |
+| Dataloader 中间件（per-request 实例） | `api/dataloader/loaders.go` |
 | 用户名密码登录 Resolver | `api/graphql/resolvers/user.go` |
-| 更新用户/密码 Resolver | `api/graphql/resolvers/user.go:110-145` |
+| 更新用户/密码 Resolver（@isAdmin 限管理员） | `api/graphql/resolvers/user.go:110-145` |
+| 改用户偏好 Resolver（@isAuthorized 普通用户可用） | `api/graphql/resolvers/user.go:247-273` |
 | Share Token Resolver | `api/graphql/resolvers/share_token.go` |
 | Share Token Actions | `api/graphql/models/actions/share_token_actions.go` |
 | 用户操作 Actions（含 DeleteUser） | `api/graphql/models/actions/user_actions.go` |
 | 通知订阅 Resolver | `api/graphql/resolvers/notification.go` |
 | 通知广播中心 | `api/graphql/notification/notification.go` |
-| GraphQL 端点配置 | `api/graphql/endpoint/graphql_endpoint.go` |
+| GraphQL 端点配置（Transport + Directive 注册） | `api/graphql/endpoint/graphql_endpoint.go` |
 | WebSocket 升级器与 Origin 校验 | `api/server/websocket.go` |
 | CORS 中间件 | `api/server/cors_middleware.go` |
 | Throttle 工具（仅用于扫描器） | `api/utils/throttle.go` |
 | 服务器入口（中间件注册链） | `api/server.go` |
+| GraphQL Directive（@isAdmin / @isAuthorized） | `api/graphql/directive.go` |
 | 媒体/相册 HTTP 鉴权 | `api/routes/authenticate_routes.go` |
 | 照片路由 | `api/routes/photos.go` |
 | 下载路由 | `api/routes/downloads.go` |
-| Apollo 错误处理（失效清除 Cookie） | `ui/src/apolloClient.ts` |
+| Apollo 错误处理（onError 清除 Cookie） | `ui/src/apolloClient.ts` |
 | 前端登录页 | `ui/src/Pages/LoginPage/LoginPage.tsx` |
 | Share 页面 | `ui/src/Pages/SharePage/SharePage.tsx` |
 | Share 密码保护页 | `ui/src/Pages/SharePage/PasswordProtectedShare.tsx` |
@@ -1743,10 +2312,9 @@ CSRF 防护三层协同
 | 路由与 Logout 页面 | `ui/src/components/routes/Routes.tsx` |
 | 受保护路由组件 | `ui/src/components/routes/AuthorizedRoute.tsx` |
 | 用户设置页 Logout 按钮 | `ui/src/Pages/SettingsPage/UserPreferences.tsx` |
-| GraphQL Schema（用户） | `api/graphql/resolvers/user.graphql` |
+| GraphQL Schema（用户 + 权限 directive） | `api/graphql/resolvers/user.graphql` |
 | GraphQL Schema（Share） | `api/graphql/resolvers/share_token.graphql` |
 | GraphQL Schema（通知） | `api/graphql/resolvers/notification.graphql` |
-| GraphQL 认证指令 | `api/graphql/directive.go` |
 | SiteInfo 模型 | `api/graphql/models/site_info.go` |
 | 环境变量 | `api/utils/environment_variables.go` |
 | Token 生成工具函数 | `api/utils/utils.go` |
@@ -1813,6 +2381,27 @@ Photoview 的代码架构为 OIDC 集成提供了良好的基础，但在 Token 
 - ✅ **修复方案明确**：在事务中更新密码后追加 `DELETE FROM access_tokens WHERE user_id = ?`
 - ✅ **提供了完整的改造代码示例**和缺失的 Token 管理 API 建议
 
+#### GraphQL Mutation 鉴权错误返回路径
+- ✅ **三层鉴权架构**：auth.Middleware（HTTP 层）→ GraphQL directive（字段层）→ Resolver 内部（业务层）
+- ✅ **第一层失败**：返回 HTTP 401 text/plain，前端识别为 networkError → 立即 clearTokenCookie()
+- ✅ **第二层失败**：返回 HTTP 200 application/json，errors 数组含 `"message": "unauthorized"` → 前端匹配 message → clearTokenCookie()
+- ❌ **`@isAdmin` 缺陷**：错误消息是 `"user must be admin"`，**不会**触发前端 clearTokenCookie()，管理员会话失效后仅显示错误不自动注销
+- ❌ **`location.reload()` 被注释**：清除 Cookie 后不会立即刷新或重定向，需等待下一次路由跳转
+
+#### UpdateUser 接口 Self vs Admin 权限分流
+- ❌ **`updateUser` 挂 `@isAdmin`**：普通用户**完全无法调用**，即使更新的是自己的信息
+- ❌ **普通用户无改密接口**：只能通过 `changeUserPreferences` 改语言，没有改密码/用户名的接口
+- ✅ **管理员全能**：可以修改任何用户的 username、password、admin 权限
+- ⚠️ **无分流逻辑**：Resolver 内部没有判断 `id == 当前用户 ID` 的逻辑，完全依赖 directive
+- ✅ **建议改造**：新增 `updateCurrentUser` mutation（@isAuthorized）供普通用户修改自己的密码
+
+#### Dataloader 缓存对吊销 token 的延迟感知
+- ✅ **per-request 架构**：每个 HTTP 请求创建全新 Loaders 实例，请求结束即销毁，缓存**不跨请求共享**
+- ✅ **新请求感知延迟**：5ms batch wait + SQL 查询时间，可忽略
+- ❌ **同一请求内缓存命中**：如果 auth.Middleware 已验证 token 并写入缓存，请求内其他 resolver 会命中缓存，即使中间 token 被吊销
+- ✅ **Clear()/Prime() 方法存在但未使用**：Dataloader 有缓存管理方法，但 Photoview 完全没有调用
+- ✅ **实际风险很低**：HTTP 请求通常 <1s，且 auth.Middleware 已在请求开始时验证过
+
 ### 需要补齐的能力
 1. ⚠️ **缺少 OIDC 中间件**：需要自行实现反向代理 Header 的解析和自动登录逻辑
 2. ⚠️ **缺少 OIDC 用户管理 UI**：当前只能通过 GraphQL API 创建无密码用户
@@ -1826,5 +2415,8 @@ Photoview 的代码架构为 OIDC 集成提供了良好的基础，但在 Token 
 10. ❌ **修改密码不失效旧 Token**：安全漏洞，需在 UpdateUser 中追加 DELETE access_tokens
 11. ❌ **WebSocket 无 token 周期校验**：需在心跳或 context 中绑定过期时间
 12. ❌ **OIDC Logout 未联动**：清除本地 Cookie 后需同步跳转到 OIDC Provider 登出
+13. ❌ **普通用户无法修改自己的密码**：`updateUser` 仅限管理员，需新增 `updateCurrentUser`
+14. ❌ **`@isAdmin` 错误不会触发自动注销**：错误消息不匹配 "unauthorized"，需统一错误代码
+15. ❌ **Dataloader Clear()/Prime() 未使用**：极端一致性场景下需要主动管理缓存
 
 OIDC 与本地账号鉴权是**并行关系**，通过 `Password` 字段是否为 `nil` 来区分。Share 链接是完全独立的第三条鉴权路径。三条路径最终都依赖相同的媒体访问控制层（`authenticateMedia`/`authenticateAlbum`），但在入口认证和会话保持上各自独立。
