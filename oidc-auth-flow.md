@@ -40,11 +40,55 @@ type AccessToken struct {
 }
 ```
 
+**关键特性**:
+- 每个 `AccessToken` 是独立记录，支持**多设备多会话**：同一用户可同时拥有多个有效 token
+- `OnDelete:CASCADE`：用户删除时关联 token 自动清除
+
+### 1.3 ShareToken 模型
+
+**文件**: `api/graphql/models/share_token.go:7-18`
+
+```go
+type ShareToken struct {
+    Model
+    Value    string     `gorm:"not null"`
+    OwnerID  int        `gorm:"not null;index"`
+    Owner    User       `gorm:"constraint:OnDelete:CASCADE;"`
+    Expire   *time.Time `gorm:"index"`     // 可空：nil 表示永不过期
+    Password *string                          // 可空：nil 表示无密码保护
+    AlbumID  *int   `gorm:"index"`
+    Album    *Album `gorm:"constraint:OnDelete:CASCADE;"`
+    MediaID  *int   `gorm:"index"`
+    Media    *Media `gorm:"constraint:OnDelete:CASCADE;"`
+}
+```
+
 ---
 
 ## 二、本地账号鉴权流程
 
-### 2.1 登录入口
+### 2.1 登录入口全景
+
+Photoview 存在**三条独立的登录/鉴权入口**，互不干扰：
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        鉴权入口总览                                        │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  入口 A: 用户名密码登录（已认证用户）                                      │
+│     LoginPage → authorizeUser mutation → GenerateAccessToken → Cookie    │
+│                                                                          │
+│  入口 B: Share 链接匿名访问（无需登录）                                    │
+│     /share/:token → shareToken query → 密码验证 → 媒体资源访问            │
+│                                                                          │
+│  入口 C: OIDC 反向代理登录（需新增中间件）                                 │
+│     X-Remote-User Header → 查询/创建无密码用户 → GenerateAccessToken     │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 入口 A：用户名密码登录
 
 #### 前端登录页面
 **文件**: `ui/src/Pages/LoginPage/LoginPage.tsx`
@@ -74,7 +118,7 @@ func (r *mutationResolver) AuthorizeUser(ctx context.Context, username string, p
 }
 ```
 
-### 2.2 密码验证逻辑
+### 2.3 密码验证逻辑
 
 **文件**: `api/graphql/models/user.go:76-100`
 
@@ -95,7 +139,7 @@ func AuthorizeUser(db *gorm.DB, username string, password string) (*User, error)
 }
 ```
 
-### 2.3 用户注册
+### 2.4 用户注册
 
 **文件**: `api/graphql/models/user.go:102-124`
 
@@ -150,6 +194,11 @@ func (user *User) GenerateAccessToken(db *gorm.DB) (*AccessToken, error) {
 }
 ```
 
+**重要设计**:
+- 每次登录调用都会创建**新的 AccessToken 记录**，旧记录不会被删除
+- 这是多设备支持的基础：每次新设备登录都生成独立 token
+- 没有续期（refresh）机制，也没有滑动窗口
+
 ### 3.2 前端 Token 存储
 
 **文件**: `ui/src/helpers/authentication.ts`
@@ -166,9 +215,17 @@ export function saveTokenCookie(token: string) {
   }
   Cookies.set(AUTH_TOKEN_COOKIE_NAME, token, options)
 }
+
+export function clearTokenCookie() {
+  Cookies.remove(AUTH_TOKEN_COOKIE_NAME)
+}
+
+export function authToken() {
+  return Cookies.get(AUTH_TOKEN_COOKIE_NAME)
+}
 ```
 
-### 3.3 认证中间件
+### 3.3 认证中间件（Token 失效判定）
 
 **文件**: `api/graphql/auth/auth.go:31-70`
 
@@ -178,37 +235,143 @@ func Middleware(db *gorm.DB) func(http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
             if tokenCookie, err := r.Cookie("auth-token"); err == nil {
                 loaders := dataloader.For(r.Context())
-                user, err := loaders.UserFromAccessToken.Load(tokenCookie.Value)
-                
-                if user != nil {
-                    ctx := AddUserToContext(r.Context(), user)
-                    r = r.WithContext(ctx)
+                if loaders == nil {
+                    http.Error(w, INTERNAL_SERVER_ERROR, http.StatusInternalServerError)
+                    return
                 }
+
+                user, err := loaders.UserFromAccessToken.Load(tokenCookie.Value)
+                if err != nil {
+                    log.Error(r.Context(), "Error loading user from token", "error", err)
+                    http.Error(w, INVALID_AUTH_TOKEN, http.StatusUnauthorized)
+                    return
+                }
+
+                // 如果 user 为 nil，表示 token 不存在或已过期
+                if user == nil {
+                    log.Error(r.Context(), "Token not found in database")
+                    http.Error(w, INVALID_AUTH_TOKEN, http.StatusUnauthorized)
+                    return
+                }
+
+                ctx := AddUserToContext(r.Context(), user)
+                r = r.WithContext(ctx)
             }
+            // 注意：如果没有 auth-token cookie，直接放行（不返回 401）
+            // 是否需要认证由后续 GraphQL directive 决定
             next.ServeHTTP(w, r)
         })
     }
 }
 ```
 
-### 3.4 Token 验证（Dataloader）
+### 3.4 Token 验证与过期检查（Dataloader）
 
 **文件**: `api/dataloader/userLoader.go:10-71`
 
 ```go
 func NewUserLoaderByToken(db *gorm.DB) *UserLoader {
     return &UserLoader{
+        maxBatch: 100,
+        wait:     5 * time.Millisecond,
         fetch: func(tokens []string) ([]*models.User, []error) {
-            // 1. 查询有效的 access_tokens（未过期）
-            db.Where("expire > ?", time.Now()).Where("value IN (?)", tokens).Find(&accessTokens)
-            // 2. 查询关联的用户
-            // 3. 返回用户列表
+            // 关键：只查询 expire > now 的 token
+            // 过期 token 直接被过滤，返回 nil user
+            var accessTokens []*models.AccessToken
+            err := db.Where("expire > ?", time.Now()).Where("value IN (?)", tokens).Find(&accessTokens).Error
+
+            rows, err := db.Table("access_tokens").Select("distinct user_id").
+                Where("expire > ?", time.Now()).
+                Where("value IN (?)", tokens).Rows()
+
+            // ... 构建 userMap 和 tokenMap
+            // 对于过期或不存在的 token，result[i] = nil
+            result := make([]*models.User, len(tokens))
+            for i, token := range tokens {
+                accessToken, tokenFound := tokenMap[token]
+                if tokenFound {
+                    user, userFound := userMap[accessToken.UserID]
+                    if userFound {
+                        result[i] = user
+                    }
+                }
+            }
+            return result, nil
         },
     }
 }
 ```
 
-### 3.5 WebSocket 认证
+### 3.5 Token 过期 14 天后的处理（无自动续期机制）
+
+经过完整代码追踪，Photoview **没有任何 Token 自动续期机制**，完整的过期路径如下：
+
+```
+Token 过期时间线
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│  登录成功                                                           │
+│    │                                                                │
+│    ▼                                                                │
+│  GenerateAccessToken() → 数据库写入 expire = now + 14天            │
+│    │                                                                │
+│    ▼                                                                │
+│  前端保存 Cookie，expires = 14天                                    │
+│    │                                                                │
+│    ▼                                                                │
+│  每次请求 → auth.Middleware → Dataloader 检查 expire > now         │
+│    │                                                                │
+│    ├── 未过期（14天内）: user != nil → 正常访问                     │
+│    │                                                                │
+│    └── 已过期（超过14天）: user == nil → 返回 401 Unauthorized      │
+│             │                                                       │
+│             ▼                                                       │
+│        前端 apolloClient 错误处理                                    │
+│        文件: ui/src/apolloClient.ts:97-106                          │
+│                                                                     │
+│        const linkError = onError(({ graphQLErrors, networkError }) │
+│          if (graphQLErrors.find(x => x.message == 'unauthorized'))  │
+│            console.log('Unauthorized, clearing token cookie')       │
+│            clearTokenCookie()            // ← 清除本地 Cookie       │
+│            // 注意：没有 location.reload()，也不会重定向到登录页     │
+│          }                                                           │
+│          if (networkError) {                                         │
+│            clearTokenCookie()            // ← 清除本地 Cookie       │
+│          }                                                           │
+│        })                                                            │
+│             │                                                       │
+│             ▼                                                       │
+│        后续页面访问                                                  │
+│        文件: ui/src/components/routes/AuthorizedRoute.tsx:35-43     │
+│                                                                     │
+│        const AuthorizedRoute = ({ children }) => {                  │
+│          const token = authToken()                                   │
+│          if (!token) {                                               │
+│            return <Navigate to="/" />      // ← 重定向到根路径      │
+│          }                                                           │
+│          return <>{children}</>                                      │
+│        }                                                             │
+│             │                                                       │
+│             ▼                                                       │
+│        IndexPage 路由判断                                            │
+│        文件: ui/src/components/routes/Routes.tsx:139-145            │
+│                                                                     │
+│        const IndexPage = () => {                                     │
+│          const token = authToken()                                   │
+│          const dest = token ? '/timeline' : '/login'  // ← 跳转登录 │
+│          return <Navigate to={dest} />                               │
+│        }                                                             │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键结论**:
+- ❌ **没有 Token 续期（refresh token）机制**：14 天后必须重新登录
+- ❌ **没有滑动窗口续期**：每次请求不会刷新 token 的过期时间
+- ❌ **没有服务端主动清除过期 token**：过期的 AccessToken 记录永远留在数据库中
+- ✅ **失效路径是强制重新登录**：过期 → 401 → 清除 Cookie → 重定向登录页
+
+### 3.6 WebSocket 认证
 
 **文件**: `api/graphql/auth/auth.go:92-131`
 
@@ -216,19 +379,295 @@ func NewUserLoaderByToken(db *gorm.DB) *UserLoader {
 func AuthWebsocketInit() func(context.Context, transport.InitPayload) (context.Context, *transport.InitPayload, error) {
     return func(ctx context.Context, initPayload transport.InitPayload) (context.Context, *transport.InitPayload, error) {
         bearer, exists := initPayload["Authorization"].(string)
-        token, err := TokenFromBearer(&bearer)  // 解析 Bearer token
-        // ... 通过 dataloader 验证 token
+        if !exists {
+            return ctx, nil, nil  // 没有 token，返回不带 user 的 context
+        }
+
+        token, err := TokenFromBearer(&bearer)
+        // ... 通过 dataloader 验证 token（同样检查 expire）
         userCtx := context.WithValue(ctx, userCtxKey, user)
         return userCtx, nil, nil
     }
 }
 ```
 
+WebSocket 连接在初始化时完成一次 token 校验，**连接建立后不会重新校验 token**。即使 token 过期，已建立的 WebSocket 连接仍然有效，直到连接断开重连。
+
 ---
 
-## 四、OIDC 集成架构
+## 四、Share 链接与匿名访问独立鉴权流程
 
-### 4.1 典型部署架构
+### 4.1 Share Token 生成
+
+**文件**: `api/graphql/models/actions/share_token_actions.go:15-103`
+
+```go
+func AddMediaShare(db *gorm.DB, user *models.User, mediaID int, expire *time.Time, password *string) (*models.ShareToken, error) {
+    // 1. 验证用户拥有该媒体
+    err := db.Joins("Album").
+        Where("EXISTS (SELECT * FROM user_albums WHERE user_albums.album_id = Album.id AND user_albums.user_id = ?)", user.ID).
+        First(&media, mediaID).Error
+
+    // 2. 哈希密码（如果提供）
+    hashedPassword, err := hashSharePassword(password)
+
+    // 3. 生成 8 位随机 token（注意：比 AccessToken 的 24 位短）
+    shareToken := models.ShareToken{
+        Value:    utils.GenerateToken(),  // 文件: api/utils/utils.go:13-25
+        OwnerID:  user.ID,
+        Expire:   expire,    // 可空：nil = 永不过期
+        Password: hashedPassword,
+        MediaID:  &mediaID,
+    }
+    db.Create(&shareToken)
+    return &shareToken, nil
+}
+```
+
+### 4.2 Share 链接前端鉴权流程
+
+**文件**: `ui/src/Pages/SharePage/SharePage.tsx`
+
+Share 页面是完全独立的路由，**不经过 AuthorizedRoute，不需要登录**：
+
+```
+/share/:token 路由处理流程（Routes.tsx:78-80）
+│
+└── ▶ TokenRoute 组件（SharePage.tsx:154-201）
+    │
+    ├── Step 1: 检查是否有缓存的密码 Cookie
+    │         password = getSharePassword(token)
+    │         Cookie 名: share-token-pw-{token}
+    │
+    ├── Step 2: 调用 shareTokenValidatePassword query
+    │         （GraphQL: share_token.graphql:28-29）
+    │         验证 Share Token 是否有效、是否过期、密码是否正确
+    │
+    ├── Step 3: 结果分支
+    │   │
+    │   ├── share not found / share expired → 显示错误页面
+    │   │
+    │   ├── 需要密码但未提供 / 密码错误 → 显示 PasswordProtectedShare
+    │   │   （PasswordProtectedShare.tsx）
+    │   │     │
+    │   │     └── 用户输入密码 → saveSharePassword() 存 Cookie → refetch
+    │   │
+    │   └── 验证成功 → 进入 AuthorizedTokenRoute
+    │
+    └── Step 4: AuthorizedTokenRoute 组件（SharePage.tsx:95-147）
+        │
+        ├── 调用 shareToken query 获取完整信息（含媒体数据）
+        │
+        ├── 如果关联 Album → AlbumSharePage 组件
+        │   └── 相册内媒体通过 /api/photo/{name}?token={shareToken} 访问
+        │
+        └── 如果关联 Media → MediaSharePage 组件
+            └── 单张媒体通过 /api/photo/{name}?token={shareToken} 访问
+```
+
+### 4.3 Share Token GraphQL 验证
+
+**文件**: `api/graphql/resolvers/share_token.go:74-156`
+
+```go
+// 查询完整 Share 信息（包含媒体数据）
+func (r *queryResolver) ShareToken(ctx context.Context, credentials models.ShareTokenCredentials) (*models.ShareToken, error) {
+    var token models.ShareToken
+    r.DB(ctx).Preload(clause.Associations).Where("value = ?", credentials.Token).First(&token)
+
+    // 过期检查（客户端时间按 UTC 归一化）
+    now := time.Now()
+    fakeTime := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), 0, time.UTC)
+    if token.Expire != nil && fakeTime.After(*token.Expire) {
+        return nil, errors.New("share expired")
+    }
+
+    // 密码检查（如果设置了密码）
+    if token.Password != nil {
+        if err := bcrypt.CompareHashAndPassword([]byte(*token.Password), []byte(*credentials.Password)); err != nil {
+            return nil, errors.New("unauthorized")
+        }
+    }
+    return &token, nil
+}
+
+// 仅验证密码（用于前端判断是否显示密码输入框）
+func (r *queryResolver) ShareTokenValidatePassword(ctx context.Context, credentials models.ShareTokenCredentials) (bool, error) {
+    // ... 同样的过期检查和密码检查逻辑
+    // 返回 true/false 而不是 ShareToken 对象
+}
+```
+
+### 4.4 媒体资源访问的双重鉴权路径
+
+**文件**: `api/routes/authenticate_routes.go:19-155`
+
+媒体和相册下载的 HTTP 接口有两条并行的鉴权路径：
+
+```go
+func authenticateMedia(media *models.Media, db *gorm.DB, r *http.Request) (success bool, ...) {
+    user := auth.UserFromContext(r.Context())
+
+    if user != nil {
+        // 路径 1：已登录用户 —— 检查用户是否拥有该相册
+        ownsAlbum, err := user.OwnsAlbum(db, &album)
+        if !ownsAlbum {
+            return false, "invalid credentials", http.StatusForbidden, nil
+        }
+    } else {
+        // 路径 2：匿名用户 —— 检查 Share Token
+        if success, respMsg, respStatus, err := shareTokenFromRequest(db, r, &media.ID, &media.AlbumID); !success {
+            return success, respMsg, respStatus, err
+        }
+    }
+    return true, "success", http.StatusAccepted, nil
+}
+
+func shareTokenFromRequest(db *gorm.DB, r *http.Request, mediaID *int, albumID *int) (success bool, ...) {
+    // Step 1: 从 URL Query 读取 ?token=xxx
+    token := r.URL.Query().Get("token")
+    if token == "" {
+        return false, "unauthorized", http.StatusForbidden, errors.New("share token not provided")
+    }
+
+    // Step 2: 查询 share_tokens 表
+    db.Where("value = ?", token).First(&shareToken)
+
+    // Step 3: 检查过期
+    if shareToken.Expire != nil && time.Now().UTC().After(shareToken.Expire.UTC()) {
+        return false, "unauthorized", http.StatusForbidden, errors.New("invalid share token")
+    }
+
+    // Step 4: 检查密码（从 Cookie 读取 share-token-pw-{token}）
+    if shareToken.Password != nil {
+        tokenPasswordCookie, err := r.Cookie(fmt.Sprintf("share-token-pw-%s", shareToken.Value))
+        if err != nil {
+            return false, "unauthorized", http.StatusForbidden, ...
+        }
+        if err := bcrypt.CompareHashAndPassword([]byte(*shareToken.Password), []byte(tokenPasswordCookie.Value)); err != nil {
+            return false, "unauthorized", http.StatusForbidden, ...
+        }
+    }
+
+    // Step 5: 检查 token 是否关联该媒体/相册（含子相册递归检查）
+    // ...
+    return true, "", 0, nil
+}
+```
+
+**媒体资源路由的实际使用**:
+- 照片：`api/routes/photos.go:35` → `authenticateMedia()`
+- 视频：`api/routes/videos.go` → 同样的 `authenticateMedia()` 模式
+- 下载：`api/routes/downloads.go:31` → `authenticateAlbum()`
+
+### 4.5 Share 链接与主登录体系的关系
+
+| 维度 | 用户登录体系（auth-token） | Share 匿名体系（share token） |
+|-----|--------------------------|-------------------------------|
+| Cookie 名 | `auth-token` | `share-token-pw-{token}` |
+| Token 长度 | 24 位 | 8 位 |
+| 过期时间 | 固定 14 天 | 可选，nil 为永不过期 |
+| 密码保护 | 用户名密码（bcrypt） | 可选密码（bcrypt） |
+| 权限范围 | 用户拥有的所有相册 | 单个指定相册或单张媒体 |
+| 是否需要用户账号 | 是 | 否，完全匿名 |
+| GraphQL directive | `@isAuthorized` / `@isAdmin` | 无，resolver 内手动校验 |
+| 路由保护 | `AuthorizedRoute` 组件 | 无，SharePage 独立处理 |
+
+---
+
+## 五、Logout 销毁路径与多设备会话
+
+### 5.1 前端 Logout 流程
+
+**文件**: `ui/src/Pages/SettingsPage/UserPreferences.tsx:79-92`
+
+```typescript
+const LogoutButton = () => {
+  const { t } = useTranslation()
+  return (
+    <Button
+      onClick={() => {
+        location.href = '/logout'   // 直接跳转，不调用 API
+      }}
+    >
+      {t('settings.logout', 'Log out')}
+    </Button>
+  )
+}
+```
+
+**文件**: `ui/src/components/routes/Routes.tsx:151-155`
+
+```typescript
+const LogoutPage = ({ navigate }: { navigate: NavigateFunction }) => {
+  clearTokenCookie()    // 仅清除本地 Cookie
+  navigate('/')
+  return null
+}
+```
+
+### 5.2 Logout 的实际效果
+
+经过完整代码追踪，Photoview 的 Logout **只做了一件事：清除浏览器端的 Cookie**。完整的影响分析如下：
+
+```
+Logout 影响范围
+┌────────────────────────────────────────────────────────────────────┐
+│                                                                    │
+│  ✅ 已清除：                                                         │
+│     ├── 浏览器 Cookie: auth-token                                  │
+│     └── 当前浏览器会话立即失去身份                                  │
+│                                                                    │
+│  ❌ 未清除（仍有效）：                                               │
+│     ├── 数据库中的 AccessToken 记录（14 天后自然过期）              │
+│     ├── 其他设备/浏览器上的同用户登录会话                           │
+│     ├── WebSocket 已建立连接（直到断开重连才失效）                  │
+│     └── Share Token（不受 Logout 影响，独立过期）                  │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 多设备会话管理机制的缺失
+
+**数据库层面**（`AccessToken` 表）：
+```
+access_tokens 表结构（支持多设备）
+┌────┬─────────┬──────────────────────────┬─────────────────────┐
+│ id │ user_id │ value                    │ expire              │
+├────┼─────────┼──────────────────────────┼─────────────────────┤
+│ 1  │ 1       │ abcdefghijklmnopqrstuvwx │ 2026-06-20 10:00:00 │ ← 设备 A
+│ 2  │ 1       │ yyyy...24chars           │ 2026-07-01 15:30:00 │ ← 设备 B
+│ 3  │ 1       │ zzzz...24chars           │ 2026-07-03 08:00:00 │ ← 设备 C
+│ 4  │ 2       │ xxxx...24chars           │ 2026-07-02 12:00:00 │ ← 其他用户
+└────┴─────────┴──────────────────────────┴─────────────────────┘
+```
+
+**现状分析**:
+- ✅ 数据库设计**支持**多设备：每次 `GenerateAccessToken()` 都 INSERT 新记录
+- ❌ **没有 API** 来查看当前用户的所有活跃会话
+- ❌ **没有 API** 来强制注销某一设备（DELETE 特定 access_token）
+- ❌ **没有 API** 来强制注销所有其他设备
+- ❌ **没有后台清理任务**来清除已过期的 AccessToken 记录
+- ❌ **没有修改密码后使旧 token 失效**的逻辑
+
+### 5.4 会话失效的完整路径汇总
+
+| 失效触发方式 | 代码路径 | 影响范围 | 是否立即生效 |
+|------------|---------|---------|------------|
+| 用户主动 Logout | 前端 `clearTokenCookie()` | 仅当前浏览器 Cookie | 是 |
+| Token 自然过期（14 天） | Dataloader `expire > now` 过滤 | 该特定 token | 是，下次请求时 |
+| GraphQL 认证失败 | `apolloClient.ts` onError → `clearTokenCookie()` | 当前浏览器 Cookie | 是 |
+| 网络错误 | `apolloClient.ts` onError → `clearTokenCookie()` | 当前浏览器 Cookie | 是 |
+| 用户被删除 | 数据库 `OnDelete:CASCADE` | 该用户所有 token | 是，下次请求时 |
+| 管理员强制某设备下线 | ❌ 无此功能 | - | - |
+| 修改密码后失效旧 token | ❌ 无此功能 | - | - |
+| 定期清理过期 token | ❌ 无后台清理任务 | - | - |
+
+---
+
+## 六、OIDC 集成架构
+
+### 6.1 典型部署架构
 
 ```
 ┌─────────────────┐     OIDC Redirect     ┌──────────────────┐
@@ -258,7 +697,7 @@ func AuthWebsocketInit() func(context.Context, transport.InitPayload) (context.C
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 OIDC 用户账号绑定
+### 6.2 OIDC 用户账号绑定
 
 OIDC 用户的账号绑定需要以下步骤：
 
@@ -283,7 +722,7 @@ OIDC 用户的账号绑定需要以下步骤：
    - 如果存在且 `Password == nil`，则生成 AccessToken 并设置 cookie
    - 如果不存在，可配置自动创建用户或拒绝访问
 
-### 4.3 需要新增的 OIDC 中间件示例
+### 6.3 需要新增的 OIDC 中间件示例
 
 ```go
 // 伪代码：需要新增的 OIDC 认证中间件
@@ -342,24 +781,45 @@ func OIDCMiddleware(db *gorm.DB) func(http.Handler) http.Handler {
 }
 ```
 
+### 6.4 OIDC Logout 的特殊考虑
+
+集成 OIDC 后，Logout 需要考虑双重登出：
+
+```
+OIDC 场景下的完整 Logout
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│  1. 前端：点击 Logout → /logout → clearTokenCookie()         │
+│                                                              │
+│  2. 可选（需新增）：跳转到 OIDC Provider 的 logout endpoint   │
+│     例如 Authelia: https://auth.example.com/logout           │
+│     否则 OIDC Provider 的会话仍然有效，立即重新访问会免密登录 │
+│                                                              │
+│  3. 可选（需新增）：反向代理清除自身认证 Cookie/Session        │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
 ---
 
-## 五、完整认证流程对比
+## 七、完整认证流程对比
 
-| 流程步骤 | 本地账号鉴权 | OIDC 鉴权（反向代理模式） |
-|---------|-------------|-------------------------|
-| 1. 用户访问 | 打开登录页面 | 访问任意页面 |
-| 2. 认证方式 | 输入用户名密码 | 重定向到 OIDC Provider 登录 |
-| 3. 凭证验证 | `AuthorizeUser()` 验证 bcrypt 密码 | 反向代理验证 OIDC Token |
-| 4. 用户识别 | 通过用户名查询用户 | 通过 `X-Remote-User` Header 查询用户 |
-| 5. 账号检查 | 检查 `Password != nil` | 检查 `Password == nil` |
-| 6. Token 生成 | `GenerateAccessToken()` | `GenerateAccessToken()` |
-| 7. 会话保持 | `auth-token` Cookie | `auth-token` Cookie |
-| 8. 后续请求 | 中间件验证 Cookie | 中间件验证 Cookie |
+| 流程步骤 | 本地账号鉴权 | OIDC 鉴权（反向代理模式） | Share 链接匿名访问 |
+|---------|-------------|-------------------------|-----------------|
+| 1. 用户访问 | 打开 /login | 访问任意页面 | 打开 /share/:token |
+| 2. 认证方式 | 输入用户名密码 | 反向代理 OIDC 重定向 | 可选输入密码 |
+| 3. 凭证验证 | `AuthorizeUser()` 验证 bcrypt | 反向代理验证 OIDC Token | `shareTokenValidatePassword` query |
+| 4. 用户识别 | 通过 username 查询 User | 通过 X-Remote-User 查询 User | 无需用户，仅验证 ShareToken |
+| 5. 账号检查 | `Password != nil` | `Password == nil` | ShareToken.Expire / Password |
+| 6. Token 生成 | `GenerateAccessToken()` | `GenerateAccessToken()` | 生成时已创建 ShareToken |
+| 7. 会话保持 | `auth-token` Cookie | `auth-token` Cookie | `share-token-pw-{token}` Cookie + URL token |
+| 8. 过期时间 | 固定 14 天 | 固定 14 天 | 自定义或永不过期 |
+| 9. 后续请求 | 中间件验证 Cookie → User Context | 中间件验证 Cookie → User Context | authenticateMedia → shareTokenFromRequest |
+| 10. 过期失效 | 401 → 清除 Cookie → 重定向登录 | 401 → 清除 Cookie → 反向代理重新 OIDC | 显示 share expired 页面 |
 
 ---
 
-## 六、GraphQL 认证指令
+## 八、GraphQL 认证指令
 
 **文件**: `api/graphql/directive.go`
 
@@ -383,11 +843,24 @@ func IsAuthorized(ctx context.Context, obj interface{}, next graphql.Resolver) (
 }
 ```
 
+**Share 相关的 Mutation 都需要 `@isAuthorized`**，即只有登录用户才能创建/修改分享链接：
+```graphql
+extend type Mutation {
+  shareAlbum(albumId: ID!, expire: Time, password: String): ShareToken! @isAuthorized
+  shareMedia(mediaId: ID!, expire: Time, password: String): ShareToken! @isAuthorized
+  deleteShareToken(token: String!): ShareToken! @isAuthorized
+  protectShareToken(token: String!, password: String): ShareToken! @isAuthorized
+  setExpireShareToken(token: String!, expire: Time): ShareToken! @isAuthorized
+}
+```
+
+但 `shareToken` 和 `shareTokenValidatePassword` 这两个 Query **没有 directive**，允许匿名访问。
+
 ---
 
-## 七、安全注意事项
+## 九、安全注意事项
 
-### 7.1 OIDC 集成安全要点
+### 9.1 OIDC 集成安全要点
 
 1. **Header 信任范围**: 必须确保只有反向代理能设置 `X-Remote-User` Header
    - 配置防火墙只允许反向代理访问 Photoview
@@ -401,40 +874,82 @@ func IsAuthorized(ctx context.Context, obj interface{}, next graphql.Resolver) (
    - OIDC Provider 是否已经对用户进行了授权
    - 是否需要管理员预先审批
 
-### 7.2 现有安全机制
+4. **OIDC Logout 同步**: Photoview 清除 Cookie 后必须联动 OIDC Provider 登出，否则会立即自动重新登录
+
+### 9.2 Token 管理的安全隐患
+
+1. **无强制失效机制**:
+   - 修改用户密码不会使已有的 AccessToken 失效
+   - 管理员无法吊销特定设备的登录会话
+   - 数据库中过期 token 永远堆积，无清理任务
+
+2. **WebSocket 会话窗口**:
+   - WebSocket 连接建立时校验一次 token，之后即使 token 过期连接仍然有效
+   - 最长可达 14 天 + 连接保持时间
+
+3. **Share Token 安全**:
+   - Share Token 仅 8 位字符（AccessToken 是 24 位），熵值较低
+   - 建议：总是给 Share Token 设置密码和过期时间
+
+### 9.3 现有安全机制
 
 - 密码使用 bcrypt 哈希存储（cost=12）
 - AccessToken 为 24 位加密安全随机字符串
 - Cookie 使用 `SameSite: Lax` 防止 CSRF
 - 所有媒体资源访问都经过鉴权中间件
+- Share Token 密码同样使用 bcrypt 哈希
 
 ---
 
-## 八、关键文件索引
+## 十、关键文件索引
 
 | 功能模块 | 文件路径 |
 |---------|---------|
 | User 模型 | `api/graphql/models/user.go` |
-| 认证中间件 | `api/graphql/auth/auth.go` |
-| GraphQL Resolvers | `api/graphql/resolvers/user.go` |
-| Token Dataloader | `api/dataloader/userLoader.go` |
-| 媒体鉴权 | `api/routes/authenticate_routes.go` |
-| 前端登录 | `ui/src/Pages/LoginPage/LoginPage.tsx` |
-| 认证辅助 | `ui/src/helpers/authentication.ts` |
-| GraphQL Schema | `api/graphql/resolvers/user.graphql` |
-| 服务器入口 | `api/server.go` |
+| AccessToken / ShareToken 模型 | `api/graphql/models/user.go` / `api/graphql/models/share_token.go` |
+| 认证中间件（Cookie 校验） | `api/graphql/auth/auth.go` |
+| Token Dataloader（过期检查） | `api/dataloader/userLoader.go` |
+| 用户名密码登录 Resolver | `api/graphql/resolvers/user.go` |
+| Share Token Resolver | `api/graphql/resolvers/share_token.go` |
+| Share Token Actions | `api/graphql/models/actions/share_token_actions.go` |
+| 媒体/相册 HTTP 鉴权 | `api/routes/authenticate_routes.go` |
+| 照片路由 | `api/routes/photos.go` |
+| 下载路由 | `api/routes/downloads.go` |
+| Apollo 错误处理（失效清除 Cookie） | `ui/src/apolloClient.ts` |
+| 前端登录页 | `ui/src/Pages/LoginPage/LoginPage.tsx` |
+| Share 页面 | `ui/src/Pages/SharePage/SharePage.tsx` |
+| Share 密码保护页 | `ui/src/Pages/SharePage/PasswordProtectedShare.tsx` |
+| 认证 Cookie 辅助函数 | `ui/src/helpers/authentication.ts` |
+| 路由与 Logout 页面 | `ui/src/components/routes/Routes.tsx` |
+| 受保护路由组件 | `ui/src/components/routes/AuthorizedRoute.tsx` |
+| 用户设置页 Logout 按钮 | `ui/src/Pages/SettingsPage/UserPreferences.tsx` |
+| GraphQL Schema（用户） | `api/graphql/resolvers/user.graphql` |
+| GraphQL Schema（Share） | `api/graphql/resolvers/share_token.graphql` |
+| GraphQL 认证指令 | `api/graphql/directive.go` |
+| 服务器入口（中间件注册） | `api/server.go` |
 | 环境变量 | `api/utils/environment_variables.go` |
+| Token 生成工具函数 | `api/utils/utils.go` |
 
 ---
 
-## 九、总结
+## 十一、总结
 
-Photoview 的代码架构为 OIDC 集成提供了良好的基础：
+Photoview 的代码架构为 OIDC 集成提供了良好的基础，但在 Token 生命周期和多设备管理上有明显缺失：
 
-1. ✅ **用户模型支持无密码用户**：`Password *string` 字段设计
-2. ✅ **统一的会话机制**：基于 `auth-token` Cookie 的认证对所有鉴权方式透明
-3. ✅ **清晰的权限体系**：`IsAuthorized` 和 `IsAdmin` 指令与认证方式解耦
-4. ⚠️ **缺少 OIDC 中间件**：需要自行实现反向代理 Header 的解析和自动登录逻辑
-5. ⚠️ **缺少 OIDC 用户管理 UI**：当前只能通过 GraphQL API 创建无密码用户
+### 已有的基础能力
+1. ✅ **用户模型支持无密码用户**：`Password *string` 字段设计是 OIDC 集成的关键
+2. ✅ **三条鉴权入口完全解耦**：用户名密码登录、Share 匿名访问、反向代理 Header 认证互补干扰
+3. ✅ **统一的会话机制**：基于 `auth-token` Cookie 的认证对所有登录方式透明
+4. ✅ **Share 链接独立鉴权体系**：独立的 Token、密码、过期时间、路由保护
+5. ✅ **清晰的权限体系**：`IsAuthorized` 和 `IsAdmin` 指令与认证方式解耦
 
-OIDC 与本地账号鉴权是**并行关系**，通过 `Password` 字段是否为 `nil` 来区分。两种方式最终都会生成 `AccessToken` 并通过相同的 Cookie 机制维持会话。
+### 需要补齐的能力
+1. ⚠️ **缺少 OIDC 中间件**：需要自行实现反向代理 Header 的解析和自动登录逻辑
+2. ⚠️ **缺少 OIDC 用户管理 UI**：当前只能通过 GraphQL API 创建无密码用户
+3. ❌ **没有 Token 续期机制**：14 天后强制重新登录，无 refresh token，无滑动窗口
+4. ❌ **没有会话管理功能**：无法查看、吊销特定设备的登录会话
+5. ❌ **没有过期 Token 清理任务**：AccessToken 和 ShareToken 过期后永远留在数据库
+6. ❌ **Logout 只清前端 Cookie**：不影响服务端和其他设备的会话
+7. ❌ **修改密码不失效旧 Token**：安全漏洞，密码泄露后旧 token 仍可使用到 14 天
+
+OIDC 与本地账号鉴权是**并行关系**，通过 `Password` 字段是否为 `nil` 来区分。Share 链接是完全独立的第三条鉴权路径。三条路径最终都依赖相同的媒体访问控制层（`authenticateMedia`/`authenticateAlbum`），但在入口认证和会话保持上各自独立。
