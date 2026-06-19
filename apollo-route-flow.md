@@ -1616,9 +1616,585 @@ Service Worker 知道要限制图片缓存到 50 条，但 Apollo 层对自己�
 
 ---
 
-## 十七、Mutation 乐观更新的 Rollback 链路
+## 十七、Apollo Client 实例化与 useMemo/useCallback 缓存复用对查询性能的影响
 
-### 17.1 唯一使用 optimisticResponse 的 Mutation
+### 17.1 Apollo Client 单例的实例化时机
+
+文件：`ui/src/apolloClient.ts:190-196`、`ui/src/index.tsx:4-18`
+
+```typescript
+// apolloClient.ts — 模块顶层，import 时即执行
+const client = new ApolloClient({
+  link: ApolloLink.from([linkError, link]),
+  cache: memoryCache,
+})
+export default client
+
+// index.tsx — 将单例注入 Provider
+import client from './apolloClient'
+const Main = () => (
+  <ApolloProvider client={client}>
+    ...
+  </ApolloProvider>
+)
+```
+
+**实例化路径**：
+
+```
+Vite 加载模块图
+        │
+        ▼
+import client from './apolloClient'
+        │
+        ├─ 模块顶层代码执行（只跑一次）
+        │     ├─ new HttpLink(...)              ← HTTP 链
+        │     ├─ new WebSocketLink(...)          ← WS 链
+        │     ├─ split(...)                      ← 路由分流
+        │     ├─ new InMemoryCache(...)          ← 缓存实例
+        │     └─ new ApolloClient({...})         ← 客户端实例
+        │
+        └─ client 被缓存到模块作用域
+              │
+              ├─ ApolloProvider 通过 context 传递给所有子组件
+              └─ 整个应用生命周期内 client 永不重建
+```
+
+**性能含义**：
+- Apollo Client 实例、InMemoryCache、所有 Link 对象都是**一次创建、全局复用**
+- 不存在"每次路由切换创建新 client"的问题
+- `ApolloProvider` 只是 context 传值，不涉及任何对象创建
+
+### 17.2 useQuery 变量对象与缓存键的关系
+
+Apollo 用 `variables` 对象的**序列化结果**作为缓存键的一部分。这意味着变量的引用稳定性直接影响缓存命中率：
+
+```typescript
+// AlbumPage.tsx:50-62
+const { loading, error, data, refetch, fetchMore } = useQuery(ALBUM_QUERY, {
+  variables: {
+    id: albumId,
+    onlyFavorites,
+    mediaOrderBy: orderParams.orderBy,
+    orderDirection: orderParams.orderDirection,
+    offset: 0,
+    limit: 200,
+  },
+})
+```
+
+**关键问题**：每次渲染都会创建新的 `variables` 对象字面量。Apollo 如何处理？
+
+```
+useQuery(ALBUM_QUERY, { variables: { id: "42", ... } })
+        │
+        ▼
+Apollo 内部序列化 variables
+        │
+        ├─ JSON.stringify 或 equivalent → 生成缓存键
+        │     "{id:\"42\",onlyFavorites:false,mediaOrderBy:\"date_shot\",...}"
+        │
+        ├─ 与缓存中已有的键做字符串比较（不是引用比较）
+        │
+        └─ 键匹配 → cache-first → 直接返回缓存，不发请求
+        键不匹配 → 发请求 → 写入新缓存条目
+```
+
+**结论**：变量的引用不稳定**不会**导致缓存 miss，因为 Apollo 用序列化比较而非引用比较。但引用不稳定会导致 `useQuery` 内部的浅比较判断 `variables` 变了，可能触发**不必要的重新订阅**（虽然最终走缓存不会发请求，但订阅逻辑本身有开销）。
+
+### 17.3 项目中 useMemo/useCallback 的使用与 Apollo 的交互
+
+项目共有 **10 处** `useMemo`/`useCallback` 使用，与 Apollo 查询性能相关的有 4 处：
+
+| Hook | 文件位置 | 用途 | 与 Apollo 的关系 |
+|------|---------|------|-----------------|
+| `useCallback` | `useScrollPagination.ts:60` | `containerElem` ref callback | 稳定的 ref callback，避免 IntersectionObserver 重复创建 |
+| `useCallback` | `useOrderingParams.ts:27` | `setOrdering` 函数 | 稳定的排序设置函数，避免下游组件不必要渲染 |
+| `useCallback` | `AlbumPage.tsx:72` | `toggleFavorites` 函数 | 稳定的收藏切换函数，依赖 `[setOnlyFavorites, refetch]` |
+| `useMemo` | `AlbumFilter.tsx:68` | `defaultOptions` 排序选项 | 稳定的下拉选项数组，依赖 `[t]` |
+
+**缺失的 useMemo/useCallback 场景**：
+
+1. **`getItems` 函数未缓存**：
+
+```typescript
+// AlbumPage.tsx:64-70
+const { containerElem, finished } = useScrollPagination<albumQuery>({
+  loading,
+  fetchMore,
+  data,
+  getItems: data => data.album.media,  // ← 每次渲染新建箭头函数
+})
+```
+
+`getItems` 是新的箭头函数引用，会导致 `useScrollPagination` 的 `useEffect([fetchMore, data, finished])` 在每次渲染时都触发 `reconfigureIntersectionObserver()`，因为 `data` 变化已经导致了这个 effect。但 `getItems` 本身没有被加入依赖数组，所以不会额外增加触发次数。
+
+2. **`useQuery` 的 `variables` 未缓存**：
+
+```typescript
+// AlbumPage.tsx:53-61
+variables: {
+  id: albumId,
+  onlyFavorites,
+  mediaOrderBy: orderParams.orderBy,
+  orderDirection: orderParams.orderDirection,
+  offset: 0,
+  limit: 200,
+}
+```
+
+每次渲染创建新的 `variables` 对象。如果用 `useMemo` 包裹，可以避免 `useQuery` 内部的浅比较检测到"变量变了"而触发重新订阅。但在实际运行中，只有 `onlyFavorites` 或排序参数真正变化时才会重建——而此时重新订阅是正确的预期行为。因此**缺少 useMemo 不会导致多余的网络请求**，只是增加少量订阅逻辑开销。
+
+### 17.4 useScrollPagination 的闭包陷阱
+
+文件：`ui/src/hooks/useScrollPagination.ts:25-58`
+
+```typescript
+const reconfigureIntersectionObserver = () => {
+  // ...
+  observer.current = new IntersectionObserver(entities => {
+    if (entities.find(x => x.isIntersecting == false)) {
+      const itemCount = data !== undefined ? getItems(data).length : 0  // ← 闭包捕获 data
+      fetchMore({                                                        // ← 闭包捕获 fetchMore
+        variables: { offset: itemCount },
+      }).then(result => {
+        const newItemCount = getItems(result.data).length
+        if (newItemCount == 0) {
+          setFinished(true)
+        }
+      })
+    }
+  }, options)
+}
+```
+
+`reconfigureIntersectionObserver` **不是用 useCallback 包裹的**，而是一个普通函数。它通过闭包捕获 `data`、`fetchMore`、`getItems`、`finished` 等变量。
+
+**问题**：IntersectionObserver 的回调中捕获的 `data` 和 `fetchMore` 可能是**过期的闭包引用**。但这个问题被以下机制缓解：
+
+```
+useEffect([fetchMore, data, finished])
+  → 每次 data 或 fetchMore 变化时
+  → 重新调用 reconfigureIntersectionObserver()
+  → 创建新的 IntersectionObserver（替代旧的）
+  → 新回调捕获最新的 data 和 fetchMore
+```
+
+所以**依赖数组 `[fetchMore, data, finished]` 确保了闭包的时效性**。但代价是每次 `data` 变化（包括 fetchMore 返回新数据）都会销毁旧 Observer 并创建新 Observer。
+
+### 17.5 Apollo 查询性能的关键路径总结
+
+```
+用户进入 Album 页面
+        │
+        ├─ useQuery(ALBUM_QUERY, { variables })
+        │     │
+        │     ├─ Apollo 检查 InMemoryCache
+        │     │     ├─ keyArgs 匹配 → cache-first → 返回缓存（0ms）
+        │     │     └─ keyArgs 不匹配 → 发 HTTP 请求 → 写缓存 → 返回数据
+        │     │
+        │     └─ variables 引用不稳定（每次渲染新建对象）
+        │           → Apollo 内部浅比较检测到"变量变了"
+        │           → 触发重新订阅 ObservableQuery
+        │           → 但序列化比较发现键一样 → 不发请求
+        │           → 开销：少量订阅逻辑，无网络请求
+        │
+        ├─ useScrollPagination({ data, fetchMore })
+        │     │
+        │     └─ useEffect([data, fetchMore])
+        │           → data 变化 → 重建 IntersectionObserver
+        │           → Observer 回调闭包捕获最新 data
+        │
+        └─ fetchMore 触发分页加载
+              │
+              ├─ paginateCache merge → 追加到缓存数组
+              │
+              └─ data 引用变化 → 触发重新渲染链
+                    → useScrollPagination 重建 Observer
+                    → 组件重新渲染
+```
+
+**性能影响评估**：变量对象和 `getItems` 函数未缓存，导致每次渲染多走一次 Apollo 内部的变量比较和 ObservableQuery 重新订阅逻辑。但在实际使用中，这些额外开销在微秒级，不会产生用户可感知的延迟。
+
+---
+
+## 十八、Router 切换前后的焦点恢复、滚动重置和无障碍处理完整路径
+
+### 18.1 滚动重置：App.tsx 的全局监听
+
+文件：`ui/src/App.tsx:15-19`
+
+```typescript
+const App = () => {
+  const { pathname } = useLocation()
+
+  useEffect(() => {
+    window.scrollTo(0, 0)                                           // ① 滚动到顶部
+    if (document.activeElement != document.body)
+      (document.activeElement as HTMLInputElement).blur()           // ② 释放焦点
+  }, [pathname])
+
+  return (...)
+}
+```
+
+**完整触发链**：
+
+```
+用户点击 <NavLink to="/album/42">
+        │
+        ▼
+React Router 更新 URL → pathname 变化
+        │
+        ▼
+App 组件 useEffect([pathname]) 触发
+        │
+        ├─ window.scrollTo(0, 0)
+        │     ├─ 立即将视口滚动到页面顶部
+        │     └─ 无动画，瞬间跳转
+        │
+        └─ document.activeElement.blur()
+              ├─ 如果焦点在 SearchBar 输入框 → 收起键盘（移动端）/ 取消光标
+              ├─ 如果焦点在某个按钮 → 移除 focus 样式
+              └─ 如果焦点已在 body → 不执行任何操作
+```
+
+### 18.2 React Router 6 的默认行为 vs 项目的自定义行为
+
+React Router 6 **默认不提供任何滚动恢复机制**。项目通过 `useEffect([pathname])` 手动实现了滚动重置。
+
+| 行为 | React Router 6 默认 | 项目自定义 |
+|------|---------------------|-----------|
+| 滚动到顶部 | ❌ 不处理 | ✅ `window.scrollTo(0, 0)` |
+| 恢复之前的滚动位置 | ❌ 不处理 | ❌ 不实现（每次都回到顶部） |
+| 焦点管理 | ❌ 不处理 | ✅ `activeElement.blur()` |
+| 焦点移到页面顶部 | ❌ 不处理 | ❌ 不实现 |
+
+### 18.3 滚动重置与 useScrollPagination 的交互
+
+```
+用户从 Timeline 页面（已滚动到中部）点击相册链接
+        │
+        ├─ pathname 变化 → useEffect → window.scrollTo(0, 0)
+        │     └─ 页面立刻回到顶部
+        │
+        ├─ TimelineGallery 组件开始卸载
+        │     ├─ useScrollPagination 的 useEffect cleanup
+        │     │     └─ observer.current.disconnect()
+        │     │
+        │     └─ IntersectionObserver 被销毁
+        │
+        ├─ AlbumPage 组件开始挂载
+        │     ├─ useQuery(ALBUM_QUERY) 发起请求
+        │     ├─ useScrollPagination 创建新 IntersectionObserver
+        │     └─ loading = true → Observer 不激活
+        │
+        └─ 数据返回 → loading = false → Observer 激活
+              └─ 观察容器元素是否进入视口
+```
+
+**关键交互**：`window.scrollTo(0, 0)` 在新页面组件挂载之前执行。由于新页面还在 loading 状态（高度可能不足视口），IntersectionObserver 可能立即触发 `fetchMore`。这就是为什么 `useScrollPagination` 有 `if (loading)` 保护——loading 期间 unobserve 元素。
+
+### 18.4 焦点恢复的完整生命周期
+
+**场景 A：从 SearchBar 搜索后跳转**
+
+```
+1. 用户聚焦 SearchBar → document.activeElement = <input>
+2. 用户输入搜索关键词 → debounce → useLazyQuery 发请求
+3. 用户点击搜索结果 → <NavLink> 触发路由切换
+4. pathname 变化 → useEffect → blur() → SearchBar 失去焦点
+5. SearchBar 的 useEffect([location]) → 清空输入框和搜索结果
+```
+
+**场景 B：在 Present Mode 中按 Escape 返回**
+
+```
+1. 用户在 Present Mode → history.popState → pathname 不变
+2. mediaGalleryReducer 处理 'closePresentMode'
+3. useEffect([pathname]) 不触发（pathname 没变）
+4. 焦点状态取决于之前的焦点位置（可能仍在某个按钮上）
+```
+
+**场景 C：浏览器前进/后退按钮**
+
+```
+1. 用户点击浏览器后退 → React Router 处理 popstate
+2. pathname 变化 → useEffect → scrollTo(0,0) + blur()
+3. 不会恢复之前的滚动位置（这是已知的 UX 缺陷）
+```
+
+### 18.5 无障碍（Accessibility）处理盘点
+
+**已有的无障碍支持**：
+
+| 组件 | 文件位置 | 无障碍特性 |
+|------|---------|-----------|
+| AlbumFilter 排序 | `components/album/AlbumFilter.tsx:94-127` | `<fieldset>` + `<legend>`，`aria-labelledby`，`aria-pressed`，`aria-label`，`<span className="sr-only">` |
+| 排序方向按钮 | `components/album/AlbumFilter.tsx:108-126` | `title`，`aria-label`，`aria-pressed`，`sr-only` 屏幕阅读器文本 |
+| Header logo | `components/header/Header.tsx:22` | `<img alt="logo">` |
+
+**缺失的无障碍支持**：
+
+| 场景 | 缺失内容 | 影响 |
+|------|---------|------|
+| 路由切换 | 没有 `aria-live` 区域通知页面变化 | 屏幕阅读器用户不知道页面已切换 |
+| 路由切换 | 焦点不移到新页面内容区域 | Tab 键继续从页面顶部开始，而非新内容 |
+| 无限滚动 | 没有 `aria-live` 通知新内容加载 | 屏幕阅读器用户不知道新照片已出现 |
+| Present Mode | 没有焦点陷阱（focus trap） | Tab 键可以跳出全屏看图模式 |
+| 图片网格 | 缩略图缺少 `alt` 文本描述 | 屏幕阅读器无法理解图片内容 |
+| Sidebar | 打开/关闭没有 `aria-expanded` | 屏幕阅读器不知道 Sidebar 状态 |
+| 加载状态 | 没有 `aria-busy` 或 `role="status"` | 屏幕阅读器不知道页面正在加载 |
+
+### 18.6 React.Suspense 与路由切换的焦点交互
+
+文件：`ui/src/components/routes/Routes.tsx:126-136`
+
+```typescript
+<React.Suspense
+  fallback={
+    <Layout title={t('general.loading.page', 'Loading page')}>
+      <Loader message={t('general.loading.page', 'Loading page')} active />
+    </Layout>
+  }
+>
+  {routes}
+</React.Suspense>
+```
+
+所有页面组件都用 `React.lazy` 做了代码分割。路由切换时的流程：
+
+```
+用户导航到新页面
+        │
+        ├─ pathname 变化 → scrollTo(0,0) + blur()
+        │
+        ├─ 旧页面组件卸载 → 新页面 lazy chunk 开始加载
+        │
+        ├─ Suspense fallback 渲染
+        │     └─ <Layout><Loader /></Layout>
+        │          └─ Loader 组件（旋转动画）
+        │               └─ 没有 aria-busy / role="alert" 等无障碍属性
+        │
+        └─ lazy chunk 加载完成 → 替换 fallback → 页面组件渲染
+              └─ 焦点位置不确定（取决于浏览器默认行为）
+```
+
+### 18.7 与 React Router 未来版本的对比
+
+React Router 7 开始提供 `<ScrollRestoration>` 组件，可自动处理滚动位置保存和恢复。项目当前使用的 React Router 6.3 没有此功能，所有滚动和焦点管理都是手动的。
+
+---
+
+## 十九、长会话 GC 调优与缓存生命周期管理的实测分析
+
+### 19.1 实测方法与约束
+
+**重要前提**：项目代码中没有任何内置的性能监控、内存采集或缓存统计机制。没有 `performance.mark`、没有 `performance.measure`、没有自定义的 memory metric 采集。
+
+因此以下分析基于：
+1. Apollo Client 3.6 源码中 `InMemoryCache` 的数据结构
+2. V8 引擎的 GC 行为模型
+3. `paginateCache` 的合并逻辑
+4. 浏览器 `performance.memory` API（Chrome only）的理论可用性
+
+### 19.2 InMemoryCache 内部数据结构对内存的影响
+
+Apollo `InMemoryCache` 内部维护的核心数据结构：
+
+```
+InMemoryCache
+  ├── data: EntityStore                    ← 主存储（Radix Trie）
+  │     ├── data: Map<string, StoreObject>  ← 所有标准化实体
+  │     │     "Media:1" → { id, title, type, favorite, ... }
+  │     │     "Media:2" → { id, title, type, favorite, ... }
+  │     │     "Album:1" → { id, title, media: [...refs] }
+  │     │     "MediaURL:https://..." → { url, width, height, ... }
+  │     │     ...
+  │     │
+  │     └── children: EntityStore[]         ← optimistic layers
+  │
+  ├── policies: TypePolicies               ← 类型策略配置
+  │
+  └── makeCacheKey(...)                     ← 缓存键生成器
+```
+
+**每个缓存实体的内存构成**：
+
+| 字段 | 类型 | 预估大小 |
+|------|------|---------|
+| Map key (`"Media:123"`) | string | ~12 bytes |
+| StoreObject value | object | ~200-500 bytes（取决于字段数量） |
+| MediaURL 实体 | object | ~150 bytes |
+| 分页数组引用 `{ __ref }` | object | ~30 bytes/条 |
+| 分页数组本身 | Array | 8 bytes/索引 × length |
+
+### 19.3 不同用户规模下的缓存内存估算
+
+**场景 A：小型照片库（1,000 张照片，20 个相册）**
+
+| 缓存实体 | 数量 | 单体大小 | 总计 |
+|---------|------|---------|------|
+| Media | 1,000 | ~400B | ~400 KB |
+| MediaURL (×3 尺寸/照片) | 3,000 | ~150B | ~450 KB |
+| Album | 20 | ~300B | ~6 KB |
+| Album.media 分页引用 | 3,000 | ~30B | ~90 KB |
+| Query.myTimeline 引用 | 1,000 | ~30B | ~30 KB |
+| 其他（Face、SiteInfo 等） | - | - | ~50 KB |
+| **合计** | | | **~1 MB** |
+
+**场景 B：中型照片库（10,000 张照片，100 个相册）**
+
+| 缓存实体 | 数量 | 单体大小 | 总计 |
+|---------|------|---------|------|
+| Media | 10,000 | ~400B | ~4 MB |
+| MediaURL (×3 尺寸/照片) | 30,000 | ~150B | ~4.5 MB |
+| Album | 100 | ~300B | ~30 KB |
+| Album.media 分页引用 | 30,000 | ~30B | ~900 KB |
+| Query.myTimeline 引用 | 10,000 | ~30B | ~300 KB |
+| 其他 | - | - | ~200 KB |
+| **合计** | | | **~10 MB** |
+
+**场景 C：大型照片库（50,000 张照片，300 个相册，全部浏览一遍）**
+
+| 缓存实体 | 数量 | 单体大小 | 总计 |
+|---------|------|---------|------|
+| Media | 50,000 | ~400B | ~20 MB |
+| MediaURL (×3 尺寸/照片) | 150,000 | ~150B | ~22.5 MB |
+| Album | 300 | ~300B | ~90 KB |
+| Album.media 分页引用 | 150,000 | ~30B | ~4.5 MB |
+| Query.myTimeline 引用 | 50,000 | ~30B | ~1.5 MB |
+| 其他 | - | - | ~500 KB |
+| **合计** | | | **~49 MB** |
+
+### 19.4 V8 GC 行为与 Apollo 缓存的交互
+
+V8 的垃圾回收器采用**分代收集**策略：
+
+```
+V8 堆内存
+  ├── Young Generation (新生代)
+  │     └─ 短生命周期对象
+  │         └─ 每次 paginateCache.merge 创建的临时数组
+  │            (merged = existing.slice(0))
+  │            → 旧数组在下一轮 GC 中被回收
+  │
+  └── Old Generation (老生代)
+        └─ 长生命周期对象
+            ├─ Apollo Client 单例
+            ├─ InMemoryCache.data (Map)
+            ├─ 所有 Media/Album/MediaURL 标准化实体
+            └─ IntersectionObserver 实例
+```
+
+**关键洞察**：Apollo 的标准化实体全部在老生代中。它们被 `InMemoryCache.data` 这个 Map 强引用，永远不会被 GC 回收。只有以下对象会进入新生代并被回收：
+
+1. `paginateCache.merge` 中的临时 `merged` 数组
+2. `useQuery` 返回的 `data` 包装对象（每次渲染新建）
+3. `variables` 对象字面量（每次渲染新建）
+
+### 19.5 浏览器内存压力的响应链
+
+```
+InMemoryCache 持续增长
+        │
+        ▼
+V8 老生代接近阈值
+        │
+        ├─ V8 触发 Mark-Sweep-Compact GC
+        │     └─ 无法回收 Apollo 缓存（全部可达）
+        │
+        ▼
+继续增长 → V8 老生代超出阈值
+        │
+        ├─ Chrome 单标签页限制约 4GB (64-bit)
+        │     └─ 实际远不会达到（49MB 级别）
+        │
+        ├─ 操作系统内存压力
+        │     └─ Chrome 可能终止标签页
+        │
+        └─ 在此之前，用户更可能已经：
+              ├─ 关闭了标签页
+              ├─ 刷新了页面
+              ├─ 切换了 Timeline 年份（resetStore）
+              └─ 重新登录（硬刷新）
+```
+
+### 19.6 实测数据采集方案（项目未实现但可行）
+
+虽然项目没有内置监控，但可以在浏览器 DevTools 中进行以下测量：
+
+**方案 A：Chrome DevTools Memory Snapshot**
+
+```
+1. 打开 Chrome DevTools → Memory
+2. 进入 Timeline 页面
+3. 拍摄 Heap Snapshot → 记录基线
+4. 持续滚动加载 10 页数据
+5. 再次拍摄 Heap Snapshot → 对比
+6. 搜索 "Media" / "MediaURL" 查看实例数
+```
+
+**方案 B：performance.memory API（Chrome only）**
+
+```javascript
+// 在浏览器控制台中执行
+const before = performance.memory.usedJSHeapSize
+// ... 操作页面 ...
+const after = performance.memory.usedJSHeapSize
+console.log(`Delta: ${(after - before) / 1024 / 1024} MB`)
+```
+
+**方案 C：Apollo Client DevTools**
+
+```
+1. 安装 Apollo Client DevTools 浏览器扩展
+2. 打开 Cache 面板
+3. 查看所有缓存实体数量和类型分布
+4. 导出缓存数据进行分析
+```
+
+### 19.7 缓存生命周期管理的关键指标（理论值）
+
+| 指标 | 小型库 | 中型库 | 大型库 |
+|------|-------|-------|-------|
+| 首次加载 Timeline (200 条) | ~200KB | ~200KB | ~200KB |
+| 浏览全部相册后缓存总量 | ~1MB | ~10MB | ~49MB |
+| resetStore 清空时间 | <1ms | <5ms | <20ms |
+| resetStore 后重新加载首页 | ~500ms | ~1s | ~2s |
+| 单次 fetchMore 响应时间 | ~100ms | ~200ms | ~500ms |
+| V8 GC 暂停（缓存 10MB 时） | <5ms | <10ms | <20ms |
+
+### 19.8 缓存生命周期的时间线
+
+```
+t=0    用户打开应用 → 登录 → 硬刷新 → Apollo Client 创建 → 缓存空
+t=5s   Timeline 首页加载 → 缓存: 200 Media + 600 MediaURL ≈ 0.3MB
+t=30s  用户滚动 5 页 → 缓存: 1000 Media ≈ 1MB
+t=2m   用户进入 3 个相册 → 缓存: 2500 Media + 3 Album.media 分页 ≈ 3MB
+t=5m   用户搜索 2 次 → 缓存额外增加: SearchResult 实体 ≈ +0.2MB
+t=10m  用户切换 Timeline 年份 → resetStore → 缓存清空 → 重新加载 ≈ 0.3MB
+t=15m  用户浏览 People 页面 → 缓存增加: FaceGroup + ImageFace ≈ +1MB
+t=30m  用户持续浏览 → 缓存 ≈ 5-10MB
+t=1h   用户刷新页面 → Apollo Client 重建 → 缓存清空
+```
+
+### 19.9 优化建议（基于分析）
+
+| 优化方向 | 当前状态 | 建议方案 | 预期收益 |
+|---------|---------|---------|---------|
+| 缓存持久化 | 纯内存，刷新即丢 | `apollo3-cache-persist` + localStorage/IndexedDB | 避免每次刷新重拉所有数据 |
+| 缓存上限 | 无上限 | 自定义 `merge` 函数，限制数组长度（如最多 2000 条引用） | 控制内存在合理范围 |
+| 缓存淘汰 | 无淘汰 | 定期调用 `cache.gc()` + `cache.evict()` 清理不可达实体 | 回收搜索结果等临时数据 |
+| 断网恢复 | network error 清 Cookie | 在 linkError 中区分 `navigator.onLine` 状态 | 避免断网时误登出 |
+| ErrorBoundary | 无 | 在 App 和 Layout 层添加错误边界 | 避免白屏崩溃 |
+| 滚动恢复 | 只回顶部 | 基于 `sessionStorage` 记录滚动位置 | 浏览器后退时恢复位置 |
+
+---
+
+## 二十、Mutation 乐观更新的 Rollback 链路
+
+### 20.1 唯一使用 optimisticResponse 的 Mutation
 
 文件：`ui/src/components/photoGallery/photoGalleryMutations.ts:23-43`
 
@@ -1639,7 +2215,7 @@ export const toggleFavoriteAction = ({ media, markFavorite }) => {
 }
 ```
 
-### 17.2 Apollo 乐观更新的内部写入机制
+### 20.2 Apollo 乐观更新的内部写入机制
 
 当 `markFavorite` 被调用时，Apollo Client 执行以下步骤：
 
@@ -1670,7 +2246,7 @@ export const toggleFavoriteAction = ({ media, markFavorite }) => {
         → 所有观察该 Media 的组件自动回滚
 ```
 
-### 17.3 Rollback 的责任归属
+### 20.3 Rollback 的责任归属
 
 **谁负责 rollback？——Apollo Client 自动完成，无需业务代码介入。**
 
@@ -1692,7 +2268,7 @@ Apollo 的乐观更新基于**分层缓存**架构：
 
 **关键代码验证**：`toggleFavoriteAction` 没有提供 `onError` 回调，也没有任何手动缓存修复逻辑。这证实了 rollback 完全依赖 Apollo 内部机制。
 
-### 17.4 失败场景下的完整影响链
+### 20.4 失败场景下的完整影响链
 
 ```
 用户点击收藏星标
@@ -1714,7 +2290,7 @@ HTTP 请求发出 → 服务器返回错误
         └─ UI 自动回滚到未收藏状态（星标取消高亮）
 ```
 
-### 17.5 其他 Mutation 的错误处理模式
+### 20.5 其他 Mutation 的错误处理模式
 
 项目中不使用乐观更新的 Mutation 采用了两种错误处理策略：
 
@@ -1744,9 +2320,9 @@ const [addRootPath] = useMutation(USER_ADD_ROOT_PATH_MUTATION, {
 
 ---
 
-## 十八、退出登录 / 切换用户时 Sidebar 的清理触发点
+## 二十一、退出登录 / 切换用户时 Sidebar 的清理触发点
 
-### 18.1 Sidebar 的生命周期与清理时机
+### 21.1 Sidebar 的生命周期与清理时机
 
 Sidebar 的状态存储在 `SidebarProvider` 的 `useState` 中：
 
@@ -1766,7 +2342,7 @@ export const SidebarProvider = ({ children }) => {
 
 Sidebar 不随路由变化自动重置，它的清理完全依赖**显式调用 `updateSidebar(null)`**。
 
-### 18.2 全部 updateSidebar 调用点盘点
+### 21.2 全部 updateSidebar 调用点盘点
 
 | 位置 | 触发场景 | 传入值 |
 |------|---------|-------|
@@ -1777,7 +2353,7 @@ Sidebar 不随路由变化自动重置，它的清理完全依赖**显式调用 
 | `SidebarHeader.tsx:22` | 用户点击关闭按钮 | `null` |
 | `MediaSidebar.tsx:195` | album path 链接点击时 | `null` |
 
-### 18.3 登出时 Sidebar 的清理路径
+### 21.3 登出时 Sidebar 的清理路径
 
 ```
 用户访问 /logout
@@ -1803,7 +2379,7 @@ LoginPage 渲染
 4. **Sidebar 仍然显示旧的 AlbumSidebar 内容**（包含旧用户的相册信息）
 5. Sidebar 组件内部的 `useQuery` 因 `authToken()` 返回 null，部分组件（如 `AlbumSidebar`）不会发起新请求，但**旧内容仍在 DOM 中**
 
-### 18.4 为什么视觉上不会出问题？
+### 21.4 为什么视觉上不会出问题？
 
 Sidebar 的可见性由 CSS `translate-x-full` / `translate-x-0` 控制：
 
@@ -1819,7 +2395,7 @@ className={`... ${content == null && !pinned ? 'translate-x-full' : 'translate-x
 
 所以虽然 **state 未清理**，但用户不太可能注意到残留数据。
 
-### 18.5 登录（用户切换）时的清理路径
+### 21.5 登录（用户切换）时的清理路径
 
 ```
 LoginPage authorize mutation 成功
@@ -1840,7 +2416,7 @@ login(token) (loginUtilities.tsx:13-16)
 
 **登录使用硬刷新，Sidebar state 自然清空**。这是唯一可靠的清理路径。
 
-### 18.6 Sidebar 清理缺失的完整影响矩阵
+### 21.6 Sidebar 清理缺失的完整影响矩阵
 
 | 场景 | Sidebar 是否清理 | 清理方式 | 风险 |
 |------|-----------------|---------|------|
@@ -1849,7 +2425,7 @@ login(token) (loginUtilities.tsx:13-16)
 | Session 过期 (linkError) | ❌ 不清理 | `clearTokenCookie()` 但无 `updateSidebar(null)` | Sidebar 内容可能引用已无权限的数据 |
 | Token 变为无效 | ❌ 不清理 | 后续 useQuery 返回错误，但 sidebar 不自动关闭 | Sidebar 中显示错误信息 |
 
-### 18.7 对比：App.tsx 路由变化时的副作用
+### 21.7 对比：App.tsx 路由变化时的副作用
 
 文件：`ui/src/App.tsx:15-19`
 
@@ -1865,7 +2441,7 @@ App 组件监听 `pathname` 变化做了滚动重置和焦点释放，但**没�
 
 ---
 
-## 十九、路由切换时的全局副作用
+## 二十二、路由切换时的全局副作用
 
 文件：`ui/src/App.tsx:15-19`
 
@@ -1885,7 +2461,7 @@ useEffect(() => {
 
 ---
 
-## 二十、SearchBar 的延迟查询
+## 二十三、SearchBar 的延迟查询
 
 文件：`ui/src/components/header/Searchbar.tsx`
 
@@ -1908,7 +2484,7 @@ useEffect(() => {
 
 ---
 
-## 二十一、关键代码位置速查
+## 二十四、关键代码位置速查
 
 | 功能模块 | 文件路径 | 关键行 |
 |---------|---------|-------|
@@ -1953,10 +2529,15 @@ useEffect(() => {
 | 主题 localStorage | `ui/src/theme.ts` | 3-29 |
 | 应用根节点 (无 ErrorBoundary) | `ui/src/index.tsx` | 17-28 |
 | throw 错误穷举检查 | `ui/src/helpers/utils.ts` | 44 |
+| useScrollPagination Hook | `ui/src/hooks/useScrollPagination.ts` | 全文 |
+| useOrderingParams Hook | `ui/src/hooks/useOrderingParams.ts` | 全文 |
+| useURLParameters Hook | `ui/src/hooks/useURLParameters.ts` | 全文 |
+| AlbumFilter 无障碍属性 | `ui/src/components/album/AlbumFilter.tsx` | 94-127 |
+| Suspense fallback | `ui/src/components/routes/Routes.tsx` | 126-136 |
 
 ---
 
-## 二十二、潜在问题与设计权衡
+## 二十五、潜在问题与设计权衡
 
 | 现象 | 原因 | 影响 |
 |------|------|------|
@@ -1980,3 +2561,8 @@ useEffect(() => {
 | 无 ErrorBoundary，throw 导致白屏 | 17 处 throw new Error 无任何捕获，应用无错误边界组件 | 任何一个 throw 都可能导致整页崩溃，用户只能手动刷新 |
 | 错误双重展示 | linkError 全局浮层 + 组件局部 `<div>Error</div>` | 用户同时看到两条可能重复或不一致的错误信息 |
 | Service Worker 不缓存用户照片 / GraphQL | 路由规则排除 /api/*，PNG 缓存只匹配同源非 API 路径 | 离线状态下已加载的照片元数据在 Apollo 缓存里，但图片二进制取决于浏览器 HTTP 缓存 |
+| useQuery variables 未 useMemo | 每次渲染新建 variables 对象字面量 | 触发 ObservableQuery 不必要的重新订阅，但不会导致多余网络请求 |
+| useScrollPagination 每次重建 Observer | useEffect([data, fetchMore]) 每次数据变化都销毁重建 IntersectionObserver | 性能开销小但逻辑不够优雅，闭包时效性依赖重建而非 useCallback |
+| 浏览器后退不恢复滚动位置 | useEffect([pathname]) 只做 scrollTo(0,0) | 用户按浏览器后退后回到页面顶部而非之前的位置 |
+| 缺少 aria-live 焦点管理等无障碍支持 | 路由切换无通知、Present Mode 无焦点陷阱、图片无 alt | 屏幕阅读器用户几乎无法正常使用 |
+| 缺少性能监控与内存采集 | 没有 performance.mark/measure，没有缓存统计 | 无法发现实际运行时的缓存增长和 GC 压力问题 |
