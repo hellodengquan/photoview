@@ -117,6 +117,101 @@ query = "Owner.id = ? OR Owner.admin = TRUE"
 - 关联的 Media 或 Album 被删除（CASCADE 级联删除）
 - 关联的 Owner 用户被删除（CASCADE 级联删除）
 
+### 2.4 媒体扫描 Worker Pool：高负载下的周期延迟机制
+
+**澄清：ShareToken 没有清理 worker pool。但媒体扫描（Scanner）有 worker pool，其高负载下的周期延迟机制如下：**
+
+#### 2.4.1 扫描队列 Worker Pool 架构
+
+文件：`api/scanner/scanner_queue/queue.go:43-98`
+
+```go
+type ScannerQueueSettings struct {
+    max_concurrent_tasks int  // 可配置，默认 PostgreSQL=3, SQLite=1
+}
+
+type ScannerQueue struct {
+    mutex       sync.Mutex
+    idle_chan   chan bool
+    in_progress []ScannerJob  // 正在执行的任务
+    up_next     []ScannerJob  // 等待队列
+    settings    ScannerQueueSettings
+    // ...
+}
+```
+
+**并发数配置：**
+- 默认值：PostgreSQL=3，SQLite=1（SQLite 不支持多 worker）
+- 可调范围：1-24（前端 `ScannerConcurrentWorkers.tsx:75` 的 `max="24"` 限制）
+- 管理员可在「Settings → Scanner concurrent workers」修改
+
+#### 2.4.2 定期扫描的 Ticker 机制
+
+文件：`api/scanner/periodic_scanner/periodic_scanner.go:144-174`
+
+```go
+func (ps *periodicScanner) scanIntervalRunner() {
+    for {
+        ps.tickerLocker.Lock()
+        ticker := ps.ticker
+        ps.tickerLocker.Unlock()
+
+        if ticker != nil {
+            select {
+            case <-ps.done:
+                return
+            case <-ps.ticker_changed:
+                // 配置变更
+            case <-ticker.C:
+                // ★ 同步调用：阻塞直到 AddAllToQueue 完成
+                log.Info(nil, "Scan interval runner: Starting periodic scan")
+                if err := ps.scannerQueue.AddAllToQueue(); err != nil {
+                    log.Error(nil, "Scan interval runner: Failed to add all users to queue", "error", err)
+                }
+            }
+        }
+        // ...
+    }
+}
+```
+
+**高负载下的延迟根源：**
+
+1. **同步阻塞执行**：`ticker.C` 触发后，`AddAllToQueue()` 是**同步调用**，必须等到所有用户的相册都加入队列后才会回到 `select` 等待下一次 tick
+2. **Ticker 事件累积**：`time.Ticker` 的特性是「事件不会丢失」—— 如果上一次处理还没完成，新的 tick 事件会在内部累积
+3. **累积事件连续触发**：一旦上一次处理完成，累积的 tick 事件会连续快速触发，导致「扫描风暴」
+
+**时间线示例（假设扫描周期=1小时）：**
+```
+T0: ticker 触发 → 开始扫描（预计 1.5 小时）
+T1: 1小时到了，ticker 再触发 → 事件累积（因为 goroutine 还在 T0 的扫描中）
+T1.5: T0 扫描完成 → 立即处理 T1 的累积事件 → 再次开始扫描
+T2.5: T1 扫描完成 → 回到 select 等待下一次 tick
+T3: 正常 tick → 开始扫描
+
+结果：原本应该间隔 1 小时，实际变成了间隔 0.5 小时，然后又恢复正常
+```
+
+#### 2.4.3 指标层缺失
+
+**结论：没有任何指标层暴露扫描周期延迟数据。**
+
+- 无 Prometheus metrics
+- 无 OpenTelemetry tracing
+- 无队列积压长度、等待时间、扫描耗时的持久化统计
+- 唯一的监控手段是日志（`log.Info` / `log.Error`）和实时通知（WebSocket `global-scanner-progress`）
+
+**通知内容（`queue.go:174-191`）：**
+```go
+notification.BroadcastNotification(&models.Notification{
+    Key:     globalScannerProgress,
+    Header:  "Scanning media",
+    Content: fmt.Sprintf("%d jobs in progress\n%d jobs waiting", 
+        inProgressLength, upNextLength),
+})
+```
+仅包含「进行中任务数」和「等待任务数」，无历史趋势、无延迟告警。
+
 ---
 
 ## 三、续期接口的权限校验深度剖析
@@ -209,6 +304,124 @@ func getUserToken(db *gorm.DB, userID int, tokenValue string) (*models.ShareToke
 - ✗ **不需要**输入密码二次验证
 - ✓ 只要 auth-token Cookie 有效且是 owner/admin，即可直接续期
 - ✓ 续期后原 token 值不变，分享链接不变，匿名用户刷新页面即可用新过期时间
+
+### 3.5 Owner 账号被删除/禁用时的续期权限边界
+
+**核心澄清：User 模型没有「禁用」字段，只有「删除」操作。不存在「账号被禁用但仍可登录」的中间状态。**
+
+#### 3.5.1 User 模型没有 disabled 字段
+
+文件：`api/graphql/models/user.go:14-21`
+
+```go
+type User struct {
+    Model
+    Username string  `gorm:"unique;size:128"`
+    Password *string `gorm:"size:256"`
+    Albums   []Album `gorm:"many2many:user_albums;constraint:OnDelete:CASCADE;"`
+    Admin    bool    `gorm:"default:false"`
+    // ↑ 只有 admin 标志，没有 disabled 标志
+}
+```
+
+**管理员可对用户执行的操作（`EditUserRow.tsx`）：**
+- 修改用户名
+- 修改密码
+- 授予/取消 Admin 权限
+- 修改根相册路径
+- **删除用户**（完全从数据库移除）
+
+不存在「禁用账号」「冻结账号」等功能。
+
+#### 3.5.2 用户删除时的 CASCADE 级联链
+
+文件：`api/graphql/models/share_token.go:11`
+```go
+Owner User `gorm:"constraint:OnDelete:CASCADE;"`
+```
+
+**完整的级联删除链：**
+```
+DELETE users WHERE id = ?
+    ↓ CASCADE
+DELETE access_tokens WHERE user_id = ?
+    ↓ CASCADE
+DELETE share_tokens WHERE owner_id = ?
+    ↓ CASCADE
+DELETE user_albums WHERE user_id = ?
+    ↓
+albums 若无其他 owner → DELETE albums
+    ↓ CASCADE
+DELETE media WHERE album_id = ?
+    ↓ ...
+```
+
+**结论：用户被删除的瞬间，其所有 ShareToken 会被数据库自动级联删除，不存在「账号删除了但 token 还能续期」的场景。**
+
+#### 3.5.3 AccessToken 过期检查（登录态有效性）
+
+虽然没有「禁用」概念，但 AccessToken 本身有过期机制。
+
+**AccessToken 模型（`user.go:35-41`）：**
+```go
+type AccessToken struct {
+    Model
+    UserID int       `gorm:"not null;index"`
+    User   User      `gorm:"constraint:OnDelete:CASCADE;"`
+    Value  string    `gorm:"not null;size:24;index"`
+    Expire time.Time `gorm:"not null;index"`  // 14天后过期
+}
+```
+
+**生成时设置过期时间（`user.go:137`）：**
+```go
+expire := time.Now().Add(14 * 24 * time.Hour)
+```
+
+**Dataloader 层的过期过滤（`userLoader.go:17,22`）：**
+```go
+err := db.Where("expire > ?", time.Now()).Where("value IN (?)", tokens).Find(&accessTokens).Error
+rows, err := db.Table("access_tokens").Select("distinct user_id").
+    Where("expire > ?", time.Now()).Where("value IN (?)", tokens).Rows()
+```
+
+**完整的续期权限检查链（含 AccessToken 过期）：**
+
+```
+用户发起 setExpireShareToken 请求（携带 auth-token Cookie）
+    ↓
+auth.AuthMiddleware() 读取 Cookie 中的 auth-token 值
+    ↓
+UserFromAccessToken dataloader 加载用户
+    ├─ SQL: WHERE expire > NOW() AND value = ?
+    ├─ 过期 → 返回 nil → @isAuthorized 返回 ErrUnauthorized
+    └─ 有效 → 返回 User 对象
+    ↓
+@isAuthorized 指令检查 user != nil
+    ├─ nil → 401 Unauthorized
+    └─ 非 nil → 继续
+    ↓
+getUserToken() 检查 Owner 或 Admin
+    ├─ 不是 owner 也不是 admin → 403 Forbidden
+    └─ 是 owner 或 admin → 续期成功
+```
+
+#### 3.5.4 极端场景分析
+
+| 场景 | 能否续期 | 原因 |
+|------|----------|------|
+| Owner 正常登录，auth-token 有效 | ✅ 可以 | 两层校验都通过 |
+| Owner 的 auth-token 过期了 | ❌ 不可以 | Dataloader 层过滤 `expire > NOW()` 失败 |
+| Owner 被取消 Admin 权限 | ✅ 可以 | 只要是 Owner 即可，不需要 Admin |
+| Owner 被删除 | ❌ 不可以 | ShareToken 已被 CASCADE 删除，token 不存在 |
+| 另一个 Admin 操作别人的 token | ✅ 可以 | `Owner.admin = TRUE` 分支允许越权 |
+| Admin 被降级为普通用户后，操作别人的 token | ❌ 不可以 | 不再满足 `Owner.admin = TRUE`，也不是 Owner |
+
+**关键结论：**
+- ❌ 不存在「账号被禁用」的状态，只有「存在」和「已删除」
+- ❌ 用户被删除时 ShareToken 同步删除，无法续期
+- ❌ AccessToken 过期（14天）也会导致续期失败，需要重新登录获取新 token
+- ✅ Admin 可以越权续期任何用户的 token（这是设计使然的权限模型）
 
 ---
 
@@ -569,6 +782,147 @@ query: { fetchPolicy: 'no-cache' },
 
 测试中显式禁用了缓存，因此测试用例不会遇到缓存窗口期问题。生产环境使用默认的 `cache-first` 策略。
 
+### 7.6 前端缓存配置澄清：无 react-query，无 staleTime，无用户可调项
+
+**核心澄清：项目使用的是 `@apollo/client` (Apollo Client)，不是 `react-query` / `@tanstack/react-query`。没有 `staleTime` 配置，也没有 5 分钟硬编码值。**
+
+#### 7.6.1 技术选型：Apollo Client，不是 react-query
+
+**证据链：**
+
+1. **package.json 依赖**（从代码推断）：
+   - 使用 `@apollo/client`（导入路径：`import { useQuery, useMutation, gql } from '@apollo/client'`）
+   - 没有 `react-query` 或 `@tanstack/react-query` 的依赖
+   - 没有 `staleTime` 配置（这是 react-query 的专属概念）
+   - Apollo Client 的等效概念是 `fetchPolicy`，不是 `staleTime`
+
+**前端使用的是 Apollo Client 的 `useQuery` / `useMutation`：**
+```javascript
+// 例如 Sharing.tsx:1
+import { useQuery, useMutation, gql } from '@apollo/client'
+// 例如 ScannerConcurrentWorkers.tsx:2
+import { useQuery, useMutation, gql } from '@apollo/client'
+```
+
+**Apollo Client 配置：**
+文件：`ui/src/apolloClient.ts:161-194`
+
+```javascript
+const memoryCache = new InMemoryCache({
+  typePolicies: {
+    SiteInfo: { merge: true },
+    MediaURL: { keyFields: ['url'] },
+    Album: { fields: { media: paginateCache(...) } },
+    // ↑ 没有 ShareToken 的特殊 typePolicy
+  },
+})
+
+const client = new ApolloClient({
+  link: ApolloLink.from([linkError, link]),
+  cache: memoryCache,
+  // ↑ 未设置 defaultOptions → fetchPolicy 使用默认值 cache-first
+})
+```
+
+**Apollo Client 与 react-query 的概念对比：**
+
+| 特性 | Apollo Client | react-query (@tanstack) | 本项目是否使用 |
+|------|---------------|------------------------|---------------|
+| 数据获取 Hook | `useQuery` | `useQuery`（同名不同实现） | Apollo Client |
+| 缓存策略 | `fetchPolicy` | `staleTime` + `cacheTime` | fetchPolicy |
+| 默认值 | `cache-first` | `staleTime: 0`（立即过期） | cache-first |
+| 5分钟硬编码 | ❌ 无 | `staleTime: 300000`（常见用法） | ❌ 无 |
+
+#### 7.6.2 前端所有 useQuery 调用的缓存策略
+
+**全局搜索所有 `useQuery` 调用：** 均未显式设置 `fetchPolicy`，全部使用默认的 `cache-first`。
+
+**示例 1：Sharing.tsx（侧边栏分享列表）：**
+```javascript
+const { data, loading, error } = useQuery(ALBUM_SHARES_QUERY, {
+  variables: { albumId },
+  // ↑ 未设置 fetchPolicy → 默认为 cache-first
+})
+```
+
+**示例 2：AlbumSharePage.tsx（相册分享页）：**
+```javascript
+const { data, loading, error } = useQuery(SHARE_TOKEN_QUERY, {
+  variables: { credentials: { token, password } },
+  // ↑ 未设置 fetchPolicy → 默认为 cache-first
+})
+```
+
+**示例 3：ScannerConcurrentWorkers.tsx（并发 worker 配置）：**
+```javascript
+const workerAmountQuery = useQuery<concurrentWorkersQuery>(
+  CONCURRENT_WORKERS_QUERY,
+  {
+    onCompleted(data) { /* ... */ },
+    // ↑ 未设置 fetchPolicy → 默认为 cache-first
+  }
+)
+```
+
+#### 7.6.3 没有任何用户可调整的缓存配置 UI
+
+**结论：** 前端**没有**任何地方暴露缓存配置给用户调整：
+
+1. **Settings 页面检查**：
+   - `SettingsPage.tsx`：无缓存配置项
+   - `UserPreferences.tsx`：仅语言配置
+   - `PeriodicScanner.tsx`：仅定期扫描间隔配置
+   - `ScannerConcurrentWorkers.tsx`：仅并发 worker 数配置
+
+2. **无隐藏配置**：
+   - 无 `localStorage` 持久化的缓存配置
+   - 无 URL query 参数控制缓存策略
+   - 无用户偏好设置中的缓存选项
+   - 无开发者面板/调试选项
+
+**唯一的缓存控制机制：**
+
+| 机制 | 位置 | 作用 |
+|------|------|------|
+| `refetch()` | 各组件手动调用 | 强制重新请求，绕过缓存 |
+| `refetchQueries` | mutation 配置 | 变更后刷新指定查询 |
+| 页面刷新（F5） | 浏览器行为 | 内存缓存全部清空 |
+| 测试环境 `no-cache` | `SharePage.test.tsx:104` | 仅测试用 |
+
+#### 7.6.4 Apollo Client `cache-first` 策略的实际行为
+
+**Apollo Client 默认 `fetchPolicy: 'cache-first'` 的行为：**
+
+```
+useQuery 发起请求
+    ↓
+检查 InMemoryCache
+    ├─ ✅ 缓存命中 → 直接返回缓存数据，不发网络请求
+    │   └─ 不会检查数据是否「过期」（Apollo 无 staleTime 概念）
+    └─ ❌ 缓存未命中 → 发网络请求，写入缓存，返回数据
+```
+
+**与 react-query `staleTime: 300000` (5分钟) 的对比：**
+
+| 行为 | Apollo cache-first | react-query staleTime: 5min |
+|------|-------------------|-----------------------------|
+| 首次请求 | 发网络请求 | 发网络请求 |
+| 3分钟后再次请求 | 返回缓存，不发请求 | 返回缓存（stale），后台静默刷新 |
+| 6分钟后再次请求 | 返回缓存，不发请求 | 发网络请求（已过期） |
+| 数据变更后的感知 | 需要手动 refetch | 下次访问时自动刷新 |
+
+**对 ShareToken 的实际影响：**
+
+```
+场景 1：token 未过期时访问分享页 → 写入缓存
+场景 2：token 过期了，用户在同一会话内再次访问 → 返回缓存（因为 cache-first）
+         → 页面结构正常显示
+         → 但图片/视频请求会被 HTTP 路由拦截 → 403
+         → 用户体验：页面能打开，图全挂了
+```
+
+这与之前分析的「缓存窗口期」现象一致，但**不是因为 staleTime 5 分钟**，而是因为 Apollo Client 的 `cache-first` 策略**永远不会自动让缓存过期**（除非手动触发 refetch 或页面刷新）。
+
 ---
 
 ## 八、完整协作流程图
@@ -718,13 +1072,16 @@ query: { fetchPolicy: 'no-cache' },
   一次 DB 更新即可生效，无需重新生成 token
 ```
 
-### 9.3 三处深入发现的关键结论
+### 9.3 六处深入发现的关键结论
 
 | 问题 | 结论 | 关键代码 |
 |------|------|----------|
 | **过期记录清理** | ❌ 无后台 cron 任务，过期记录永久保留 | `periodic_scanner.go`、`scanner_tasks.go` |
 | **续期权限校验** | ✅ 两层校验（登录 + owner/admin），无需重新登录 | `directive.go`、`share_token_actions.go:167` |
 | **前端缓存窗口期** | ⚠️ Apollo cache-first 策略可能导致页面文字正常但图片全挂 | `apolloClient.ts`、`SharePage.tsx` |
+| **高负载扫描延迟** | ⚠️ 同步阻塞的 Ticker + event 累积，可能导致「扫描风暴」，无指标层 | `periodic_scanner.go:159`、`queue.go:47` |
+| **账号禁用续期** | ❌ 无禁用功能，只有删除；删除级联清空 ShareToken | `user.go:14`、`share_token.go:11` |
+| **staleTime 配置** | ❌ 用的是 Apollo Client，不是 react-query，无 staleTime，无用户可调 | `apolloClient.ts:161`、所有 useQuery 调用 |
 
 ### 9.4 关键文件索引
 
@@ -738,8 +1095,12 @@ query: { fetchPolicy: 'no-cache' },
 | 图片路由 | `api/routes/photos.go` | 图片加载 authenticateMedia 调用 |
 | 视频路由 | `api/routes/videos.go` | 视频播放 authenticateMedia 调用 |
 | 下载路由 | `api/routes/downloads.go` | ZIP 打包下载 authenticateAlbum 调用 |
-| 定期扫描器 | `api/scanner/periodic_scanner/periodic_scanner.go` | 仅媒体扫描，无 Token 清理 |
+| 定期扫描器 | `api/scanner/periodic_scanner/periodic_scanner.go` | 仅媒体扫描，无 Token 清理，Ticker 机制 |
+| 扫描队列 | `api/scanner/scanner_queue/queue.go` | Worker Pool 架构，并发控制 |
 | 扫描任务列表 | `api/scanner/scanner_tasks/scanner_tasks.go` | allTasks 数组不含 Token 清理 |
+| 用户模型 | `api/graphql/models/user.go` | 无 disabled 字段，AccessToken 14天过期 |
+| 用户 Dataloader | `api/dataloader/userLoader.go` | AccessToken 过期过滤（WHERE expire > NOW()）|
+| 用户动作 | `api/graphql/models/actions/user_actions.go` | DeleteUser 级联删除链 |
 | 服务入口 | `api/server.go` | 后台组件初始化，无 Token 清理 |
 | Apollo 客户端 | `ui/src/apolloClient.ts` | InMemoryCache 配置、默认 cache-first |
 | 前端路由 | `ui/src/components/routes/Routes.tsx` | /share/:token 路由定义 |
@@ -748,3 +1109,5 @@ query: { fetchPolicy: 'no-cache' },
 | Cookie 管理 | `ui/src/helpers/authentication.ts` | share-token-pw-{token} 读写 |
 | URL 注入 | `ui/src/components/photoGallery/ProtectedMedia.tsx` | ?token= 查询参数附加 |
 | 侧边栏管理 | `ui/src/components/sidebar/Sharing.tsx` | 创建/删除/加密码/设置过期 UI |
+| 并发 worker 配置 | `ui/src/Pages/SettingsPage/ScannerConcurrentWorkers.tsx` | 1-24 可调，默认 PG=3/SQLite=1 |
+| 定期扫描配置 | `ui/src/Pages/SettingsPage/PeriodicScanner.tsx` | 扫描间隔可调（秒/分/时/天/月）|
