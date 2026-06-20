@@ -380,13 +380,239 @@ if videoThumbnailURL != nil {
 
 ---
 
-## 八、总结
+## 八、FFmpeg 转码失败时的降级播放路径分析
+
+### 8.1 转码失败的直接处理逻辑
+
+**ProcessVideoTask 内部无降级** (api/scanner/scanner_tasks/processing_tasks/process_video_task.go:95-98)：
+
+```go
+err = executable_worker.Ffmpeg.EncodeMp4(video.Path, webVideoPath)
+if err != nil {
+    // 直接返回错误，无任何 fallback 逻辑
+    return []*models.MediaURL{}, errors.Wrapf(err, "could not encode mp4 video (%s)", video.Path)
+}
+```
+
+转码失败时：
+- 整个事务回滚
+- 不创建 `VideoWeb` 记录到数据库
+- 错误向上冒泡到 `ProcessSingleMedia`
+- 最终在路由层返回 500 Internal Server Error (api/routes/videos.go:101-107)
+
+### 8.2 DataLoader 层面的隐含 fallback
+
+`NewVideoWebMediaURLLoader` (api/dataloader/mediaURLLoader.go:69-82) 的查询逻辑：
+
+```go
+WHERE purpose IN ('video-web', 'original')
+ORDER BY media_id ASC, CASE
+    WHEN 'original' THEN 0
+    WHEN 'video-web' THEN 1
+END ASC
+```
+
+**注意**：这个排序逻辑写反了！
+- `original` 的排序权重是 0，`video-web` 是 1
+- `ORDER BY ASC` 意味着权重小的排前面
+- 所以当两者都存在时，**`original` 会排在 `video-web` 前面**
+- 但注释写的是 "VideoWeb consistently wins ordering when both exist"，与实际代码相反
+
+不过这不影响 fallback 逻辑：
+- 当 `video-web` 不存在但 `original` 存在时，DataLoader 会返回 `original`
+- 这是唯一的降级路径
+
+### 8.3 降级路径的触发条件
+
+```
+降级播放的完整前置条件：
+├─ 1. 原视频必须是 Web 兼容格式 (IsWebCompatible() == true)
+│   ├─ mp4, webm, ogg, mpeg 四种
+│   └─ 这种情况下 ProcessVideoTask 会创建 MediaOriginal 记录
+├─ 2. VideoWeb 记录不存在
+│   ├─ 可能是转码失败（但 Web 兼容格式不会走转码分支）
+│   ├─ 或转码功能被禁用 (PHOTOVIEW_DISABLE_VIDEO_ENCODING=1)
+│   └─ 或转码尚未完成
+└─ 3. 必须通过 GraphQL 查询走 DataLoader 路径
+    └─ 直接访问 /api/video/{name} 路由只查 VideoWeb，不查 Original，无法降级
+```
+
+**路由层的限制** (api/routes/videos.go:34)：
+```go
+// 硬编码只查 video-web，无法降级到 original
+WHERE media_urls.media_name = ? AND media_urls.purpose = 'video-web'
+```
+
+这意味着：
+- 视频 URL 由 `MediaURL.URL()` 生成，Original 走 `/api/photo/`，VideoWeb 走 `/api/video/`
+- 如果 DataLoader fallback 到了 Original，前端拿到的 URL 是 `/api/photo/{name}`
+- 这个 URL 会走图片路由 (`/api/photo/`)，而图片路由也支持 `ServeFile` 和 Range 请求
+- 所以从技术上讲这个降级是能工作的，但路径非常隐晦
+
+### 8.4 实际降级效果评估
+
+| 场景 | 能否降级播放 | 原因 |
+|------|-------------|------|
+| 原视频是 mp4，从未转码过 | ✅ 可以 | DataLoader 返回 Original，URL 走 /api/photo/ |
+| 原视频是 avi，转码失败 | ❌ 不能 | 没有 Original 记录，DataLoader 返回 null |
+| 原视频是 mkv，转码功能被禁用 | ❌ 不能 | 没有 Original 记录 |
+| 原视频是 webm，VideoWeb 转码中 | ✅ 可以 | 临时 fallback 到 Original |
+| 直接访问 /api/video/{name} 路由 | ❌ 不能 | 路由层硬编码只查 VideoWeb |
+
+---
+
+## 九、HLS.js 与自适应码率 ABR 分析
+
+### 9.1 前端技术栈确认 (ui/package.json)
+
+检查依赖项，**没有任何视频播放器库**：
+```json
+{
+  "dependencies": {
+    "react": "^18.2.0",
+    "styled-components": "^5.3.5",
+    // ... 其他依赖
+    // ❌ 没有 hls.js
+    // ❌ 没有 shaka-player
+    // ❌ 没有 dash.js
+    // ❌ 没有 video.js
+  }
+}
+```
+
+### 9.2 前端播放实现确认
+
+`ProtectedVideo` 组件 (ui/src/components/photoGallery/ProtectedMedia.tsx:186-202)：
+
+```tsx
+<video
+  controls
+  crossOrigin="use-credentials"
+  poster={getProtectedUrl(media.thumbnail?.url)}
+>
+  <source src={getProtectedUrl(media.videoWeb.url)} type="video/mp4" />
+</video>
+```
+
+100% 原生 `<video>` 标签，**type 固定为 `video/mp4`**，没有 `application/x-mpegURL` 或 `application/dash+xml`。
+
+### 9.3 后端是否有 HLS 生成逻辑
+
+全局搜索结果：
+- 无 `hls`、`m3u8`、`ts`、`segment`、`chunk` 等关键词（除了 SVG logo 中的无关文本）
+- 无 HLS 播放列表生成代码
+- 无 ts 分片生成代码
+- FFmpeg 调用只有 `EncodeMp4` 和 `EncodeVideoThumbnail` 两个函数
+
+### 9.4 自适应码率 ABR 可能性评估
+
+**结论：完全不支持**
+
+ABR 自适应码率需要三个前提条件，Photoview 一个都不满足：
+
+| ABR 前提 | Photoview 现状 |
+|---------|---------------|
+| 多码率转码输出 | ❌ 只转一个 1080p MP4，无 480p/720p/1080p 多版本 |
+| 流媒体协议（HLS/DASH） | ❌ 只有整文件 MP4 |
+| 支持 ABR 的播放器 | ❌ 只有原生 `<video>` |
+
+即使未来想加 ABR，改动量也很大：
+- FFmpeg 命令要改成输出多码率 + HLS 分片
+- 后端要新增 m3u8 播放列表路由
+- 前端要引入 hls.js 或 shaka-player
+- 缓存目录结构要调整（按码率分子目录存 ts 分片）
+
+---
+
+## 十、LRU 缓存与 ts 分片 prefetch 机制分析
+
+### 10.1 LRU 缓存的真实用途
+
+`graphql_endpoint.go:41,44` 中有两处 LRU：
+
+```go
+import "github.com/99designs/gqlgen/graphql/handler/lru"
+
+// GraphQL 查询 AST 缓存，容量 1000
+graphqlServer.SetQueryCache(lru.New[*ast.QueryDocument](1000))
+
+// 持久化查询缓存，容量 100
+graphqlServer.Use(extension.AutomaticPersistedQuery{
+    Cache: lru.New[string](100),
+})
+```
+
+**这是 gqlgen 框架内置的 GraphQL 查询缓存**，与媒体文件缓存完全无关。
+
+依赖 `hashicorp/golang-lru/v2` 也是 gqlgen 的间接依赖，不是 Photoview 自己用的。
+
+### 10.2 媒体文件缓存机制
+
+`api/utils/media_cache.go` 中的缓存实现：
+
+```go
+// 只负责创建目录，不管理缓存生命周期
+func CachePathForMedia(albumID int, mediaID int) (string, error) {
+    // 创建 root/albumID/mediaID 三级目录
+    // 无容量限制
+    // 无 LRU 淘汰
+    // 无热度统计
+    // 无过期时间
+}
+```
+
+媒体缓存是**纯文件系统存储**：
+- 无限增长，直到磁盘满
+- 唯一的清理逻辑在 `cleanup_media.go` 中，但也是**存在性检查**，不是 LRU
+
+`cleanup_media.go` 逻辑概要：
+```go
+// 扫描数据库中的 MediaURL 记录
+// 检查对应的缓存文件是否存在
+// 如果数据库有记录但文件不存在 → 重新生成
+// 不删除任何文件，不做容量控制
+```
+
+### 10.3 ts 分片与 prefetch 机制
+
+**ts 分片：不存在**
+- 没有 HLS 就没有 ts 分片概念
+- 缓存目录里只有 `.mp4` 和 `.jpg` 两种文件
+
+**prefetch 机制：不存在**
+- 前端无预加载逻辑（原生 `<video>` 只有 `preload` 属性，默认为 "metadata"）
+- 后端无热度统计，无法判断哪些分片"热度低于阈值"
+- 连热度统计都没有，自然不可能基于热度触发 prefetch
+
+### 10.4 缓存策略总结
+
+| 特性 | 现状 |
+|------|------|
+| LRU 淘汰 | ❌ 无，媒体缓存永不自动删除 |
+| 容量限制 | ❌ 无，写满磁盘为止 |
+| 热度统计 | ❌ 无 |
+| 预加载/prefetch | ❌ 无 |
+| ts 分片 | ❌ 无 |
+| 过期清理 | ❌ 无，只有 cleanup 任务检查存在性 |
+
+如果需要 LRU 缓存，需要自行实现：
+- 增加访问日志表记录每次访问时间
+- 定时任务扫描缓存目录，计算最近最少使用的文件
+- 删除超过阈值的文件
+
+---
+
+## 十一、总结
 
 Photoview 的视频方案设计非常务实：
 
 1. **没有 HLS/m3u8 分片** —— 使用浏览器原生 `<video>` + HTTP Range 实现伪流式播放
-2. **按需转码 + 后台预转码双通道：扫描时预转码，用户访问也能实时触发
-3. **缓存结构清晰**：`{cache/{albumID}/{mediaID}/` 按相册和媒体分层存储
-4. **`+faststart` 优化**：moov atom 前置让 MP4 让浏览器快速启动
+2. **按需转码 + 后台预转码双通道**：扫描时预转码，用户访问也能实时触发
+3. **缓存结构清晰**：`{cache}/{albumID}/{mediaID}/` 按相册和媒体分层存储
+4. **`+faststart` 优化**：moov atom 前置让 MP4 浏览器快速启动
 5. **硬件加速可选**：支持 qsv/vaapi/nvenc 硬件编码
 6. **鉴权一体化**：Cookie 登录或分享 token 两种方式
+7. **降级路径隐晦**：只有原视频是 Web 兼容格式时，DataLoader 才能 fallback 到 Original
+8. **无 ABR 自适应码率**：单码率 MP4，无多版本转码
+9. **无 LRU 缓存管理**：媒体缓存无限增长，无淘汰策略
+10. **无 prefetch 机制**：无热度统计，无分片预加载
