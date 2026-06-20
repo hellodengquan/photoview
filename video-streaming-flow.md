@@ -602,9 +602,297 @@ func CachePathForMedia(albumID int, mediaID int) (string, error) {
 
 ---
 
-## 十一、总结
+## 十一、fallback_original 触发后 partial 文件清理分析
 
-Photoview 的视频方案设计非常务实：
+### 11.1 前提澄清：没有 HLS，也就没有 HLS partial 文件
+
+再次强调：Photoview 不使用 HLS 协议，因此不存在 `.ts` 分片、`.m3u8` 播放列表，也就没有 "partial HLS 文件" 这个概念。
+
+本节讨论的是 **FFmpeg 转码过程中产生的不完整输出文件** 在转码失败后的命运。
+
+### 11.2 视频转码的文件写入模式
+
+**ProcessVideoTask 直接写入目标文件，无临时文件阶段** (api/scanner/scanner_tasks/processing_tasks/process_video_task.go:93-98)：
+
+```go
+webVideoPath := path.Join(mediaCachePath, webVideoName)
+// 直接把 ffmpeg 输出导向最终路径
+err = executable_worker.Ffmpeg.EncodeMp4(video.Path, webVideoPath)
+if err != nil {
+    // 失败直接 return，不清理 webVideoPath
+    return []*models.MediaURL{}, errors.Wrapf(err, "could not encode mp4 video (%s)", video.Path)
+}
+```
+
+对比 sidecar 任务的 `.hold` 安全模式 (api/scanner/scanner_tasks/processing_tasks/sidecar_task.go:99-106)：
+
+```go
+tempHighResPath := baseImagePath + ".hold"
+os.Rename(baseImagePath, tempHighResPath)  // 先把旧文件备份
+// ... 生成新文件 ...
+if err != nil {
+    os.Rename(tempHighResPath, baseImagePath)  // 失败则回滚
+    return ...
+}
+os.Remove(tempHighResPath)  // 成功才删除备份
+```
+
+**结论**：视频转码没有使用 `.hold` 模式，FFmpeg 直接写入最终路径。
+
+### 11.3 转码失败后残留文件的去向
+
+```
+转码失败时的文件状态：
+├─ 输出文件 web_video_xxx.mp4 已存在但内容不完整
+├─ 数据库中没有 VideoWeb 记录（因为事务回滚）
+└─ 这个不完整的文件会永久残留在缓存目录中
+```
+
+**为什么会残留**：
+1. `process_video_task.go` 失败直接 return，不做 `os.Remove` 清理
+2. `scanMedia` 中数据库事务回滚，但不回滚文件系统操作
+3. 没有专门的 "脏文件" 清理任务
+
+### 11.4 现有清理机制的覆盖范围
+
+`CleanupMedia` 函数 (api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go:17-65)：
+
+```go
+// 逻辑：找到数据库中不存在的媒体，删除其缓存目录
+func CleanupMedia(db *gorm.DB, albumId int, albumMedia []*models.Media) []error {
+    // 1. 查出数据库中该相册的所有媒体
+    // 2. 减去磁盘上实际存在的媒体
+    // 3. 对"数据库有但磁盘没了"的媒体，删除缓存目录
+}
+```
+
+**这个清理不处理残留转码文件的原因**：
+- 它只在**媒体本身从磁盘消失**时才清理缓存
+- 不完整的转码文件所在的媒体是存在的，所以不会触发清理
+- 它检查的是媒体级别的存在性，不检查单个缓存文件的完整性
+
+### 11.5 残留文件的实际影响
+
+| 场景 | 是否产生残留 | 残留影响 |
+|------|-------------|---------|
+| 后台扫描时转码失败 | ✅ 是 | 占用磁盘空间，但不影响播放（因为数据库没有记录，不会被请求） |
+| 按需转码（用户访问时触发）失败 | ✅ 是 | 同上，残留但不被引用 |
+| 转码过程中用户取消请求 | ✅ 可能 | context 取消时 ffmpeg 进程可能被中断，文件不完整 |
+| 下次重新转码 | ✅ 覆盖 | FFmpeg 会覆盖同名文件，旧的残留被替换 |
+
+**唯一的清理时机**：
+- 该媒体被从相册中删除 → `CleanupMedia` 删除整个缓存目录
+- 手动删除缓存目录
+
+---
+
+## 十二、ABR 切换机制与移动网络稳定性分析
+
+### 12.1 ABR 自适应码率：完全不存在
+
+再次确认三项核心前提全部缺失：
+
+| ABR 前提 | Photoview 现状 | 代码证据 |
+|---------|---------------|---------|
+| 多码率输出 | ❌ 只有 1080p 单码率 | `ffmpeg_cli.go:84` 固定 `min(1080,iw)` |
+| 流媒体协议 | ❌ 只有整文件 MP4 | 全局无 m3u8/ts 生成代码 |
+| ABR 播放器 | ❌ 只有原生 `<video>` | `ProtectedMedia.tsx:193` 原生 video 标签 |
+
+### 12.2 移动端网络适配：零代码
+
+**前端无任何网络相关逻辑**：
+- 没有 `navigator.connection.effectiveType` 检测网络类型
+- 没有 `Network Information API` 使用
+- 没有根据网络状况切换视频质量的逻辑
+- 没有缓冲状态监听（`buffered`, `waiting` 事件）
+- 没有低码率降级/高码率升级的策略
+
+**后端也没有移动端特殊处理**：
+- 不区分客户端类型返回不同码率
+- 没有 User-Agent 检测
+- 没有移动端专用的更低码率转码版本
+
+### 12.3 4G 网络抖动时的表现
+
+由于完全依赖浏览器原生 `<video>` 的行为，4G 网络抖动时：
+
+```
+网络抖动时的用户体验：
+├─ 1. 缓冲耗尽 → 视频暂停，显示 loading  spinner（浏览器原生控件）
+├─ 2. 继续下载 → 缓冲足够后自动恢复播放
+├─ 3. 持续卡顿 → 用户只能手动暂停等待缓冲
+└─ 4. 完全断网 → 播放停止，无法继续
+```
+
+**没有的优化手段**：
+- ❌ 无码率自动降级（从 1080p 降到 480p）
+- ❌ 无预缓冲策略调整
+- ❌ 无缝切换（bitrate switching）
+- ❌ 帧率自适应
+
+### 12.4 稳定性指标：无任何监控
+
+代码中没有以下 QoE（Quality of Experience）指标的采集：
+
+| 指标 | 是否采集 | 备注 |
+|------|---------|------|
+| 缓冲事件次数 | ❌ 无 | - |
+| 平均缓冲时长 | ❌ 无 | - |
+| 首帧加载时间 | ❌ 无 | - |
+| 码率切换次数 | ❌ 无 | （本来就没切换） |
+| 播放中断率 | ❌ 无 | - |
+| 视频加载失败率 | ❌ 无 | - |
+
+前端没有任何视频播放事件的埋点或统计。
+
+### 12.5 与真正 ABR 方案的差距
+
+如果 Photoview 要实现 ABR，需要增加的模块：
+
+```
+ABR 实现路径：
+├─ 后端
+│   ├─ FFmpeg 输出多码率 (240p/360p/480p/720p/1080p)
+│   ├─ 生成 HLS 或 DASH 播放列表
+│   ├─ ts 分片生成与管理
+│   └─ m3u8/mpd 文件路由
+└─ 前端
+    ├─ 引入 hls.js 或 shaka-player
+    ├─ 实现 ABR 策略（带宽估计 + 缓冲区状态）
+    ├─ 码率切换 UI
+    └─ QoE 指标上报
+```
+
+工作量相当于重构整个视频系统。
+
+---
+
+## 十三、prefetch_queue 与缓存主动 evict 机制分析
+
+### 13.1 没有 prefetch_queue
+
+全局搜索结果：
+- 没有 `prefetch` 相关代码
+- 没有视频预加载队列
+- 没有分片预取逻辑
+- 没有预读策略
+
+**唯一的 "queue" 是 scanner_queue** (api/scanner/scanner_queue/queue.go)：
+```go
+type ScannerQueue struct {
+    in_progress []ScannerJob  // 正在执行的扫描任务
+    up_next     []ScannerJob  // 等待执行的扫描任务
+    // ...
+}
+```
+
+这是**媒体扫描队列**，用于后台扫描相册和转码，与播放时的 prefetch 完全无关。
+
+### 13.2 没有缓存容量限制
+
+**关键发现：媒体缓存是"无限增长"模式**
+
+`api/utils/media_cache.go` 中：
+- 无 `MaxSize` / `Capacity` 配置
+- 无磁盘空间检查
+- 无配额管理
+- 无按用户/按相册的容量限制
+
+环境变量中也没有相关配置 (`api/utils/environment_variables.go`)：
+```go
+// 所有缓存相关环境变量
+const (
+    EnvMediaCachePath EnvironmentVariable = "PHOTOVIEW_MEDIA_CACHE"
+    // ❌ 没有 PHOTOVIEW_MEDIA_CACHE_MAX_SIZE
+    // ❌ 没有 PHOTOVIEW_CACHE_QUOTA
+)
+```
+
+### 13.3 没有主动 evict 机制
+
+整个代码库中：
+- ❌ 没有 LRU 缓存淘汰
+- ❌ 没有 LFU 缓存淘汰
+- ❌ 没有 FIFO 淘汰
+- ❌ 没有 TTL 过期淘汰
+- ❌ 没有磁盘空间阈值触发清理
+
+**唯一的缓存删除发生在两种情况**：
+
+1. **媒体被删除** (cleanup_media.go:43-47)：
+```go
+// 当媒体文件从磁盘消失时，删除对应缓存目录
+cachePath := path.Join(utils.MediaCachePath(), strconv.Itoa(int(albumId)), strconv.Itoa(int(media.ID)))
+err := os.RemoveAll(cachePath)
+```
+
+2. **相册被删除** (cleanup_media.go:103-107)：
+```go
+// 当相册消失时，删除整个相册缓存目录
+cachePath := path.Join(utils.MediaCachePath(), strconv.Itoa(int(album.ID)))
+err := os.RemoveAll(cachePath)
+```
+
+这两种都是**被动删除**，不是基于容量或热度的主动 evict。
+
+### 13.4 缓存接近满时的行为
+
+**结论：什么都不做，直到磁盘写满**
+
+当缓存目录所在磁盘空间不足时：
+1. FFmpeg 转码会失败（因为写不出文件）
+2. 缩略图生成会失败
+3. 错误日志会记录失败原因
+4. 但系统不会主动清理任何缓存文件
+
+没有以下保护机制：
+- ❌ 磁盘水位线告警（如 80% 警告，95% 紧急）
+- ❌ 低水位自动清理
+- ❌ 写前检查磁盘空间
+- ❌ 缓存淘汰策略
+
+### 13.5 热度统计与 prefetch 的缺失链条
+
+要实现 "ts 分片热度低于阈值时触发 prefetch"，需要完整的链路：
+
+```
+prefetch 系统需要的组件：
+├─ 1. 访问日志/热度统计
+│   ├─ 记录每次视频请求
+│   ├─ 记录请求的时间戳和范围
+│   └─ 计算热度分数
+├─ 2. 预取决策
+│   ├─ 判断哪些分片/视频"热"
+│   ├─ 判断哪些"冷"且即将被访问
+│   └─ 触发预取任务
+├─ 3. 预取执行队列
+│   ├─ 并发控制
+│   ├─ 优先级调度
+│   └─ 取消机制
+└─ 4. 缓存淘汰
+    ├─ 容量上限
+    ├─ 淘汰策略 (LRU/LFU)
+    └─ 与预取的协同
+```
+
+Photoview 这四层全部缺失，连最基础的访问日志都没有。
+
+### 13.6 相关模块总结
+
+| 功能 | 现状 | 可能的误解 |
+|------|------|-----------|
+| prefetch_queue | ❌ 无 | scanner_queue 是扫描队列，不是预取队列 |
+| 缓存容量限制 | ❌ 无 | 会无限增长直到磁盘满 |
+| 主动 evict | ❌ 无 | 只有媒体删除时的被动清理 |
+| 热度统计 | ❌ 无 | 没有访问日志 |
+| 分片预取 | ❌ 无 | 连分片都没有 |
+| LRU 缓存 | ❌ 无（媒体缓存） | gqlgen 的 LRU 是 GraphQL 查询缓存，与此无关 |
+
+---
+
+## 十四、总结
+
+Photoview 的视频方案设计非常务实，本质是**个人相册级别的简单视频播放方案**：
 
 1. **没有 HLS/m3u8 分片** —— 使用浏览器原生 `<video>` + HTTP Range 实现伪流式播放
 2. **按需转码 + 后台预转码双通道**：扫描时预转码，用户访问也能实时触发
@@ -613,6 +901,8 @@ Photoview 的视频方案设计非常务实：
 5. **硬件加速可选**：支持 qsv/vaapi/nvenc 硬件编码
 6. **鉴权一体化**：Cookie 登录或分享 token 两种方式
 7. **降级路径隐晦**：只有原视频是 Web 兼容格式时，DataLoader 才能 fallback 到 Original
-8. **无 ABR 自适应码率**：单码率 MP4，无多版本转码
-9. **无 LRU 缓存管理**：媒体缓存无限增长，无淘汰策略
-10. **无 prefetch 机制**：无热度统计，无分片预加载
+8. **无 ABR 自适应码率**：单码率 MP4，无多版本转码，无移动端网络适配
+9. **无 LRU 缓存管理**：媒体缓存无限增长，无淘汰策略，无容量限制
+10. **无 prefetch 机制**：无热度统计，无分片预加载，无预取队列
+11. **转码失败残留文件**：失败时不清理不完整的输出文件，会占用磁盘空间
+12. **无 QoE 监控**：无播放质量指标采集，无网络稳定性统计
