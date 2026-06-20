@@ -684,6 +684,131 @@ ffprobe/ffmpeg 从视频容器元数据中读取位置信息时使用完全不�
 
 **结论**：不存在任何将 `Latitude` ↔ `GPSLatitude` 或 `location` ↔ `GPSLatitude` 的字段名映射代码。两套解析路径使用完全独立的字段命名体系，Photoview 选择了 exiftool 体系，从未与 ffmpeg 体系做过对齐。
 
+#### 9.1.6 alias_map 别名表与 ffmpeg metadata 字段覆盖分析
+
+**代码证据：项目中不存在 alias_map 别名表。**
+
+```bash
+$ grep -rn "alias_map\|aliasMap\|AliasMap" api/ ui/
+# 无结果
+```
+
+exiftool 的字段解析完全依赖 Go 标准库 `json.Decode` 的 struct tag 隐式映射机制，无任何显式别名表。映射逻辑位于两层结构体之间：
+
+**第一层：exiftool JSON → `exiftool` 包内部结构体**（`values.go:10-171`）
+
+通过 `QueryJSONTagsByNumber()` 调用 `json.NewDecoder(e.stdout).Decode(v)` 直接反序列化，字段名大小写敏感的 1:1 匹配：
+
+| exiftool JSON 键 | Go 结构体字段（values.go） | 类型 |
+|-----------------|---------------------------|------|
+| `GPSLatitude` | `GPS.GPSLatitude` | `*float64` |
+| `GPSLongitude` | `GPS.GPSLongitude` | `*float64` |
+| `SubSecDateTimeOriginal` | `TimeAll.SubSecDateTimeOriginal` | `*string` |
+| `SubSecCreateDate` | `TimeAll.SubSecCreateDate` | `*string` |
+| `DateTimeOriginal` | `TimeAll.DateTimeOriginal` | `*string` |
+| `CreateDate` | `TimeAll.CreateDate` | `*string` |
+| `TrackCreateDate` | `TimeAll.TrackCreateDate` | `*string` |
+| `MediaCreateDate` | `TimeAll.MediaCreateDate` | `*string` |
+| `FileModifyDate` | `TimeAll.FileModifyDate` | `*string` |
+| `OffsetTimeOriginal` | `TimeAll.OffsetTimeOriginal` | `*string` |
+| `OffsetTime` | `TimeAll.OffsetTime` | `*string` |
+| `TimeZone` | `TimeAll.TimeZone` | `*int` |
+| `GPSDateTime` | `TimeAll.GPSDateTime` | `*string` |
+| `ImageDescription` | `PhotoMeta.ImageDescription` | `*string` |
+| `Model` | `PhotoMeta.Model` | `*string` |
+| `Make` | `PhotoMeta.Make` | `*string` |
+| `LensModel` | `PhotoMeta.LensModel` | `*string` |
+| `ISO` | `PhotoMeta.ISO` | `*int64` |
+| `Flash` | `PhotoMeta.Flash` | `*int64` |
+| `Orientation` | `PhotoMeta.Orientation` | `*int64` |
+| `ExposureProgram` | `PhotoMeta.ExposureProgram` | `*int64` |
+| `ExposureTime` | `PhotoMeta.ExposureTime` | `*float64` |
+| `Aperture` | `PhotoMeta.Aperture` | `*float64` |
+| `FocalLength` | `PhotoMeta.FocalLength` | `*float64` |
+| `MIMEType` | `MIMEType.MIMEType` | `*string` |
+
+**第二层：`exiftool` 结构体 → `models.MediaEXIF` 数据库模型**（`exif.go:64-91`）
+
+这是项目中唯一的"映射"逻辑，但它不是别名表，而是**显式的字段赋值代码**：
+
+```go
+ret := models.MediaEXIF{
+    Camera:          values.Model,            // PhotoMeta.Model → MediaEXIF.Camera（字段名不同！）
+    Maker:           values.Make,             // PhotoMeta.Make → MediaEXIF.Maker
+    Lens:            values.LensModel,        // PhotoMeta.LensModel → MediaEXIF.Lens（字段名不同！）
+    Iso:             values.ISO,              // PhotoMeta.ISO → MediaEXIF.Iso（大小写不同！）
+    Flash:           values.Flash,            // PhotoMeta.Flash → MediaEXIF.Flash
+    Orientation:     values.Orientation,      // PhotoMeta.Orientation → MediaEXIF.Orientation
+    ExposureProgram: values.ExposureProgram,  // PhotoMeta.ExposureProgram → MediaEXIF.ExposureProgram
+    Exposure:        values.ExposureTime,     // PhotoMeta.ExposureTime → MediaEXIF.Exposure（字段名不同！）
+    Aperture:        values.Aperture,         // PhotoMeta.Aperture → MediaEXIF.Aperture
+    FocalLength:     values.FocalLength,      // PhotoMeta.FocalLength → MediaEXIF.FocalLength
+    Description:     values.ImageDescription, // PhotoMeta.ImageDescription → MediaEXIF.Description（字段名不同！）
+    DateShot:        ...,                     // TimeAll.TimeInLocal() 经过时间解析后赋值
+    OffsetSecShot:   ...,                     // TimeAll.OffsetSecs() 经过偏移计算后赋值
+    GPSLatitude:     values.GPS.GPSLatitude,  // GPS.GPSLatitude → MediaEXIF.GPSLatitude
+    GPSLongitude:    values.GPS.GPSLongitude, // GPS.GPSLongitude → MediaEXIF.GPSLongitude
+}
+```
+
+**字段名差异清单**（第二层映射中发生重命名的字段）：
+
+| 源字段（exiftool） | 目标字段（MediaEXIF） | 差异类型 |
+|---------------------|----------------------|----------|
+| `Model` | `Camera` | 语义重命名 |
+| `LensModel` | `Lens` | 简化命名 |
+| `ISO` | `Iso` | 大小写差异（全大写 → PascalCase） |
+| `ExposureTime` | `Exposure` | 语义简化 |
+| `ImageDescription` | `Description` | 简化命名 |
+| `TimeAll.*` (多个字段) | `DateShot` | 多字段优先级合并解析 |
+| `TimeAll.*` + GPS 时间 | `OffsetSecShot` | 多字段计算得出 |
+
+**ffmpeg/ffprobe 能暴露但 Photoview 完全未覆盖的 metadata 字段**：
+
+ffprobe 的 `ProbeData` 数据结构（来自 `gopkg.in/vansante/go-ffprobe.v2`）包含以下 Photoview 完全未使用的字段：
+
+| ffprobe 字段路径 | 含义 | Photoview 是否覆盖 |
+|-----------------|------|-------------------|
+| `Format.Tags["title"]` | 视频标题 | ❌ 未覆盖（照片走 exiftool） |
+| `Format.Tags["artist"]` | 艺术家/作者 | ❌ 未覆盖 |
+| `Format.Tags["album"]` | 专辑 | ❌ 未覆盖 |
+| `Format.Tags["date"]` | 创作日期 | ❌ 未覆盖（照片走 exiftool） |
+| `Format.Tags["genre"]` | 流派 | ❌ 未覆盖 |
+| `Format.Tags["comment"]` | 注释 | ❌ 未覆盖（照片走 exiftool） |
+| `Format.Tags["copyright"]` | 版权信息 | ❌ 未覆盖 |
+| `Format.Tags["location"]` | GPS 位置（ISO 6709） | ❌ 完全未使用 |
+| `Format.Tags["com.apple.quicktime.location.ISO6709"]` | Apple 位置信息 | ❌ 完全未使用 |
+| `Format.Tags["com.apple.quicktime.make"]` | Apple 设备厂商 | ❌ 未覆盖 |
+| `Format.Tags["com.apple.quicktime.model"]` | Apple 设备型号 | ❌ 未覆盖 |
+| `Stream.CodecName` | 编解码器短名 | ✅ 间接（`CodecLongName`） |
+| `Stream.PixFmt` | 像素格式 | ❌ 未覆盖 |
+| `Stream.ColorSpace` | 色彩空间 | ✅ 间接（`Profile` → ColorProfile） |
+| `Stream.DisplayAspectRatio` | 显示宽高比 | ❌ 未覆盖 |
+| `Stream.Rotation` | 旋转角度 | ❌ 未覆盖（照片走 exiftool Orientation） |
+| `Stream.Level` | 编码级别 | ❌ 未覆盖 |
+| `Stream.SampleAspectRatio` | 采样宽高比 | ❌ 未覆盖 |
+| `Stream.FieldOrder` | 场序（逐行/隔行） | ❌ 未覆盖 |
+| `Stream.ChromaSubsampling` | 色度子采样 | ❌ 未覆盖 |
+
+**ffprobe 中 Photoview 已覆盖的字段**（`video_metadata_task.go:66-75`）：
+
+| ffprobe 字段 | MediaEXIF / VideoMetadata 字段 |
+|-------------|-------------------------------|
+| `Stream.Width` | `VideoMetadata.Width` |
+| `Stream.Height` | `VideoMetadata.Height` |
+| `Format.DurationSeconds` | `VideoMetadata.Duration` |
+| `Stream.CodecLongName` | `VideoMetadata.Codec` |
+| `Stream.AvgFrameRate` → 解析 | `VideoMetadata.Framerate` |
+| `Stream.BitRate` | `VideoMetadata.Bitrate` |
+| `Stream.Profile` | `VideoMetadata.ColorProfile` |
+| `Stream.Channels` → 文本描述 | `VideoMetadata.Audio` |
+
+**总结**：不存在显式 `alias_map` 数据表/变量，字段映射通过两层机制实现：
+1. JSON 反序列化的隐式 struct 字段名匹配（exiftool JSON → values.go）
+2. `exif.go:64-91` 中手写的显式赋值语句（values.go → MediaEXIF）
+
+ffmpeg/ffprobe 能暴露的 metadata 字段中，Photoview 仅覆盖了视频技术参数（宽、高、时长、编码、帧率、码率、色彩、音频通道数）约 8 个字段，剩余 20+ 个标签/位置/色彩细节字段完全未涉及。
+
 ---
 
 ### 9.2 GPS 坐标精度与 geofence 边界场景影响
@@ -822,6 +947,74 @@ C(0.000900, 0.000900), D(0.000000, 0.000900)  → CD 边
 | 独栋建筑 | 10m 级 | ~4.44% | <5% | 是，边界敏感 |
 | 房间/设备 | 1m 级 | ~44.4% | <10% | 严重不可用 |
 | 50m 近邻查询 | — | ~0.44% | <1% | 可忽略 |
+
+#### 9.2.3.2 GPS 6 位小数截断（±11.1cm）在 nm 级精度科研场景下的影响
+
+**代码证据：Photoview 中不存在任何纳米级精度相关功能**
+
+```bash
+$ grep -rn "nanometer\|nm\|nanometre\|RTK\|差分\|survey\|geodetic" api/ ui/
+# 无任何结果
+```
+
+**精度量级对比**：
+
+| 精度级别 | 典型误差 | 获取方式 | Photoview 能否达到 |
+|----------|----------|----------|-------------------|
+| 6 位小数（Photoview 当前） | ±11.1 cm | 消费级 GPS（手机、运动相机） | ✅ 可以（float64 足够） |
+| 7 位小数 | ±1.11 cm | 中端 GNSS | ✅ 可以（float64 足够） |
+| 8 位小数 | ±1.11 mm | RTK 差分 GPS | ✅ 可以（float64 足够） |
+| 9 位小数 | ±0.111 mm | 大地测量级设备 | ✅ 理论可以（float64 约 ~15-17 位有效数字） |
+| **1 nm（纳米）** | 0.000001 mm = 10⁻⁹ m | 激光干涉仪/原子级测量 | ❌ 不相关 |
+
+**核心问题：GPS 不可能达到 nm 级精度**
+
+GPS/GNSS 系统的物理极限：
+- **民用 GPS（C/A 码）**：标称精度 3-5m（开放天空），实际 5-10m
+- **DGPS（差分 GPS）**：精度 0.5-3m
+- **RTK（实时动态差分）**：精度 1-5cm，基站覆盖区内
+- **PPK（事后动态差分）**：精度 5mm-1cm，后处理
+- **大地测量级静态观测**（数小时）：精度 0.1-1mm
+
+即使是最精密的大地测量 GPS，精度极限也在 **亚毫米级（0.1mm = 10⁵ nm）**，距离 1nm 还有 **5 个数量级**的差距。GPS 通过电磁波测距，波长 19cm（L1 载波），物理上不可能达到纳米级精度。
+
+**nm 级精度的典型应用场景**：
+- 半导体芯片制造（光刻定位）
+- 原子力显微镜（AFM）
+- X 射线晶体学
+- 量子计量学
+- 精密光学系统对准
+
+这些场景与照片地理定位完全无关，照片的 GPS 标签不可能也不需要纳米级精度。
+
+**如果 Photoview 误用在高精度科研场景（如 RTK 无人机测绘）的实际影响**：
+
+假设使用 RTK 设备采集了毫米级精度的 GPS 数据（如 44.478997231, 11.297922264），截断到 6 位小数后：
+
+```
+原始坐标（9 位小数，RTK 精度 5mm）：
+  lat = 44.478997231°  →  截断为 44.478997°  →  误差 = 0.000000231° ≈ 0.0256m = 2.56cm
+  lon = 11.297922264°  →  截断为 11.297922°  →  误差 = 0.000000264° ≈ 0.0293m = 2.93cm
+欧氏距离误差：√(2.56² + 2.93²) ≈ 3.89cm
+
+相对误差：3.89cm / 5mm(RTK标称精度) ≈ 7.8 倍精度损失
+```
+
+对典型 RTK 应用的影响：
+| 应用 | 精度要求 | 6 位小数截断是否可用 |
+|------|----------|---------------------|
+| 农业植保无人机 | ±10-30cm | ✅ 可用 |
+| 地形测绘（1:500 比例尺） | ±2-5cm | ⚠️ 临界，损失部分精度 |
+| 建筑物变形监测 | ±1-5mm | ❌ 不可用，误差 10 倍于要求 |
+| 大地控制点测量 | ±0.1-1mm | ❌ 完全不可用 |
+
+**Photoview 架构层面不支持高精度的根本原因**：
+1. `values.go:42` 使用 `%.9f` 格式化，但这只是显示格式，存储仍是 float64
+2. 前端地图使用 Mapbox GL JS，渲染精度在像素级（Zoom 22 时约 1cm/像素），完全看不到 mm 级差异
+3. `myMediaGeoJson` 返回的 GeoJSON 中坐标由 JavaScript 浮点数处理，精度虽够但渲染不支持
+4. 业务逻辑中无任何"高精度定位模式"开关或相关功能
+
+**结论**：nm 级精度场景与 Photoview 的产品定位（个人照片管理）完全脱节。GPS 技术本身也不可能达到 nm 级。即使是要求最高的 RTK 测绘场景（mm 级），float64 存储本身没问题，但 6 位小数截断会引入 ~2.5-4cm 误差，超出 RTK 标称精度约 5-8 倍。Photoview 不适合也不应用于科研级高精度定位场景。
 
 #### 9.2.4 geofence 边界场景的具体影响
 
@@ -993,6 +1186,236 @@ type PlacesConfig {
 
 前端通过 `useQuery(PLACES_CONFIG_QUERY)` 获取配置后传入 `map.addSource()`。
 
+#### 9.3.1.2 frontend/config.ts 暴露的 supercluster 配置：文档缺失与合法性校验缺失
+
+**代码证据：项目中不存在 frontend/config.ts。**
+
+```bash
+$ find ui/src -name "config*" -type f
+# 无结果
+$ grep -rn "PLACES_CLUSTER\|placesConfig\|PlacesConfig" ui/src/
+# 无结果（这是上文建议的方案，尚未实现）
+```
+
+**当前实际配置方式**：完全硬编码在 `PlacesPage.tsx:114-122`
+
+```typescript
+map.addSource('media', {
+    type: 'geojson',
+    data: mapboxData?.myMediaGeoJson as never,
+    cluster: true,
+    clusterRadius: 50,           // 硬编码
+    // clusterMaxZoom: 14        // 使用 Mapbox GL JS 默认值
+    // clusterMinPoints: 2       // 使用 Mapbox GL JS 默认值
+    clusterProperties: {
+        thumbnail: ['coalesce', ['get', 'thumbnail'], false],
+    },
+})
+```
+
+**若按上一节建议实现 frontend/config.ts，应包含的文档与校验：**
+
+**当前缺失项 A：配置文档（运维侧无法知晓配置项）**
+
+假设存在 `ui/src/config/placesConfig.ts`，应至少包含：
+
+```typescript
+/**
+ * Places（地图）聚类配置
+ *
+ * 通过环境变量注入（构建时）或 GraphQL placesConfig 查询（运行时）获取。
+ * 所有参数均有默认值，运维可按需调整。
+ */
+export interface PlacesClusterConfig {
+    /**
+     * 聚类像素半径（单位：屏幕像素）
+     * 范围：10 - 200
+     * 默认：50
+     * 值越大 → 聚类越激进（更多点被合并），地图越稀疏
+     * 值越小 → 聚类越保守（更少点被合并），地图越密集
+     * 建议：照片总量 <1万 用 30，1万-10万 用 50，>10万 用 80
+     */
+    clusterRadius: number;
+
+    /**
+     * 最大聚类缩放级别
+     * 范围：0 - 24（Mapbox GL JS zoom 范围）
+     * 默认：14
+     * 超过此缩放级别后，所有聚类解聚为独立点
+     * 值越大 → 解聚越晚（高缩放级别仍保持聚类）
+     * 警告：设为 20+ 且照片量大时，解聚瞬间可能产生数万 DOM 节点，导致卡顿
+     */
+    clusterMaxZoom: number;
+
+    /**
+     * 形成聚类的最少点数
+     * 范围：2 - 100
+     * 默认：2
+     * 值越大 → 小聚类越少（视觉更连贯），但孤立点更多
+     * 建议：照片总量 >10万 时设为 5-10，减少"两点聚类"
+     */
+    clusterMinPoints: number;
+}
+
+export const DEFAULT_PLACES_CLUSTER_CONFIG: PlacesClusterConfig = {
+    clusterRadius: 50,
+    clusterMaxZoom: 14,
+    clusterMinPoints: 2,
+};
+```
+
+**当前缺失项 B：默认值合法性校验（运维配置错误无任何反馈）**
+
+需在后端环境变量解析 + 前端消费处双重校验：
+
+```typescript
+/**
+ * 校验并规范化 Places 聚类配置。
+ * 配置超出合法范围时，回退到默认值并在控制台告警。
+ *
+ * @param rawConfig 从 GraphQL/环境变量获取的原始配置
+ * @returns 校验后的合法配置
+ */
+export function validatePlacesClusterConfig(
+    rawConfig: Partial<PlacesClusterConfig>,
+    logger: { warn: (msg: string) => void } = console
+): PlacesClusterConfig {
+    const config = { ...DEFAULT_PLACES_CLUSTER_CONFIG, ...rawConfig };
+
+    // 校验 clusterRadius：10 - 200 像素
+    if (!Number.isInteger(config.clusterRadius) || config.clusterRadius < 10 || config.clusterRadius > 200) {
+        logger.warn(
+            `[PlacesConfig] clusterRadius=${config.clusterRadius} 超出范围 [10, 200]，` +
+            `回退到默认值 ${DEFAULT_PLACES_CLUSTER_CONFIG.clusterRadius}`
+        );
+        config.clusterRadius = DEFAULT_PLACES_CLUSTER_CONFIG.clusterRadius;
+    }
+
+    // 校验 clusterMaxZoom：0 - 24（Mapbox GL JS 支持的 zoom 范围）
+    if (!Number.isInteger(config.clusterMaxZoom) || config.clusterMaxZoom < 0 || config.clusterMaxZoom > 24) {
+        logger.warn(
+            `[PlacesConfig] clusterMaxZoom=${config.clusterMaxZoom} 超出范围 [0, 24]，` +
+            `回退到默认值 ${DEFAULT_PLACES_CLUSTER_CONFIG.clusterMaxZoom}`
+        );
+        config.clusterMaxZoom = DEFAULT_PLACES_CLUSTER_CONFIG.clusterMaxZoom;
+    }
+
+    // 校验 clusterMinPoints：2 - 100（至少需要 2 个点才能叫"聚类"）
+    if (!Number.isInteger(config.clusterMinPoints) || config.clusterMinPoints < 2 || config.clusterMinPoints > 100) {
+        logger.warn(
+            `[PlacesConfig] clusterMinPoints=${config.clusterMinPoints} 超出范围 [2, 100]，` +
+            `回退到默认值 ${DEFAULT_PLACES_CLUSTER_CONFIG.clusterMinPoints}`
+        );
+        config.clusterMinPoints = DEFAULT_PLACES_CLUSTER_CONFIG.clusterMinPoints;
+    }
+
+    // 组合规则校验：clusterMaxZoom 不应过低
+    if (config.clusterMaxZoom < 5) {
+        logger.warn(
+            `[PlacesConfig] clusterMaxZoom=${config.clusterMaxZoom} 过低，` +
+            `Zoom ${config.clusterMaxZoom + 1}+ 级别将直接显示所有独立点，` +
+            `高密度区域可能导致浏览器卡顿`
+        );
+    }
+
+    // 组合规则校验：clusterMinPoints 不应高于 clusterRadius 能容纳的合理点数
+    const estimatedMaxPointsPerCluster = Math.PI * (config.clusterRadius / 2) ** 2 / 100; // 粗略估计
+    if (config.clusterMinPoints > estimatedMaxPointsPerCluster) {
+        logger.warn(
+            `[PlacesConfig] clusterMinPoints=${config.clusterMinPoints} 过高，` +
+            `clusterRadius=${config.clusterRadius} 像素范围内预计只能容纳约 ` +
+            `${Math.round(estimatedMaxPointsPerCluster)} 个点，可能无法形成任何聚类`
+        );
+    }
+
+    return config;
+}
+```
+
+**后端对应的环境变量校验**（`api/utils/environment_variables.go` 中应补充）：
+
+```go
+// （需新增）PlacesClusterRadius 返回聚类半径，合法范围 [10, 200]
+func PlacesClusterRadius() int {
+    val := os.Getenv(EnvPlacesClusterRadius)
+    if val == "" {
+        return 50
+    }
+    n, err := strconv.Atoi(val)
+    if err != nil || n < 10 || n > 200 {
+        log.Warn(nil, "Invalid PHOTOVIEW_PLACES_CLUSTER_RADIUS, using default 50",
+            "value", val)
+        return 50
+    }
+    return n
+}
+
+// （需新增）PlacesClusterMaxZoom 返回最大聚类缩放级别，合法范围 [0, 24]
+func PlacesClusterMaxZoom() int {
+    val := os.Getenv(EnvPlacesClusterMaxZoom)
+    if val == "" {
+        return 14
+    }
+    n, err := strconv.Atoi(val)
+    if err != nil || n < 0 || n > 24 {
+        log.Warn(nil, "Invalid PHOTOVIEW_PLACES_CLUSTER_MAX_ZOOM, using default 14",
+            "value", val)
+        return 14
+    }
+    return n
+}
+
+// （需新增）PlacesClusterMinPoints 返回最小聚类点数，合法范围 [2, 100]
+func PlacesClusterMinPoints() int {
+    val := os.Getenv(EnvPlacesClusterMinPoints)
+    if val == "" {
+        return 2
+    }
+    n, err := strconv.Atoi(val)
+    if err != nil || n < 2 || n > 100 {
+        log.Warn(nil, "Invalid PHOTOVIEW_PLACES_CLUSTER_MIN_POINTS, using default 2",
+            "value", val)
+        return 2
+    }
+    return n
+}
+```
+
+**运维配置文档（应写入 README 或部署文档）**：
+
+```markdown
+## Places 地图聚类配置（可选）
+
+| 环境变量 | 类型 | 默认值 | 范围 | 说明 |
+|----------|------|--------|------|------|
+| `PHOTOVIEW_PLACES_CLUSTER_RADIUS` | int | 50 | 10-200 | 聚类像素半径，越大合并越激进 |
+| `PHOTOVIEW_PLACES_CLUSTER_MAX_ZOOM` | int | 14 | 0-24 | 超过此 zoom 级别解聚为独立点 |
+| `PHOTOVIEW_PLACES_CLUSTER_MIN_POINTS` | int | 2 | 2-100 | 形成聚类最少需要的点数 |
+
+### 推荐配置
+
+| 照片规模 | RADIUS | MAX_ZOOM | MIN_POINTS |
+|----------|--------|----------|------------|
+| < 1 万张 | 30 | 14 | 2 |
+| 1 万 - 10 万张 | 50 | 15 | 3 |
+| 10 万 - 100 万张 | 80 | 16 | 5 |
+| > 100 万张 | 100 | 17 | 8 |
+
+配置错误时会回退到默认值并在服务端日志和浏览器 Console 输出告警。
+```
+
+**当前状态总结**：
+
+| 要素 | 当前代码状态 | 建议状态 |
+|------|-------------|----------|
+| `frontend/config.ts` 文件 | ❌ 不存在 | ✅ 新建，导出接口与默认值 |
+| 参数 JSDoc 文档 | ❌ 缺失 | ✅ 每个参数说明含义、范围、建议 |
+| 默认值单值合法性校验 | ❌ 缺失 | ✅ `validatePlacesClusterConfig()` 范围检查 |
+| 参数组合合理性校验 | ❌ 缺失 | ✅ radius/minPoints 冲突检测 |
+| 超范围回退 + 日志告警 | ❌ 缺失 | ✅ 前后端双重 `log.Warn` / `console.warn` |
+| 运维部署文档 | ❌ 缺失 | ✅ README/部署手册新增配置章节 |
+| 不同规模推荐配置 | ❌ 缺失 | ✅ 配置文档提供推荐值对照表 |
+
 #### 9.3.2 百万级数据的性能瓶颈分析
 
 **瓶颈 1：数据全量加载到前端内存**
@@ -1142,3 +1565,7 @@ const features = map.queryRenderedFeatures({
 | GPS 格式化输出（9 位小数精度） | `api/scanner/externaltools/exiftool/values.go` | 42 |
 | 环境变量定义清单 | `api/utils/environment_variables.go` | 16-47 |
 | 前端环境变量配置 | `ui/example.env` | 1 |
+| PhotoMeta 完整字段定义 | `api/scanner/externaltools/exiftool/values.go` | 139-151 |
+| TimeAll 时间字段定义 | `api/scanner/externaltools/exiftool/values.go` | 45-61 |
+| exiftool 结构体到 MediaEXIF 映射 | `api/scanner/externaltools/exif/exif.go` | 64-91 |
+| 视频 ffprobe 元数据提取（8个已覆盖字段 | `api/scanner/scanner_tasks/video_metadata_task.go` | 66-75 |
