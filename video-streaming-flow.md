@@ -1203,26 +1203,293 @@ Photoview 这四层**全部缺失**，连最基础的访问日志都没有。
 
 ---
 
-## 十七、总结
+## 十七、video.cleanup_interval 配置项与最小值 floor 分析
 
-Photoview 的视频方案设计非常务实，本质是**个人相册级别的简单视频播放方案**，很多企业级特性都没有实现：
+### 17.1 核心结论：不存在此配置项
 
-### 已实现的特性
-1. **没有 HLS/m3u8 分片** —— 使用浏览器原生 `<video>` + HTTP Range 实现伪流式播放
-2. **按需转码 + 后台预转码双通道**：扫描时预转码，用户访问也能实时触发
+全局代码搜索结果：
+- ❌ 没有 `cleanup_interval` 变量/函数
+- ❌ 没有 `video.cleanup` 命名空间
+- ❌ 没有专门的清理间隔配置
+
+### 17.2 与之最接近的配置：PeriodicScanInterval
+
+系统唯一的时间间隔配置是 `PeriodicScanInterval`，存储在 `site_info` 表中。
+
+**校验逻辑** (api/graphql/resolvers/scanner.go:55-59)：
+
+```go
+func (r *mutationResolver) SetPeriodicScanInterval(ctx context.Context, interval int) (int, error) {
+    db := r.DB(ctx)
+    if interval < 0 {
+        return 0, errors.New("interval must be 0 or above")
+    }
+    // ... 直接写入数据库，无其他校验
+}
+```
+
+**问题：没有最小值 floor 保护**
+
+| 校验项 | 是否存在 | 代码位置 |
+|--------|---------|---------|
+| 不允许负数 | ✅ 是 | `scanner.go:57` `interval < 0` |
+| 最小值 floor（如 ≥60s） | ❌ 否 | - |
+| 最大值 ceiling | ❌ 否 | - |
+| 整数溢出检查 | ❌ 否 | - |
+| 合理性警告 | ❌ 否 | - |
+
+运维可以设置 `interval = 1`，即**每 1 秒触发一次全量扫描**，这会导致：
+- CPU 和 I/O 资源被持续占用
+- FFmpeg 进程不断启动
+- 数据库高频读写
+- 对用户正常访问造成严重影响
+
+### 17.3 其他环境变量的校验对比
+
+| 配置项 | 校验逻辑 | 有 floor | 有 ceiling |
+|--------|---------|---------|-----------|
+| `PeriodicScanInterval` | `interval < 0` | ❌ 无 | ❌ 无 |
+| `ConcurrentWorkers` | `workers < 1` | ✅ 最小 1 | ❌ 无 |
+| `MediaProbeTimeout` | `seconds > 0` | ✅ 最小 1s | ❌ 无 |
+| `PHOTOVIEW_MEDIA_CACHE` | 无校验 | ❌ 无 | ❌ 无 |
+| `PHOTOVIEW_LISTEN_PORT` | 无校验 | ❌ 无 | ❌ 无 |
+
+**`ConcurrentWorkers` 有 floor（`≥1`）而 `PeriodicScanInterval` 没有**，这是一个防御性编程的遗漏。
+
+### 17.4 如果要加 floor 保护，需要修改的代码
+
+```
+scanner.go:55-59 的 SetPeriodicScanInterval 函数：
+
+// 当前代码
+if interval < 0 {
+    return 0, errors.New("interval must be 0 or above")
+}
+
+// 应改为（建议最小 60 秒，0 表示禁用）
+if interval < 0 {
+    return 0, errors.New("interval must be 0 or above")
+}
+if interval > 0 && interval < 60 {
+    return 0, errors.New("interval must be at least 60 seconds (or 0 to disable)")
+}
+```
+
+### 17.5 前端 UI 层面也无保护
+
+`PeriodicScanner.tsx:145-156` 的 `onScanIntervalUpdate` 函数直接将用户输入的值发送到后端：
+
+```tsx
+const onScanIntervalUpdate = (scanInterval: TimeValue) => {
+    const seconds = convertToSeconds(scanInterval)
+    if (scanIntervalServerValue.current != seconds) {
+        setScanIntervalMutation({
+            variables: { interval: seconds },
+        })
+    }
+}
+```
+
+前端没有做最小值校验，用户可以在输入框填入 `1` 秒并直接提交。
+
+---
+
+## 十八、network_type detection 与 WiFi-5GHz / 5G-NR 区分分析
+
+### 18.1 核心结论：不存在任何网络类型检测
+
+**后端**：无网络类型相关代码。
+- ❌ 没有 `network_type`、`wifi`、`5ghz`、`5g`、`nr` 相关代码
+- ❌ 不读取请求头中的网络信息
+- ❌ 不区分客户端网络环境
+
+**前端**：无 Network Information API 使用。
+- ❌ 没有 `navigator.connection`
+- ❌ 没有 `effectiveType`、`downlink`、`rtt`、`saveData`
+- ❌ 没有网络类型检测逻辑
+
+### 18.2 浏览器 Network Information API 能力
+
+虽然 Photoview 没使用，但浏览器原生支持的 `navigator.connection` 可以提供：
+
+```typescript
+// 浏览器 API 可提供的网络信息
+navigator.connection.effectiveType  // 'slow-2g' | '2g' | '3g' | '4g'
+navigator.connection.downlink       // 下行带宽估计 (Mbps)
+navigator.connection.rtt            // 往返时延 (ms)
+navigator.connection.saveData       // 是否开启省流模式
+navigator.connection.type           // 'wifi' | 'cellular' | 'ethernet' | 'none' | ...
+```
+
+**WiFi-5GHz 与 5G-NR 的区分限制**：
+
+| 区分需求 | API 能力 | 说明 |
+|---------|---------|------|
+| WiFi vs Cellular | ✅ `connection.type` | `wifi` vs `cellular` |
+| 5GHz vs 2.4GHz WiFi | ❌ 不可区分 | API 不暴露频段信息 |
+| 5G-NR vs 4G LTE | ❌ 粗略 | `effectiveType` 只到 `4g`，不区分 5G |
+| 实际带宽估计 | ✅ `downlink` | 但精度有限，基于历史吞吐量 |
+| 网络质量波动 | ⚠️ `rtt` + `change` 事件 | 可监听变化，但不是实时 |
+
+**结论**：即使用了 Network Information API，也无法精确区分 WiFi-5GHz 和 5G-NR。两者在 API 层面都表现为高带宽低延迟（`effectiveType: '4g'`, `downlink: 10+`, `rtt: <50`），无法仅靠浏览器 API 区分。
+
+### 18.3 区分 WiFi-5GHz 与 5G-NR 的技术路径
+
+如果真需要区分，只能通过以下方式：
+
+```
+精确区分网络类型的可行路径：
+├─ 1. 客户端提示 (Client Hints)
+│   ├─ Save-Data 请求头 ✅ 浏览器已支持
+│   ├─ Downlink 请求头 ❌ 非标准，需要自定义
+│   └─ 需要前端 JS 读取 navigator.connection 并注入请求头
+├─ 2. 服务端带宽探测
+│   ├─ 记录每个请求的传输速率
+│   ├─ 统计 IP 的历史带宽分布
+│   └─ 基于统计推断网络类型（不精确）
+├─ 3. IP 归属地 + 运营商数据库
+│   ├─ 判断 IP 是否属于移动运营商
+│   ├─ 成本高，精度有限
+│   └─ 无法区分运营商 WiFi 和自建 WiFi
+└─ 4. 用户手动选择
+    ├─ 设置页提供网络类型选项
+    ├─ 最简单但用户体验差
+    └─ 可作为 fallback
+```
+
+### 18.4 前端视频播放与网络类型的现状
+
+`ProtectedVideo` 组件 (ui/src/components/photoGallery/ProtectedMedia.tsx:186-202)：
+
+```tsx
+<video
+  controls
+  crossOrigin="use-credentials"
+  poster={getProtectedUrl(media.thumbnail?.url)}
+>
+  <source src={getProtectedUrl(media.videoWeb.url)} type="video/mp4" />
+</video>
+```
+
+- 固定 `type="video/mp4"`，无自适应
+- 无 `<source>` 标签列表（没有多码率可选）
+- 无 JS 监听 `navigator.connection.change`
+- 无根据网络类型调整 `preload` 策略
+
+---
+
+## 十九、evict_misprediction_rate 与自动回滚到保守 LRU 策略分析
+
+### 19.1 核心结论：不存在误判率统计，更不存在回滚机制
+
+全局代码搜索结果：
+- ❌ 没有 `misprediction`、`mis.predict` 相关代码
+- ❌ 没有 `evict_rate`、`evict_rollback` 相关代码
+- ❌ 没有 `conservative`、`fallback.*lru` 相关代码
+- ❌ 媒体缓存没有淘汰机制，也就没有误判可言
+
+### 19.2 系统中唯一存在 "策略回滚" 的代码
+
+Photoview 代码库中唯一有回滚逻辑的是 **sidecar 任务的 `.hold` 文件保护**（第十一章已分析），但这与缓存淘汰无关：
+
+```go
+// sidecar_task.go:99-106
+tempHighResPath := baseImagePath + ".hold"
+os.Rename(baseImagePath, tempHighResPath)  // 备份
+updatedHighRes, err := generateSaveHighResJPEG(...)
+if err != nil {
+    os.Rename(tempHighResPath, baseImagePath)  // 回滚
+    return ...
+}
+os.Remove(tempHighResPath)  // 成功则删除备份
+```
+
+这是一个文件级别的原子性保护，不是缓存策略的回滚。
+
+### 19.3 媒体缓存无淘汰 = 无误判问题
+
+因为媒体缓存**永不淘汰**，所以：
+- 没有 "被淘汰后又命中" 的误判场景
+- 没有 "淘汰决策是否正确" 的评估
+- 没有 "需要回滚到保守策略" 的触发条件
+
+缓存只有两种状态：
+1. **文件存在** → 返回文件
+2. **文件不存在** → 触发转码生成
+
+### 19.4 如果未来实现淘汰，误判率回滚机制的完整设计
+
+```
+evict_misprediction_rate 回滚机制设计：
+
+├─ 1. 指标采集层
+│   ├─ 每次淘汰记录：{时间, 媒体ID, 淘汰算法, 淘汰时热度分数}
+│   ├─ 每次缓存未命中记录：{时间, 媒体ID, 是否刚被淘汰}
+│   └─ 计算：misprediction_rate = 淘汰后 T 内再次访问的次数 / 总淘汰次数
+│
+├─ 2. 策略管理器
+│   ├─ 策略栈：[预测LRU (激进), 标准LRU (保守), LFU (最保守)]
+│   ├─ 当前策略：默认标准LRU
+│   └─ 切换条件：
+│       ├─ misprediction_rate > 10% → 降级到下一级保守策略
+│       ├─ misprediction_rate < 2%  → 尝试升级到激进策略
+│       └─ 突发流量检测 → 直接切换到保守策略
+│
+├─ 3. 回滚执行器
+│   ├─ 切换策略时预热缓存（加载热点数据）
+│   ├─ 记录策略切换历史
+│   └─ 冷却期：切换后 N 分钟内不再切换（防止抖动）
+│
+└─ 4. 告警层
+    ├─ misprediction_rate > 5%  → 警告日志
+    ├─ misprediction_rate > 10% → 策略降级 + 告警
+    └─ 连续降级到最保守策略 → 告警 + 建议扩容
+```
+
+### 19.5 当前代码与完整设计的差距
+
+| 组件 | 设计要求 | 当前代码 |
+|------|---------|---------|
+| 淘汰机制 | 必须有淘汰才能有误判 | ❌ 无淘汰 |
+| 指标采集 | 记录淘汰和重访问事件 | ❌ 无访问日志 |
+| 策略管理 | 多策略可切换 | ❌ 只有 gqlgen 标准LRU |
+| 回滚执行 | 降级+预热+冷却 | ❌ 无 |
+| 告警 | 阈值触发 | ❌ 无 |
+
+**结论**：误判率回滚是一个三层依赖（淘汰 → 指标 → 回滚），Photoview 第一层都没有。
+
+---
+
+## 二十、总结
+
+经过四轮对代码库的递进式分析，可以给出一个确定的结论：
+
+**Photoview 是一个个人/家庭级别的相册应用，其视频播放采用最简单的整文件 MP4 + HTTP Range 方案。用户追问的 HLS 分片、ABR 自适应码率、LRU 缓存淘汰、吞吐量监控、预测算法、误判率回滚等企业级流媒体特性，在该代码库中均不存在实现。**
+
+### 已实现的特性（8 项）
+1. **整文件 MP4 + HTTP Range**：浏览器原生 `<video>` + Go `http.ServeFile` 自动处理 206 Partial Content
+2. **按需转码 + 后台预转码**：扫描时预转码，用户访问时也能实时触发
 3. **缓存结构清晰**：`{cache}/{albumID}/{mediaID}/` 按相册和媒体分层存储
 4. **`+faststart` 优化**：moov atom 前置让 MP4 浏览器快速启动
 5. **硬件加速可选**：支持 qsv/vaapi/nvenc 硬件编码
 6. **鉴权一体化**：Cookie 登录或分享 token 两种方式
 7. **降级路径隐晦**：只有原视频是 Web 兼容格式时，DataLoader 才能 fallback 到 Original
-8. **周期性扫描可配置**：扫描周期和并发 worker 数暴露给运维配置
+8. **周期性扫描可配置**：扫描周期和并发 worker 数暴露给运维配置（但扫描周期无最小值 floor）
 
-### 未实现的特性
-9. **无 ABR 自适应码率**：单码率 MP4，无多版本转码，无移动端网络适配
-10. **无 LRU 缓存管理**：媒体缓存无限增长，无淘汰策略，无容量限制
-11. **无 prefetch 机制**：无热度统计，无分片预加载，无预取队列
-12. **转码失败残留文件**：失败时不清理不完整的输出文件，会占用磁盘空间
-13. **无 QoE 监控**：无播放质量指标采集，无网络稳定性统计
-14. **无 orphan 文件清理 worker**：只有周期性扫描，不清理残留转码文件
-15. **无吞吐量监控**：无采样间隔，无动态调整，无 5G 网络适配
-16. **无 LRU 预测算法**：只有标准 LRU（gqlgen 内置），无预测，无误判率统计
+### 未实现的特性（16 项）
+9. **无 HLS/m3u8 分片**：不生成 ts 分片，不生成 m3u8 播放列表
+10. **无 ABR 自适应码率**：单码率 MP4，无多版本转码，无移动端网络适配
+11. **无 LRU 缓存管理**：媒体缓存无限增长，无淘汰策略，无容量限制
+12. **无 prefetch 机制**：无热度统计，无分片预加载，无预取队列
+13. **转码失败残留文件**：失败时不清理不完整的输出文件，会占用磁盘空间
+14. **无 QoE 监控**：无播放质量指标采集，无网络稳定性统计
+15. **无 orphan 文件清理 worker**：只有周期性扫描，不清理残留转码文件
+16. **无吞吐量监控**：无采样间隔，无动态调整，无 5G 网络适配
+17. **无 LRU 预测算法**：只有标准 LRU（gqlgen 内置），无预测，无误判率统计
+18. **无 cleanup_interval 配置**：PeriodicScanInterval 是唯一的间隔配置，且无最小值 floor
+19. **无网络类型检测**：前端未使用 Network Information API，无法区分 WiFi-5GHz 与 5G-NR
+20. **无误判率回滚**：无淘汰机制，无指标采集，无策略管理，无回滚执行
+21. **前端无网络适配**：ProtectedVideo 固定 video/mp4，无多码率 source，无网络监听
+22. **配置校验不足**：PeriodicScanInterval 无 floor，运维可设置 1 秒扫描间隔导致资源耗尽
+23. **无容量保护**：缓存无上限，磁盘满后转码失败，无告警无自动清理
+24. **并发转码无去重**：多个请求同时触发同一视频转码时无 singleflight 保护
