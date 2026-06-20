@@ -64,18 +64,164 @@ query = "Owner.id = ? OR Owner.admin = TRUE"
 ```
 即 token 创建者本人或系统管理员均可操作。
 
+### 2.3 过期记录的清理机制（无后台定期任务）
+
+**结论：share_tokens 表中的过期记录**不会被后台定期任务自动清理。
+
+**代码证据链：**
+
+1. **定期扫描器只做媒体扫描**  
+   文件：`api/scanner/periodic_scanner/periodic_scanner.go:159-163`
+   ```go
+   case <-ticker.C:
+       log.Info(nil, "Scan interval runner: Starting periodic scan")
+       if err := ps.scannerQueue.AddAllToQueue(); err != nil {
+           // ...
+       }
+   ```
+   periodic_scanner 的唯一职责是触发媒体扫描队列，与 ShareToken 无关。
+
+2. **扫描任务列表不含 Token 清理**  
+   文件：`api/scanner/scanner_tasks/scanner_tasks.go:15-27`
+   ```go
+   var allTasks []scanner_task.ScannerTask = []scanner_task.ScannerTask{
+       NotificationTask{},
+       IgnorefileTask{},
+       processing_tasks.CounterpartFilesTask{},
+       processing_tasks.SidecarTask{},
+       processing_tasks.ProcessPhotoTask{},
+       processing_tasks.ProcessVideoTask{},
+       FaceDetectionTask{},
+       BlurhashTask{},
+       ExifTask{},
+       VideoMetadataTask{},
+       cleanup_tasks.MediaCleanupTask{},  // 仅清理磁盘缺失的媒体
+   }
+   ```
+   `MediaCleanupTask` 只负责清理「文件系统中已删除的媒体」，不涉及 ShareToken。
+
+3. **服务启动时无清理初始化**  
+   文件：`api/server.go:62-68`
+   ```go
+   if err := scanner_queue.InitializeScannerQueue(db); err != nil { ... }
+   if err := periodic_scanner.InitializePeriodicScanner(db); err != nil { ... }
+   if err := face_detection.InitializeFaceDetector(db); err != nil { ... }
+   ```
+   server.go 初始化的三个后台组件均与 ShareToken 清理无关。
+
+4. **无任何 cron / scheduler / 定时清理代码**  
+   全库搜索 `cron`、`scheduler`、`expired.*delete` 等关键词，均无 ShareToken 相关清理逻辑。
+
+**过期记录的删除仅在以下场景发生：**
+- 用户主动调用 `deleteShareToken` mutation
+- 关联的 Media 或 Album 被删除（CASCADE 级联删除）
+- 关联的 Owner 用户被删除（CASCADE 级联删除）
+
 ---
 
-## 三、分享页面访问流程（前端路由）
+## 三、续期接口的权限校验深度剖析
 
-### 3.1 路由入口
+### 3.1 setExpireShareToken 的完整权限链
+
+`setExpireShareToken` mutation 有**两层权限校验**，不需要 owner 重新登录确认，只要当前会话有效即可操作。
+
+**校验链：**
+
+```
+GraphQL 请求 → @isAuthorized 指令（第一层）
+    ↓
+resolver 函数 SetExpireShareToken（第二层）
+    ↓
+actions.SetExpireShareToken()
+    ↓
+getUserToken() → "Owner.id = ? OR Owner.admin = TRUE"
+```
+
+### 3.2 第一层：@isAuthorized 指令（登录态校验）
+
+文件：`api/graphql/directive.go:20-27`
+
+```go
+func IsAuthorized(ctx context.Context, obj interface{}, next graphql.Resolver) (res interface{}, err error) {
+    user := auth.UserFromContext(ctx)
+    if user == nil {
+        return nil, auth.ErrUnauthorized
+    }
+    return next(ctx)
+}
+```
+
+- 作用：确保请求方是已登录用户
+- 校验方式：从 HTTP 请求的 `auth-token` Cookie 中读取 token，通过 dataloader 查用户
+- 只要 Cookie 中的 auth-token 有效，就能通过这一层
+- **不需要重新输入密码或二次确认**
+
+### 3.3 第二层：getUserToken 所有权校验
+
+文件：`api/graphql/models/actions/share_token_actions.go:167-184`
+
+```go
+func getUserToken(db *gorm.DB, userID int, tokenValue string) (*models.ShareToken, error) {
+    var query string
+    if drivers.POSTGRES.MatchDatabase(db) {
+        query = "\"Owner\".id = ? OR \"Owner\".admin = TRUE"
+    } else {
+        query = "Owner.id = ? OR Owner.admin = TRUE"
+    }
+
+    var token models.ShareToken
+    err := db.Where("share_tokens.value = ?", tokenValue).Joins("Owner").Where(query, userID).First(&token).Error
+    // ...
+}
+```
+
+**两个分支的权限：**
+
+| 分支 | 条件 | 能否操作 |
+|------|------|----------|
+| **Owner 分支** | 当前用户 ID == token 的 OwnerID | ✅ 可以（token 创建者本人） |
+| **Admin 分支** | 当前用户的 admin = TRUE | ✅ 可以（系统管理员越权操作） |
+
+### 3.4 续期操作的完整调用栈
+
+```
+前端侧边栏 Sharing.tsx
+  MorePopoverSectionExpiration 组件
+    用户选择新日期 → 点击确认
+      ↓
+    useMutation(SET_EXPIRE_MUTATION)
+      variables: { token, expire: dayjs(date).endOf('day').format()+'Z' }
+      ↓
+    GraphQL 请求（携带 auth-token Cookie）
+      ↓
+后端
+  @isAuthorized 指令 → 确认已登录
+  SetExpireShareToken resolver → 调 actions.SetExpireShareToken
+    getUserToken → 确认是 owner 或 admin
+    token.Expire = expire
+    db.Save(&token) → 更新数据库
+      ↓
+    refetchQueries → 刷新侧边栏 shares 列表
+```
+
+**关键结论：**
+- ✗ **不需要**重新登录确认
+- ✗ **不需要**输入密码二次验证
+- ✓ 只要 auth-token Cookie 有效且是 owner/admin，即可直接续期
+- ✓ 续期后原 token 值不变，分享链接不变，匿名用户刷新页面即可用新过期时间
+
+---
+
+## 四、分享页面访问流程（前端路由）
+
+### 4.1 路由入口
 文件：`ui/src/components/routes/Routes.tsx:77-80`
 
 ```
 /share/:token/*  →  TokenRoute (懒加载)
 ```
 
-### 3.2 两阶段验证机制
+### 4.2 两阶段验证机制
 
 文件：`ui/src/Pages/SharePage/SharePage.tsx`
 
@@ -113,9 +259,9 @@ AuthorizedTokenRoute
 
 ---
 
-## 四、匿名下载授权机制
+## 五、匿名下载授权机制
 
-### 4.1 三条下载/访问路由
+### 5.1 三条下载/访问路由
 
 | 路由 | 文件 | 用途 |
 |------|------|------|
@@ -123,7 +269,7 @@ AuthorizedTokenRoute
 | `GET /video/{name}` | `api/routes/videos.go` | 视频播放（含转码后 web 格式） |
 | `GET /download/album/{id}/{purpose}` | `api/routes/downloads.go` | 批量打包下载相册为 ZIP |
 
-### 4.2 双轨认证架构
+### 5.2 双轨认证架构
 
 文件：`api/routes/authenticate_routes.go:19-69`
 
@@ -138,7 +284,7 @@ authenticateMedia / authenticateAlbum
 └─ 【匿名用户路径】进入 shareTokenFromRequest()
 ```
 
-### 4.3 ShareToken 请求认证核心逻辑
+### 5.3 ShareToken 请求认证核心逻辑
 
 文件：`api/routes/authenticate_routes.go:71-155`
 
@@ -176,7 +322,7 @@ shareTokenFromRequest(db, r, mediaID, albumID)
 └─ 全部通过 → 返回 true
 ```
 
-### 4.4 前端 URL Token 注入机制
+### 5.4 前端 URL Token 注入机制
 
 文件：`ui/src/components/photoGallery/ProtectedMedia.tsx:13-25`
 
@@ -208,9 +354,9 @@ crossOrigin="use-credentials"  // 确保 Cookie 随请求发送
 
 ---
 
-## 五、密码 Cookie 机制
+## 六、密码 Cookie 机制
 
-### 5.1 Cookie 存储（前端）
+### 6.1 Cookie 存储（前端）
 
 文件：`ui/src/helpers/authentication.ts:31-47`
 
@@ -225,7 +371,7 @@ getSharePassword(token)    // 读取
 clearSharePassword(token)  // 删除
 ```
 
-### 5.2 Cookie 读取（后端）
+### 6.2 Cookie 读取（后端）
 
 文件：`api/routes/authenticate_routes.go:95-113`
 
@@ -247,16 +393,16 @@ bcrypt.CompareHashAndPassword(
 
 ---
 
-## 六、Token 过期检查的「双向触发」机制
+## 七、Token 过期检查的「双向触发」机制
 
-### 6.1 两处过期检查点
+### 7.1 两处过期检查点
 
 | 检查位置 | 文件 | 场景 | 时间处理 |
 |----------|------|------|----------|
 | **GraphQL Resolver** | `api/graphql/resolvers/share_token.go:84-98` | 页面访问时获取 shareToken 元数据 | **构造 fakeTime**：截断纳秒，UTC，客户端本地时间视为 UTC |
 | **HTTP 路由** | `api/routes/authenticate_routes.go:89-92` | 图片/视频/下载请求时 | **直接 UTC 比较**：time.Now().UTC() vs expire.UTC() |
 
-### 6.2 为什么有两处检查？——协作流程
+### 7.2 为什么有两处检查？——协作流程
 
 ```
 用户访问 /share/abc123
@@ -282,7 +428,7 @@ shareTokenFromRequest()
     └─ 防止用户手动构造 URL 绕过页面层检查
 ```
 
-### 6.3 双向触发的含义
+### 7.3 双向触发的含义
 
 ```
 方向 1：Token 过期 → 阻止下载（正向拦截）
@@ -299,7 +445,7 @@ shareTokenFromRequest()
       → 后续下载请求自动放行
 ```
 
-### 6.4 时间处理的「坑」——fakeTime 逻辑
+### 7.4 时间处理的「坑」——fakeTime 逻辑
 
 文件：`api/graphql/resolvers/share_token.go:84-94` 与 `113-133`
 
@@ -323,9 +469,109 @@ fakeTime := time.Date(
 → 意味着 resolver 层可能通过（差几秒），但实际下载请求被拒
 → 这是一个细微的不一致点
 
+### 7.5 前端缓存：过期 Token 的隐形窗口期
+
+**结论：Apollo Client 的 InMemoryCache 可能导致「token 已过期但页面仍显示内容」的窗口期。**
+
+#### 7.5.1 Apollo 缓存配置
+
+文件：`ui/src/apolloClient.ts:161-194`
+
+```javascript
+const memoryCache = new InMemoryCache({
+  typePolicies: {
+    SiteInfo: { merge: true },
+    MediaURL: { keyFields: ['url'] },
+    Album: { fields: { media: paginateCache(...) } },
+    // 注意：没有 ShareToken 的特殊 typePolicy
+  },
+})
+
+const client = new ApolloClient({
+  link: ApolloLink.from([linkError, link]),
+  cache: memoryCache,
+  // 未设置 defaultOptions，fetchPolicy 使用默认值 cache-first
+})
+```
+
+**关键事实：**
+- 默认 `fetchPolicy: 'cache-first'`（Apollo Client 默认值）
+- ShareToken 查询未设置任何特殊缓存策略
+- 缓存 key 由 query 名称 + 变量共同决定
+
+#### 7.5.2 窗口期产生的条件
+
+```
+场景：用户第一次访问分享链接（token 未过期）
+    │
+    ├─ SHARE_TOKEN_QUERY 发起网络请求
+    ├─ 后端返回 shareToken 数据（包含 album/media）
+    └─ Apollo 将结果写入 InMemoryCache（以 token+password 为 key）
+    │
+    ▼
+用户停留在页面上，期间 token 过期了
+    │
+    └─ 页面上的图片/视频会陆续 403（因为 HTTP 路由每次都查 DB）
+    └─ 但页面元数据（标题、结构）仍然显示（因为走缓存）
+
+场景：用户在同一会话中重新访问同一分享链接
+    │
+    ├─ useQuery 检测到缓存中有匹配结果
+    ├─ cache-first 策略：直接返回缓存数据，不发网络请求
+    └─ 页面显示「正常」，但图片全是破图
+```
+
+**窗口期的边界：**
+
+| 操作 | 是否命中缓存 | 是否能检测过期 |
+|------|-------------|---------------|
+| 首次访问分享页 | ❌ 无缓存 | ✅ 网络请求，后端检查 |
+| 同一会话内再次访问 | ✅ 命中缓存 | ❌ 不发请求，无法知道过期 |
+| 刷新页面（F5） | ❌ 内存缓存重置 | ✅ 重新请求 |
+| 关闭浏览器再打开 | ❌ Cookie 和缓存都重置 | ✅ 重新请求 |
+| 密码变更后访问 | ❌ 变量变了，缓存 key 变 | ✅ 重新请求 |
+| 主动调用 refetch() | ❌ 强制网络请求 | ✅ 重新请求 |
+
+#### 7.5.3 两道防线的分工
+
+```
+过期检测三道防线：
+┌─────────────────────────────────────────────────────────┐
+│ 第 1 道：GraphQL Resolver 过期检查（fakeTime 方式）       │
+│   作用：页面加载时判断是否显示内容                        │
+│   问题：受 Apollo 缓存影响，可能不触发                    │
+├─────────────────────────────────────────────────────────┤
+│ 第 2 道：HTTP 路由过期检查（真实 UTC 比较）               │
+│   作用：每次媒体请求都检查，防止直链绕过                  │
+│   特点：无缓存，每次都查 DB，最可靠                       │
+├─────────────────────────────────────────────────────────┤
+│ 第 3 道：图片加载失败的视觉提示                           │
+│   作用：用户看到破图，间接感知 token 失效                 │
+│   特点：被动感知，不是主动拦截                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+**实际效果：**
+- 缓存窗口期内，页面**结构和文字**可能正常显示
+- 但**所有媒体资源**（图片、视频、下载）都会因 HTTP 路由检查而失败
+- 用户体验是「页面能打开，但图全挂了」
+- 这是「过期 → 拦截下载」双向触发机制中，HTTP 路由层兜底作用的体现
+
+#### 7.5.4 测试环境的特殊配置
+
+文件：`ui/src/Pages/SharePage/SharePage.test.tsx:104-106`
+
+```javascript
+// disable cache, required to make fragments work
+watchQuery: { fetchPolicy: 'no-cache' },
+query: { fetchPolicy: 'no-cache' },
+```
+
+测试中显式禁用了缓存，因此测试用例不会遇到缓存窗口期问题。生产环境使用默认的 `cache-first` 策略。
+
 ---
 
-## 七、完整协作流程图
+## 八、完整协作流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -441,42 +687,61 @@ fakeTime := time.Date(
 
 ---
 
-## 八、协作机制总结
+## 九、协作机制总结
 
-### 8.1 分享 Token 生命周期 × 匿名下载授权 的协作关系
+### 9.1 分享 Token 生命周期 × 匿名下载授权 的协作关系
 
 | 生命周期阶段 | 涉及模块 | 授权影响 |
 |-------------|----------|----------|
 | **创建** | `AddMediaShare` / `AddAlbumShare` | 生成可用 token，匿名用户可访问 |
 | **活跃** | 所有访问路径 | 双重过期检查 + 双重密码校验 |
-| **过期** | GraphQL resolver + HTTP route | 双向拦截：页面层和下载层都拒绝 |
-| **续期** | `SetExpireShareToken` | 更新 DB，后续请求自动放行 |
+| **过期（存储）** | share_tokens 表 | **无后台清理**，过期记录永久保留，仅 CASCADE 删除 |
+| **过期（访问）** | GraphQL resolver + HTTP route + 前端缓存 | 三道防线：页面检查 → 媒体检查 → 视觉感知 |
+| **续期** | `SetExpireShareToken` | 两层权限校验（登录 + owner/admin），原链接不变 |
 | **加/解密** | `ProtectShareToken` | 增删密码，影响 Cookie 校验要求 |
 | **删除** | `DeleteShareToken` | DB 记录消失，所有检查失败 |
 
-### 8.2 双向触发的本质
+### 9.2 双向触发的本质
 
 ```
 「过期 → 拦截下载」：
-  被动检查机制，两道防线（GraphQL + HTTP）
+  被动检查机制，三道防线
+  第 1 道：GraphQL Resolver（可能被 Apollo 缓存跳过）
+  第 2 道：HTTP 路由（每次请求都查 DB，最可靠）
+  第 3 道：图片加载失败的视觉提示
   防止用户绕开前端直接访问媒体 URL
 
 「续期 → 延长下载」：
-  主动修改机制，一次 DB 更新即可生效
-  无需重新生成 token，原链接保持可用
+  主动修改机制，两层权限校验
+  第 1 层：@isAuthorized 确保已登录
+  第 2 层：getUserToken 确保是 owner 或 admin
+  一次 DB 更新即可生效，无需重新生成 token
 ```
 
-### 8.3 关键文件索引
+### 9.3 三处深入发现的关键结论
+
+| 问题 | 结论 | 关键代码 |
+|------|------|----------|
+| **过期记录清理** | ❌ 无后台 cron 任务，过期记录永久保留 | `periodic_scanner.go`、`scanner_tasks.go` |
+| **续期权限校验** | ✅ 两层校验（登录 + owner/admin），无需重新登录 | `directive.go`、`share_token_actions.go:167` |
+| **前端缓存窗口期** | ⚠️ Apollo cache-first 策略可能导致页面文字正常但图片全挂 | `apolloClient.ts`、`SharePage.tsx` |
+
+### 9.4 关键文件索引
 
 | 模块 | 文件路径 | 核心内容 |
 |------|----------|----------|
 | 数据模型 | `api/graphql/models/share_token.go` | ShareToken 结构体 |
-| 业务动作 | `api/graphql/models/actions/share_token_actions.go` | CRUD + 权限校验 |
+| 业务动作 | `api/graphql/models/actions/share_token_actions.go` | CRUD + 权限校验（getUserToken）|
 | GraphQL 解析 | `api/graphql/resolvers/share_token.go` | 过期检查（fakeTime）+ 密码校验 |
+| GraphQL 指令 | `api/graphql/directive.go` | @isAuthorized / @isAdmin 权限指令 |
 | HTTP 路由认证 | `api/routes/authenticate_routes.go` | 下载授权核心逻辑（过期+密码+资源匹配）|
 | 图片路由 | `api/routes/photos.go` | 图片加载 authenticateMedia 调用 |
 | 视频路由 | `api/routes/videos.go` | 视频播放 authenticateMedia 调用 |
 | 下载路由 | `api/routes/downloads.go` | ZIP 打包下载 authenticateAlbum 调用 |
+| 定期扫描器 | `api/scanner/periodic_scanner/periodic_scanner.go` | 仅媒体扫描，无 Token 清理 |
+| 扫描任务列表 | `api/scanner/scanner_tasks/scanner_tasks.go` | allTasks 数组不含 Token 清理 |
+| 服务入口 | `api/server.go` | 后台组件初始化，无 Token 清理 |
+| Apollo 客户端 | `ui/src/apolloClient.ts` | InMemoryCache 配置、默认 cache-first |
 | 前端路由 | `ui/src/components/routes/Routes.tsx` | /share/:token 路由定义 |
 | 分享页面 | `ui/src/Pages/SharePage/SharePage.tsx` | 两阶段验证（预检+加载） |
 | 密码输入页 | `ui/src/Pages/SharePage/PasswordProtectedShare.tsx` | 密码收集与 Cookie 保存 |
