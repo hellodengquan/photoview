@@ -809,6 +809,90 @@ ffprobe 的 `ProbeData` 数据结构（来自 `gopkg.in/vansante/go-ffprobe.v2`�
 
 ffmpeg/ffprobe 能暴露的 metadata 字段中，Photoview 仅覆盖了视频技术参数（宽、高、时长、编码、帧率、码率、色彩、音频通道数）约 8 个字段，剩余 20+ 个标签/位置/色彩细节字段完全未涉及。
 
+#### 9.1.7 strings.HasPrefix 兜底匹配在 GPS 字段大小写/空格差异下的命中分析
+
+**代码证据：项目中不使用 strings.HasPrefix 做 GPS 字段匹配。**
+
+```bash
+$ grep -rn "HasPrefix\|HasSuffix\|strings\.Equal\|strings\.ToLower\|strings\.Contains" api/scanner/externaltools/exiftool/
+# 无结果
+```
+
+整个 `exiftool` 包中**没有任何字符串模糊匹配函数调用**。GPS 字段解析的唯一机制是 Go 标准库 `encoding/json.Decoder` 的 struct 字段名匹配。
+
+**Go json.Decode 字段匹配规则**（`exiftool.go:167`）：
+
+```go
+if err = json.NewDecoder(e.stdout).Decode(v); err != nil {
+    return
+}
+```
+
+Go 的 `json.Decoder` 使用以下规则将 JSON 键映射到 struct 字段：
+
+1. **精确匹配**：JSON 键必须与 Go struct 字段名**完全一致**（大小写敏感）
+2. **case-insensitive 回退**：仅当精确匹配失败时，才尝试不区分大小写匹配
+3. **无空格/前缀匹配**：不支持 `HasPrefix`、空格忽略或任何模糊匹配
+
+**具体测试：大小写和空格差异能否命中**
+
+| JSON 键（exiftool 输出） | Go struct 字段 | 精确匹配 | case-insensitive 回退 | 最终结果 |
+|--------------------------|---------------|----------|----------------------|----------|
+| `GPSLatitude` | `GPSLatitude` | ✅ | — | ✅ 命中 |
+| `gpslatitude` | `GPSLatitude` | ❌ | ✅ | ✅ 命中 |
+| `gpsLATITUDE` | `GPSLatitude` | ❌ | ✅ | ✅ 命中 |
+| `GPS Latitude` | `GPSLatitude` | ❌ | ❌ | ❌ **丢失** |
+| `GPS_Latitude` | `GPSLatitude` | ❌ | ❌ | ❌ **丢失** |
+| `Latitude` | `GPSLatitude` | ❌ | ❌ | ❌ **丢失** |
+| `gpsLatitude` | `GPSLatitude` | ❌ | ✅ | ✅ 命中 |
+
+**关键问题：exiftool 实际输出中是否会出现带空格的键？**
+
+exiftool 使用 `-n` 参数输出数值格式（`exiftool.go:233`），此时 JSON 键名遵循 exiftool 的标准命名规范：
+
+```
+exiftool 标准键名规则：
+- EXIF GPS 标签：GPSLatitude, GPSLongitude, GPSLatitudeRef, GPSLongitudeRef, GPSAltitude
+- IPTC 标签：无空格，如 Country, City
+- XMP 标签：exif:GPSLatitude, xmp:Creator（带命名空间前缀，但无空格）
+- QuickTime 标签：TrackCreateDate, MediaCreateDate
+- Composite 标签：SubSecDateTimeOriginal
+```
+
+exiftool **永远不会在 JSON 键中输出空格**。它的键名来自 EXIF/XMP/IPTC 标签的规范名称，这些规范名称本身就不用空格。
+
+**但如果文件元数据中存在非标准标签（如某些软件写入的自定义 XMP 扩展），会发生什么？**
+
+```json
+[{
+  "SourceFile": "photo.jpg",
+  "GPSLatitude": 44.4789972,      ← 标准 EXIF，Go 匹配成功
+  "GPS Longitude": 44.4789972,     ← 不可能：exiftool 不输出带空格的键
+  "xmp:GPSLatitude": 44.4789972,   ← XMP 命名空间前缀，Go 精确匹配失败
+                                      case-insensitive 也失败（多了 "xmp:" 前缀）
+                                      → GPS 数据丢失！
+}]
+```
+
+**DisallowUnknownFields 缺失的影响**：
+
+`exiftool.go:167` 没有调用 `decoder.DisallowUnknownFields()`，这意味着：
+- 无法匹配的 JSON 键会被**静默丢弃**，不会报错
+- 运维和开发者**无法得知**哪些 EXIF 字段因键名不匹配而丢失
+- 特别是 XMP 命名空间前缀的标签（如 `xmp:GPSLatitude`）会静默丢失
+
+**实际风险场景**：
+
+| 场景 | 风险等级 | 原因 |
+|------|----------|------|
+| 正常相机 EXIF GPS | 无风险 | exiftool 输出 `GPSLatitude`，精确匹配 |
+| 手机照片 EXIF GPS | 无风险 | 同上 |
+| 含 XMP 扩展 GPS 的照片 | **中风险** | `xmp:GPSLatitude` 不匹配 `GPSLatitude`，丢失但 EXIF GPS 仍存在 |
+| 经视频编辑器处理的 MP4 | **中风险** | 视频元数据可能走 `com.apple.quicktime.location.ISO6709`，而非 `GPSLatitude` |
+| 第三方软件写入的自定义 XMP | **低风险** | exiftool 可能合并输出，但不保证键名匹配 |
+
+**结论**：不存在 `strings.HasPrefix` 兜底匹配机制。Go 的 `json.Decode` 仅提供精确匹配 + case-insensitive 回退，不支持空格/前缀/命名空间模糊匹配。exiftool 的标准输出不会包含带空格的键名，因此"GPS Latitude" vs "GPSLatitude" 的情况在实际中不会发生。但 XMP 命名空间前缀（如 `xmp:GPSLatitude`）会导致静默丢失，且由于缺少 `DisallowUnknownFields()`，这类丢失不可观测。
+
 ---
 
 ### 9.2 GPS 坐标精度与 geofence 边界场景影响
@@ -1416,6 +1500,131 @@ func PlacesClusterMinPoints() int {
 | 运维部署文档 | ❌ 缺失 | ✅ README/部署手册新增配置章节 |
 | 不同规模推荐配置 | ❌ 缺失 | ✅ 配置文档提供推荐值对照表 |
 
+#### 9.3.1.3 maxZoom 等合法但无意义值的校验缺失分析
+
+**代码证据：当前无任何校验代码，上节建议的 `validatePlacesClusterConfig()` 也仅做了范围检查**
+
+上节建议的校验逻辑：
+```typescript
+if (!Number.isInteger(config.clusterMaxZoom) || config.clusterMaxZoom < 0 || config.clusterMaxZoom > 24) {
+    // 类型 + 范围校验
+}
+```
+
+这只检查了"值是否在 [0, 24] 的整数范围内"，但**没有检查值是否在业务语义上有意义**。
+
+**合法但无意义的值清单**：
+
+| 参数 | 合法但无意义的值 | 行为 | 后果 |
+|------|-----------------|------|------|
+| `clusterMaxZoom = 0` | ✅ 通过范围校验 | Zoom 1+ 级别就解聚，全球视图下也显示所有独立点 | 百万级数据 → 浏览器 OOM |
+| `clusterMaxZoom = 1` | ✅ 通过范围校验 | Zoom 2+ 级别就解聚，大洲级视图显示独立点 | 同上，稍好 |
+| `clusterMaxZoom = 24` | ✅ 通过范围校验 | 永远不解聚（Mapbox 最大 zoom 22） | 聚类永远不展开，无法看到单张照片 |
+| `clusterRadius = 200` | ✅ 通过范围校验 | 极端聚类，整个屏幕可能只有 1-2 个聚类 | 地图几乎不可用 |
+| `clusterMinPoints = 100` | ✅ 通过范围校验 | 几乎不可能形成聚类 | 等于关闭聚类功能 |
+| `clusterRadius = 10` + `clusterMinPoints = 100` | ✅ 分别通过 | 10px 半径内找 100 个点 → 不可能 | 无聚类，等同于 `cluster: false` |
+
+**maxZoom = 0 的详细分析**：
+
+Mapbox GL JS 的 supercluster 内部处理 `clusterMaxZoom` 的逻辑：
+```javascript
+// supercluster 源码简化
+if (zoom <= this.options.maxZoom) {
+    return this._cluster(points, zoom);  // 执行聚类
+} else {
+    return points;  // 直接返回原始点
+}
+```
+
+当 `clusterMaxZoom = 0` 时：
+- **Zoom 0**（全球视图，约 156km/像素）：执行聚类 → 显示几个大聚类
+- **Zoom 1**（大洲级，约 78km/像素）：直接返回原始点 → 百万 DOM 节点
+- 用户任何放大操作都会触发灾难性渲染
+
+当前端接收到 `myMediaGeoJson`（假设 100 万条数据）时：
+```
+Zoom 0 → supercluster 返回 5-10 个聚类 → 正常
+Zoom 1 → supercluster 返回 100 万个原始点 → 创建 100 万个 DOM Marker
+         → 每个 ReactDOM.render 独立渲染 → 内存暴涨 → 主线程冻结
+```
+
+**应该增加的语义校验**：
+
+在 `validatePlacesClusterConfig()` 的范围校验之后，增加业务语义校验：
+
+```typescript
+// 语义校验：clusterMaxZoom 过低（虽然合法但必然导致性能灾难）
+if (config.clusterMaxZoom <= 3) {
+    logger.warn(
+        `[PlacesConfig] clusterMaxZoom=${config.clusterMaxZoom} 过低。` +
+        `Zoom ${config.clusterMaxZoom + 1}+ 将显示所有独立点，` +
+        `在照片数量较多时（>1000）会导致浏览器严重卡顿或崩溃。` +
+        `建议最低设为 10，推荐 14-17。`
+    );
+    // 不强制回退，但强烈建议调整（运维可能有意为之，如小数据集）
+}
+
+// 语义校验：clusterMaxZoom 过高（聚类永远不会展开）
+if (config.clusterMaxZoom >= 22) {
+    logger.warn(
+        `[PlacesConfig] clusterMaxZoom=${config.clusterMaxZoom} 过高。` +
+        `Mapbox GL JS 最大支持 Zoom 22，此设置下聚类永远不会解聚，` +
+        `用户无法查看单张照片的位置。建议设为 14-17。`
+    );
+}
+
+// 语义校验：clusterMinPoints 与 clusterRadius 组合不合理
+if (config.clusterRadius <= 20 && config.clusterMinPoints >= 20) {
+    logger.warn(
+        `[PlacesConfig] clusterRadius=${config.clusterRadius} + ` +
+        `clusterMinPoints=${config.clusterMinPoints} 组合不合理。` +
+        `${config.clusterRadius}px 半径内难以容纳 ${config.clusterMinPoints} 个点，` +
+        `实际上等同于关闭聚类。建议降低 clusterMinPoints 或增大 clusterRadius。`
+    );
+}
+
+// 语义校验：clusterRadius 过大
+if (config.clusterRadius >= 150) {
+    logger.warn(
+        `[PlacesConfig] clusterRadius=${config.clusterRadius} 过大。` +
+        `几乎所有点会被合并为极少数聚类，地图将失去地理分辨能力。` +
+        `建议不超过 120。`
+    );
+}
+```
+
+**后端对应的环境变量语义校验**（`environment_variables.go` 补充）：
+
+```go
+func PlacesClusterMaxZoom() int {
+    // ... 范围校验 [0, 24] ...
+    if n <= 3 {
+        log.Warn(nil, "PHOTOVIEW_PLACES_CLUSTER_MAX_ZOOM is very low, "+
+            "zoom levels above this will show all individual points. "+
+            "This may cause browser performance issues with large photo libraries.",
+            "value", n, "recommended_min", 10)
+    }
+    if n >= 22 {
+        log.Warn(nil, "PHOTOVIEW_PLACES_CLUSTER_MAX_ZOOM is very high, "+
+            "clusters will never expand to show individual points. "+
+            "Users won't be able to see individual photo locations.",
+            "value", n, "recommended_max", 17)
+    }
+    return n
+}
+```
+
+**校验分级体系**：
+
+| 校验级别 | 含义 | 违反时行为 | 示例 |
+|----------|------|-----------|------|
+| L0 类型校验 | 值是否为正确类型 | 强制回退默认值 | `clusterMaxZoom = "abc"` |
+| L1 范围校验 | 值是否在有效区间内 | 强制回退默认值 | `clusterMaxZoom = -1` 或 `30` |
+| **L2 语义校验** | **值是否在业务上合理** | **仅告警不回退** | `clusterMaxZoom = 0` |
+| L3 组合校验 | 多个值之间是否自洽 | 仅告警不回退 | `radius=10 + minPoints=100` |
+
+**当前缺失的就是 L2 和 L3 级校验。** L0/L1 只保证"程序不会崩溃"，但 L2/L3 才保证"程序行为符合预期"。运维设置 `clusterMaxZoom=0` 不会得到任何错误提示，程序正常运行但地图功能实质上不可用。
+
 #### 9.3.2 百万级数据的性能瓶颈分析
 
 **瓶颈 1：数据全量加载到前端内存**
@@ -1535,6 +1744,171 @@ const features = map.queryRenderedFeatures({
 })
 ```
 
+#### 9.3.3 GPS 1mm 精度上限的可观测性指标（metrics）缺失分析
+
+**代码证据：项目中无任何 metrics 暴露机制**
+
+```bash
+$ grep -rn "prometheus\|metrics\|opentelemetry\|otel" api/go.mod
+# 无结果
+$ grep -rn "counter\|gauge\|histogram\|metric" api/scanner/
+# 无结果（仅有 scanner 的 "scanner" 变量名，非 Prometheus metrics）
+```
+
+**Photoview 日志体系现状**：
+
+`api/log/default.go` 仅提供 4 级日志（Debug/Info/Warn/Error），无结构化指标输出：
+
+```go
+func Debug(ctx context.Context, msg string, args ...any) { getLogger(ctx).DebugContext(ctx, msg, args...) }
+func Info(ctx context.Context, msg string, args ...any)  { getLogger(ctx).InfoContext(ctx, msg, args...) }
+func Warn(ctx context.Context, msg string, args ...any)  { getLogger(ctx).WarnContext(ctx, msg, args...) }
+func Error(ctx context.Context, msg string, args ...any) { getLogger(ctx).ErrorContext(ctx, msg, args...) }
+```
+
+GPS 相关的日志仅有一条，位于 `exif_task.go:25`：
+```go
+log.Warn(ctx, "SaveEXIF failed", "title", media.Title, "error", err, "path", media.Path)
+```
+
+没有关于 GPS 解析成功/失败/精度的任何日志或指标。
+
+**应该暴露的 GPS 可观测性指标**：
+
+| 指标名 | 类型 | 标签 | 含义 |
+|--------|------|------|------|
+| `photoview_exif_parse_total` | Counter | `status=success/failure/empty` | EXIF 解析总次数（按结果分类） |
+| `photoview_exif_gps_parsed_total` | Counter | `status=valid/invalid/missing` | GPS 解析结果分类计数 |
+| `photoview_exif_gps_invalid_reason_total` | Counter | `reason=nil_lat/nil_lon/nan_lat/nan_lon/out_of_range` | GPS 无效的具体原因计数 |
+| `photoview_exif_gps_precision_bucket` | Histogram | — | GPS 坐标小数位数分布（1-15 位） |
+| `photoview_exif_parse_duration_seconds` | Histogram | `file_type=image/video` | EXIF 解析耗时 |
+| `photoview_geojson_points_served` | Counter | — | GeoJSON API 返回的总 GPS 点数 |
+| `photoview_geojson_response_size_bytes` | Histogram | — | GeoJSON 响应体大小 |
+
+**1mm 精度上限可观测性指标的具体实现**：
+
+GPS 坐标 1mm 对应约 8 位小数（0.00000001° ≈ 0.001m = 1mm）。以下指标可以监控 GPS 精度分布，帮助运维发现数据质量问题：
+
+```go
+// 在 exif.go:Parse() 中增加指标记录
+func Parse(filepath string) (*models.MediaEXIF, error) {
+    // ... 现有解析逻辑 ...
+
+    // 记录 GPS 指标
+    if values.GPS.IsValid() {
+        gpsParseTotal.WithLabelValues("valid").Inc()
+
+        latStr := strconv.FormatFloat(*values.GPS.GPSLatitude, 'f', -1, 64)
+        lonStr := strconv.FormatFloat(*values.GPS.GPSLongitude, 'f', -1, 64)
+
+        // 计算小数位数（精度代理指标）
+        latDecimals := countDecimalPlaces(latStr)
+        lonDecimals := countDecimalPlaces(lonStr)
+        maxDecimals := math.Max(float64(latDecimals), float64(lonDecimals))
+
+        gpsPrecisionBucket.Observe(maxDecimals)
+        // maxDecimals ≥ 8 → 毫米级精度（1mm 上限）
+        // maxDecimals = 6 → ~11cm 精度（消费级 GPS 典型值）
+        // maxDecimals = 4 → ~11m 精度（低精度 GPS）
+    } else {
+        if values.GPS.GPSLatitude == nil || values.GPS.GPSLongitude == nil {
+            gpsParseTotal.WithLabelValues("missing").Inc()
+        } else if math.IsNaN(*values.GPS.GPSLatitude) || math.IsNaN(*values.GPS.GPSLongitude) {
+            gpsParseTotal.WithLabelValues("invalid").Inc()
+            gpsInvalidReason.WithLabelValues("nan").Inc()
+        } else {
+            gpsParseTotal.WithLabelValues("invalid").Inc()
+            gpsInvalidReason.WithLabelValues("out_of_range").Inc()
+        }
+    }
+
+    return &ret, nil
+}
+
+func countDecimalPlaces(s string) int {
+    parts := strings.Split(s, ".")
+    if len(parts) != 2 {
+        return 0
+    }
+    trimmed := strings.TrimRight(parts[1], "0")
+    if len(trimmed) == 0 {
+        return 0
+    }
+    return len(trimmed)
+}
+```
+
+**GPS 精度分布直方图的桶位设计**：
+
+```go
+gpsPrecisionBucket = prometheus.NewHistogram(prometheus.HistogramOpts{
+    Name:    "photoview_exif_gps_precision_decimals",
+    Help:    "Distribution of GPS coordinate decimal places (proxy for precision)",
+    Buckets: []float64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15},
+    // 0 = 整数度（~111km）
+    // 4 = ~11m（低精度 GPS）
+    // 6 = ~11cm（消费级 GPS 极限）
+    // 8 = ~1mm（RTK / 高精度）
+    // 10+ = 亚毫米级（大地测量 / 异常值）
+})
+```
+
+**运维利用精度指标的场景**：
+
+| 场景 | 观测手段 | 告警条件 |
+|------|----------|----------|
+| 大量照片 GPS 缺失 | `gps_parsed_total{status="missing"}` 急升 | 缺失率 > 90% |
+| exiftool 版本升级后 GPS 解析率骤降 | `gps_parsed_total{status="valid"}` 对比前后 | 下降 > 20% |
+| 导入了含虚假 GPS 的照片（0,0 坐标） | `gps_invalid_reason{reason="out_of_range"}` 或精度为 0 | 任何增长 |
+| 高精度 GPS 数据被截断 | `gps_precision_decimals` 分布右移或截断 | 8+ 位桶占比下降 |
+| GPS 精度异常高（伪造数据） | `gps_precision_decimals` 10+ 位桶异常增长 | 占比 > 5% |
+
+**当前代码中最接近"可观测性"的代码**：
+
+`values.go:17-35` 的 `GPS.IsValid()` 是唯一对 GPS 数据质量进行判断的代码，但它的结果仅用于"是否写入数据库"，**不产生任何日志或指标**：
+
+```go
+func (gps GPS) IsValid() bool {
+    if gps.GPSLongitude == nil || gps.GPSLatitude == nil { return false }
+    if math.IsNaN(*gps.GPSLatitude) { return false }
+    if math.IsNaN(*gps.GPSLongitude) { return false }
+    if math.Abs(*gps.GPSLatitude) > 90 || math.Abs(*gps.GPSLongitude) > 180 { return false }
+    return true
+}
+```
+
+这段验证逻辑丢弃了重要的诊断信息：**为什么 GPS 无效**（是 nil？是 NaN？还是超范围？），运维无法从日志中得知。
+
+**最小改动方案**（不引入 Prometheus 依赖）：
+
+在 `exif.go:88-91` 中增加结构化日志，仅用现有的 `log` 包：
+
+```go
+if values.GPS.IsValid() {
+    ret.GPSLatitude = values.GPS.GPSLatitude
+    ret.GPSLongitude = values.GPS.GPSLongitude
+    log.Debug(ctx, "GPS parsed successfully",
+        "latitude", *values.GPS.GPSLatitude,
+        "longitude", *values.GPS.GPSLongitude,
+        "path", filepath)
+} else {
+    switch {
+    case values.GPS.GPSLatitude == nil && values.GPS.GPSLongitude == nil:
+        log.Debug(ctx, "GPS data missing", "path", filepath)
+    case values.GPS.GPSLatitude == nil || values.GPS.GPSLongitude == nil:
+        log.Debug(ctx, "GPS data partial (one coordinate nil)", "path", filepath)
+    case math.IsNaN(*values.GPS.GPSLatitude) || math.IsNaN(*values.GPS.GPSLongitude):
+        log.Warn(ctx, "GPS data contains NaN", "path", filepath)
+    case math.Abs(*values.GPS.GPSLatitude) > 90:
+        log.Warn(ctx, "GPS latitude out of range", "latitude", *values.GPS.GPSLatitude, "path", filepath)
+    case math.Abs(*values.GPS.GPSLongitude) > 180:
+        log.Warn(ctx, "GPS longitude out of range", "longitude", *values.GPS.GPSLongitude, "path", filepath)
+    }
+}
+```
+
+**总结**：Photoview 当前无任何 GPS 可观测性指标暴露，也没有 Prometheus/OpenTelemetry 依赖。GPS 解析结果（成功/失败/精度）完全不可观测。建议至少在 `exif.go` 中增加结构化日志（最小改动），有条件时引入 Prometheus metrics 暴露 GPS 精度分布直方图和解析计数器。
+
 ---
 
 ## 十、代码引用速查
@@ -1569,3 +1943,8 @@ const features = map.queryRenderedFeatures({
 | TimeAll 时间字段定义 | `api/scanner/externaltools/exiftool/values.go` | 45-61 |
 | exiftool 结构体到 MediaEXIF 映射 | `api/scanner/externaltools/exif/exif.go` | 64-91 |
 | 视频 ffprobe 元数据提取（8个已覆盖字段 | `api/scanner/scanner_tasks/video_metadata_task.go` | 66-75 |
+| json.Decode 字段匹配（无 HasPrefix） | `api/scanner/externaltools/exiftool/exiftool.go` | 167 |
+| GPS IsValid 验证（无指标输出） | `api/scanner/externaltools/exiftool/values.go` | 17-35 |
+| EXIF 保存日志（唯一 GPS 相关日志） | `api/scanner/scanner_tasks/exif_task.go` | 25 |
+| 日志包定义（仅 4 级，无 metrics） | `api/log/default.go` | 1-25 |
+| 环境变量校验示例（MediaProbeTimeout） | `api/utils/environment_variables.go` | 87-95 |
