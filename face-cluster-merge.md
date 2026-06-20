@@ -99,6 +99,25 @@ dlib 的 `face_recognition_resnet_model_v1` 输出的 128 维 embedding 遵循�
 - 同一人如果表情、角度差异较大，可能被分为多个 FaceGroup
 - 这为后续用户手动合并留下了大量空间——是"宽松拆分 + 人工合并"的设计策略
 
+### 2.5 阈值的可配置性：硬编码，运维侧不可调
+
+`0.2` 这个阈值是**硬编码的字面量**，定义在 `face_detector_impl.go:131`：
+
+```go
+func (fd *faceDetector) classifyDescriptor(descriptor face.Descriptor) int32 {
+    return int32(fd.rec.ClassifyThreshold(descriptor, 0.2))
+}
+```
+
+**运维侧无法通过配置或环境变量调整**。目前与人脸识别相关的环境变量仅有两个（定义在 `api/utils/environment_variables.go:21,43`）：
+
+| 环境变量 | 作用 |
+|----------|------|
+| `PHOTOVIEW_FACE_RECOGNITION_MODELS_PATH` | 模型文件路径 |
+| `PHOTOVIEW_DISABLE_FACE_RECOGNITION` | 总开关（布尔值） |
+
+**没有任何配置项可以调整距离阈值**。如果需要修改，必须改代码重新编译。这也反映了设计上的一个取舍：把阈值固化在代码中，避免用户随意调整导致聚类结果不稳定。
+
 ---
 
 ## 3. 数据模型
@@ -381,9 +400,120 @@ GROUP BY candidate.media_id HAVING COUNT(*) > 1
 
 ---
 
-## 7. UI 合并模态框的状态机
+## 7. 封面（Cover Image）的隐式处理与合并冲突
 
-### 7.1 MergeFaceGroupsModal 状态
+### 7.1 FaceGroup 没有显式的 cover_image 字段
+
+与 Album 有 `cover_media_id` 不同，`FaceGroup` 数据模型中**没有** `cover_image` 或类似字段。封面是**隐式**的——UI 层取 `imageFaces[0]`（第一个 ImageFace）作为封面展示。
+
+```tsx
+// ui/src/Pages/PeoplePage/PeoplePage.tsx:220
+export const FaceGroup = ({ group }: FaceGroupProps) => {
+    const previewFace = group.imageFaces[0]  // 第一个就是封面
+    // ...
+    <FaceCircleImage imageFace={previewFace} selectable />
+}
+```
+
+`FaceCircleImage` 组件会根据 `rectangle` 裁切掉图片中人脸以外的部分，呈现圆形头像效果。
+
+### 7.2 ImageFaces 的排序规则
+
+`ImageFaces` resolver (`faces.go:20-53`) 中**没有显式的 ORDER BY**：
+
+```go
+query := db.
+    Joins("Media").
+    Where(faceGroupIDIsQuestion, obj.ID).
+    Where("album_id IN (?)", userAlbumIDs)
+
+query = models.FormatSQL(query, nil, paginate)  // order 参数为 nil
+```
+
+`FormatSQL` (`models/utils.go:11`) 在 `order` 为 nil 时不加排序。因此，返回顺序由数据库决定，在大多数数据库中等价于**按主键 id 升序**——即**先创建的 ImageFace 排在前面**。
+
+这意味着：**FaceGroup 的"封面"就是该组中最早创建的那张人脸图片。**
+
+### 7.3 合并后的封面归属
+
+合并 FaceGroup 时，没有专门的"封面冲突处理"逻辑。封面的归属由排序规则自然决定：
+
+1. 合并后，dest 组中的 ImageFace 仍按 id 升序排列
+2. **id 最小的那张**（通常是 dest 组中最早创建的）排在最前面，成为新封面
+3. source 组的 ImageFace id 通常更大（后创建），所以通常不会"抢占"封面
+
+**结论**：合并后 dest 组的原始封面通常保持不变。只有当 source 组中存在 id 更小的 ImageFace 时（极端情况，比如 dest 是新建的空组），封面才会变化。这不是一个被显式设计或测试过的行为，而是排序规则的副作用。
+
+### 7.4 去重步骤与封面的关系
+
+`CombineFaceGroups` 的去重步骤保留 `MIN(id)`（`faces.go:204`），这与封面排序逻辑一致——保留最早创建的人脸记录，也保留了它作为封面的可能性。
+
+---
+
+## 8. 关于 face_state 与 unmerge 回退路径
+
+### 8.1 没有 face_state 状态字段
+
+`FaceGroup` 模型中**不存在** `face_state`、`status`、`phase` 或任何类似的状态字段。整个系统没有"合并中"、"已合并"、"已拆分"等状态标记。
+
+```go
+// api/graphql/models/face_detection.go:16
+type FaceGroup struct {
+    Model                          // ID, CreatedAt, UpdatedAt
+    Label      *string             // 只有 label 是可空的标记字段
+    ImageFaces []ImageFace
+}
+```
+
+`Label` 是唯一的"状态式"字段——它标记了这组是否被用户确认过（有名字 = 已确认，null = 未确认），但它不是状态机意义上的状态。
+
+### 8.2 合并是单向的，没有 unmerge 回退路径
+
+`CombineFaceGroups` 合并后，source FaceGroup 会被**物理删除**（`faces.go:200`）：
+
+```go
+// delete the source face groups
+if err := deleteFaceGroups(sourceFaceGroups, tx); err != nil {
+    return err
+}
+```
+
+**没有任何撤销/回退机制**：
+
+- 没有合并历史记录表
+- 没有软删除标记
+- 没有 unmerge mutation
+- 没有"合并前快照"
+
+### 8.3 近似的"逆向操作"：DetachImageFaces
+
+`DetachImageFaces`（拆分到新组）是最接近"撤销合并"的操作，但它**不能精确还原**：
+
+| 维度 | 真正的 unmerge | DetachImageFaces |
+|------|---------------|------------------|
+| 恢复原组 ID | 能 | 不能（新组 ID 不同） |
+| 恢复 label | 能 | 不能（新组无 label） |
+| 精确拆分边界 | 能（按原组边界） | 不能（需手动选择哪些人脸） |
+| 批量还原 | 能 | 需手动操作 |
+
+**设计意图**：合并被视为一个**不可逆的决策**。用户确认合并后，原组就消失了。如果合并错了，用户只能手动把人脸拆出来（Detach），但无法恢复原组的身份。
+
+### 8.4 为什么没有状态机？
+
+从代码设计来看，Photoview 的人脸识别采用了**极简模型**：
+
+1. 没有状态字段，没有状态机
+2. 没有操作历史，没有审计日志
+3. 合并即删除，拆分即新建
+4. 唯一的"状态"就是 label 的有/无
+
+这是一种**"结果导向"**的设计：系统只关心"当前每个 FaceGroup 包含哪些 ImageFace"，不关心是怎么到达这个状态的。
+
+---
+
+## 9. UI 合并模态框的状态机
+
+### 9.1 MergeFaceGroupsModal 状态
 
 ```
 ┌─────────┐    用户点击"合并"    ┌───────────────────┐
@@ -404,19 +534,19 @@ GROUP BY candidate.media_id HAVING COUNT(*) > 1
 
 如果提供了 `preselectedDestinationFaceGroup`（从某个 FaceGroup 页面发起合并），则跳过 `SelectDestination`，直接进入 `SelectSources`。
 
-### 7.2 MoveImageFacesModal 状态
+### 9.2 MoveImageFacesModal 状态
 
 两步流程：
 1. **选择要移动的 ImageFaces**（`SelectImageFacesTable`）
 2. **选择目标 FaceGroup**（`SelectFaceGroupTable`，过滤掉当前组）
 
-### 7.3 DetachImageFacesModal
+### 9.3 DetachImageFacesModal
 
 单步流程：选择要拆分的 ImageFaces，点击"Detach"后自动创建新组。
 
 ---
 
-## 8. 完整状态机协同图
+## 10. 完整状态机协同图
 
 ```
                         ┌─────────────────────────────────────────────┐
@@ -478,7 +608,7 @@ GROUP BY candidate.media_id HAVING COUNT(*) > 1
 
 ---
 
-## 9. 关键代码位置索引
+## 11. 关键代码位置索引
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -502,19 +632,30 @@ GROUP BY candidate.media_id HAVING COUNT(*) > 1
 | UI 移动模态框 | `ui/src/Pages/PeoplePage/SingleFaceGroup/MoveImageFacesModal.tsx` | 1-203 |
 | UI 拆分模态框 | `ui/src/Pages/PeoplePage/SingleFaceGroup/DetachImageFacesModal.tsx` | 1-155 |
 | 合并冲突测试 | `api/graphql/resolvers/faces_test.go` | 93-216 |
+| 环境变量定义 | `api/utils/environment_variables.go` | 21, 43 |
+| FormatSQL 排序处理 | `api/graphql/models/utils.go` | 11 |
+| FaceCircleImage 封面渲染 | `ui/src/Pages/PeoplePage/FaceCircleImage.tsx` | 1-136 |
 
 ---
 
-## 10. 设计要点总结
+## 12. 设计要点总结
 
 1. **阈值 0.2 是保守策略**：自动聚类宁可过拆，把同一人拆成多个组，也不误合并不同人。手动操作弥补过度拆分。
 
-2. **Label 是状态机的分水岭**：有 label 的 FaceGroup 成为重识别的"锚点"，无 label 的组是待确认的候选。用户的标记行为实质上在驱动状态转换。
+2. **阈值硬编码，运维侧不可调**：`0.2` 是字面量写死在代码中，没有环境变量或配置项可以调整。运维侧只能开关人脸识别，不能调阈值。
 
-3. **冲突检查保护语义一致性**：同一 FaceGroup 中同一 Media 只能有一个 ImageFace，避免"同一人在同一照片中被识别两次"的矛盾。
+3. **Label 是状态机的分水岭**：有 label 的 FaceGroup 成为重识别的"锚点"，无 label 的组是待确认的候选。用户的标记行为实质上在驱动状态转换。
 
-4. **内存同步的延迟性**：`MergeImageFaces` 仅修改 `faceGroupIDs` 映射，不触发 `SetSamples`。分类器样本集的更新发生在下次 `classifyFace` 或 `RecognizeUnlabeledFaces` 时。
+4. **冲突检查保护语义一致性**：同一 FaceGroup 中同一 Media 只能有一个 ImageFace，避免"同一人在同一照片中被识别两次"的矛盾。
 
-5. **CombineFaceGroups 的去重是防御性代码**：由于冲突检查在前，合并后的去重步骤在正常路径上不会触发，仅作为安全网存在。
+5. **封面是隐式的，无冲突处理**：FaceGroup 没有 `cover_image` 字段，封面由 `imageFaces[0]`（id 最小的人脸）自然决定。合并后封面归属是排序规则的副作用，而非专门设计。
 
-6. **RecognizeUnlabeledFaces 会重建样本集**：先把未标记样本从内存中移除，用已标记样本作为训练集重新分类，这确保了标记操作对重识别的即时影响。
+6. **没有 face_state，没有状态机**：整个系统不追踪合并历史，不维护状态字段。合并即物理删除 source 组，拆分即新建组。
+
+7. **合并不可逆，无 unmerge 路径**：合并操作是单向的，source 组被物理删除。用户只能通过 `DetachImageFaces` 近似回退，但无法恢复原组身份和结构。
+
+8. **内存同步的延迟性**：`MergeImageFaces` 仅修改 `faceGroupIDs` 映射，不触发 `SetSamples`。分类器样本集的更新发生在下次 `classifyFace` 或 `RecognizeUnlabeledFaces` 时。
+
+9. **CombineFaceGroups 的去重是防御性代码**：由于冲突检查在前，合并后的去重步骤在正常路径上不会触发，仅作为安全网存在。
+
+10. **RecognizeUnlabeledFaces 会重建样本集**：先把未标记样本从内存中移除，用已标记样本作为训练集重新分类，这确保了标记操作对重识别的即时影响。
