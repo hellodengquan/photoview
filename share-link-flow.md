@@ -212,6 +212,59 @@ notification.BroadcastNotification(&models.Notification{
 ```
 仅包含「进行中任务数」和「等待任务数」，无历史趋势、无延迟告警。
 
+### 2.5 token_cleanup_lag 告警阈值：不存在的概念
+
+**核心结论：`token_cleanup_lag` 告警阈值在代码库中完全不存在。没有任何告警系统、监控指标或自适应调整机制。**
+
+#### 2.5.1 搜索证据链
+
+全面搜索代码库，以下关键词均无匹配：
+
+| 关键词分类 | 搜索关键词 | 匹配结果 |
+|-----------|-----------|---------|
+| 告警阈值 | `token_cleanup_lag`、`cleanup_lag`、`cleanupLag` | ❌ 0 个匹配 |
+| 监控系统 | `prometheus`、`grafana`、`metric`、`monitor` | ❌ 0 个匹配（仅 README 和 codecov.yml 提及） |
+| 告警机制 | `alert`、`threshold`、`warning`、`SLO`、`SLA` | ❌ 0 个匹配 |
+| 可观测性 | `observability`、`tracing`、`latency` | ❌ 0 个匹配 |
+| 自适应调整 | `autoscale`、`adaptive`、`dynamic`、`auto_tune` | ❌ 0 个匹配 |
+
+#### 2.5.2 仅有的「类监控」机制
+
+项目中仅有三种与「状态反馈」相关的机制，均不属于监控告警范畴：
+
+1. **日志输出**（`log.Info` / `log.Error`）
+   - 纯文本日志，无结构化，无指标聚合
+   - 无告警规则，无法配置阈值
+
+2. **WebSocket 实时通知**（`notification.BroadcastNotification`）
+   - 仅用于前端 UI 实时更新（如扫描进度）
+   - 内容仅包含「进行中 X 个，等待 Y 个」的瞬时状态
+   - 无历史数据，无法计算延迟
+
+3. **Scanner progress 通知**（`queue.go:174-191`）
+   - 节流 500ms 推送一次
+   - 仅推送队列长度，无延迟指标
+   - 无告警阈值，无自适应逻辑
+
+#### 2.5.3 不存在自适应调整的原因
+
+由于根本没有 ShareToken 清理任务，自然也不存在「清理延迟」和「告警阈值」：
+
+```
+不存在清理任务 → 不存在清理延迟 → 不存在延迟告警 → 不存在自适应阈值
+```
+
+**相关结论回顾（第 2.3 节）：**
+- share_tokens 表的过期记录永久保留
+- 无后台 cron / 定时清理任务
+- 仅 CASCADE 级联删除（删除用户/相册/媒体时）
+
+**因此：**
+- ❌ 没有 `token_cleanup_lag` 指标
+- ❌ 没有告警阈值配置
+- ❌ 没有随系统负载自适应调整的逻辑
+- ❌ 没有任何监控告警系统集成
+
 ---
 
 ## 三、续期接口的权限校验深度剖析
@@ -422,6 +475,89 @@ getUserToken() 检查 Owner 或 Admin
 - ❌ 用户被删除时 ShareToken 同步删除，无法续期
 - ❌ AccessToken 过期（14天）也会导致续期失败，需要重新登录获取新 token
 - ✅ Admin 可以越权续期任何用户的 token（这是设计使然的权限模型）
+
+### 3.6 用户账号「禁用」与 ShareToken 的同步清理机制
+
+**核心澄清：没有「禁用账号」功能。等效的操作有三种，但都不会「同步清理已签发但仍活跃的 ShareToken」。**
+
+#### 3.6.1 三种「类禁用」操作及其对 ShareToken 的影响
+
+| 操作 | 操作方式 | ShareToken 是否被清理 | 原因 |
+|------|---------|---------------------|------|
+| **删除用户** | `deleteUser` mutation（仅 Admin） | ✅ 全部删除 | CASCADE 级联：`Owner User ON DELETE CASCADE` |
+| **修改密码** | `UpdateUser` mutation（Admin 或本人） | ❌ 不受影响 | 改密码不影响 ShareToken 表，仅影响登录验证 |
+| **取消 Admin 权限** | `UpdateUser` mutation（仅 Admin） | ❌ 不受影响 | ShareToken 的 Owner 关联是按 UserID，不是按 Admin 标志 |
+
+#### 3.6.2 删除用户时的 CASCADE 级联清理（唯一的同步清理路径）
+
+文件：`api/graphql/models/share_token.go:11`
+```go
+Owner User `gorm:"constraint:OnDelete:CASCADE;"`
+```
+
+**完整的级联删除链（详细版）：**
+```
+DELETE FROM users WHERE id = ?
+    ↓ 数据库级 CASCADE
+    ├─ DELETE FROM access_tokens WHERE user_id = ?
+    │      （用户登录凭证全部失效）
+    ├─ DELETE FROM share_tokens WHERE owner_id = ?
+    │      （用户创建的所有分享链接全部失效）
+    ├─ DELETE FROM user_albums WHERE user_id = ?
+    │      （用户与相册的关联解除）
+    ├─ DELETE FROM user_preferences WHERE user_id = ?
+    │      （用户偏好设置删除）
+    └─ DELETE FROM user_media_data WHERE user_id = ?
+           （用户收藏等数据删除）
+    ↓
+albums 表中，若某个相册没有任何 owner 了 → 递归删除该相册及其所有媒体
+    ↓ CASCADE
+    ├─ DELETE FROM media WHERE album_id = ?
+    ├─ DELETE FROM share_tokens WHERE album_id = ? OR media_id = ?
+    │      （注意：这是另一层级联，删除相册/媒体也会删 ShareToken）
+    └─ ...
+```
+
+**关键要点：**
+- CASCADE 是**数据库级别**的约束，不是应用层代码实现
+- 删除用户是**唯一**能触发 ShareToken 批量清理的操作
+- 清理是**同步且即时**的，在同一个事务中完成
+- 没有「延迟清理」「异步清理」「后台任务清理」
+
+#### 3.6.3 为什么修改密码不清理 ShareToken？
+
+**代码证据：** `UpdateUser` resolver（`user.go:110-145`）只更新 `username`、`password`、`admin` 三个字段，不涉及 `share_tokens` 表。
+
+```go
+func (r *mutationResolver) UpdateUser(ctx context.Context, id int, 
+    username *string, password *string, admin *bool) (*models.User, error) {
+    // ...
+    if password != nil {
+        hashedPassBytes, _ := bcrypt.GenerateFromPassword([]byte(*password), 12)
+        hashedPass := string(hashedPassBytes)
+        user.Password = &hashedPass  // 只改 password 字段
+    }
+    // ...
+    db.Save(&user)  // 只更新 users 表
+    return &user, nil
+}
+```
+
+**为什么这是合理的设计：**
+- ShareToken 是**匿名访问凭证**，不需要用户登录态
+- ShareToken 的有效期由 `Expire` 字段控制，不是由用户密码控制
+- 即使改了密码，之前生成的分享链接仍然有效（因为匿名访问不需要密码登录）
+- 如果要撤销分享，需要手动删除 ShareToken 或删除用户
+
+#### 3.6.4 「禁用」功能的替代方案
+
+如果业务上需要「禁用用户但不删除数据」，现有代码中**没有**原生支持。可能的 workaround：
+
+1. **修改用户密码**：阻止用户重新登录，但已签发的 AccessToken（14天）和 ShareToken 仍然有效
+2. **删除所有 ShareToken**：需要手动逐个删除（无批量 API）
+3. **删除用户**：最彻底的方式，但数据也没了
+
+**代码中没有任何类似「setUserDisabled」或「deactivateUser」的 mutation。**
 
 ---
 
@@ -923,6 +1059,112 @@ useQuery 发起请求
 
 这与之前分析的「缓存窗口期」现象一致，但**不是因为 staleTime 5 分钟**，而是因为 Apollo Client 的 `cache-first` 策略**永远不会自动让缓存过期**（除非手动触发 refetch 或页面刷新）。
 
+### 7.7 useShareSettings hook 与 staleTime 持久化：不存在的概念
+
+**核心结论：`useShareSettings` hook 在代码库中完全不存在。没有 staleTime 配置，也没有任何缓存设置持久化到本地存储。**
+
+#### 7.7.1 搜索证据链
+
+| 搜索对象 | 关键词 | 匹配结果 |
+|---------|--------|---------|
+| 自定义 Hook | `useShareSettings`、`shareSettings`、`share_settings` | ❌ 0 个匹配 |
+| 前端所有 Hook 文件 | `ui/src/hooks/` 目录 | ✅ 5 个文件，无分享相关 |
+| staleTime 配置 | `staleTime`、`cacheTime`、`keepPreviousData` | ❌ 0 个匹配 |
+| 本地存储 | `localStorage`、`sessionStorage` | ✅ 仅 `theme.ts` 用 localStorage 存主题 |
+| 持久化缓存 | `persist`、`persistence`、`apollo-cache-persist` | ❌ 0 个匹配 |
+
+**前端 hooks 目录全部内容（`ui/src/hooks/`）：**
+```
+hooks/
+├── __mocks__/
+│   └── useScrollPagination.ts  (Mock 测试用)
+├── useDelay.ts                  (延迟 Hook)
+├── useOrderingParams.ts         (排序参数 Hook)
+├── useScrollPagination.ts       (滚动分页 Hook)
+└── useURLParameters.ts          (URL 参数 Hook)
+```
+
+**没有任何与分享设置、缓存配置、staleTime 相关的 Hook。**
+
+#### 7.7.2 localStorage 使用情况
+
+**唯一使用 localStorage 的地方：`ui/src/theme.ts`**
+
+```typescript
+// 仅存储主题（明/暗模式）
+localStorage.theme = 'light'
+localStorage.theme = 'dark'
+localStorage.removeItem('theme')
+```
+
+**没有任何与分享、缓存、staleTime 相关的 localStorage 存储。**
+
+#### 7.7.3 前端可用的设置项
+
+**用户可调整的设置（Settings 页面）：**
+
+| 设置项 | 位置 | 是否持久化 |
+|--------|------|-----------|
+| 语言偏好 | `UserPreferences.tsx` | ✅ 存数据库 `user_preferences` 表 |
+| 定期扫描间隔 | `PeriodicScanner.tsx` | ✅ 存数据库 `site_info` 表（仅 Admin） |
+| 并发 Worker 数 | `ScannerConcurrentWorkers.tsx` | ✅ 存数据库 `site_info` 表（仅 Admin） |
+| 主题（明/暗） | `theme.ts` | ✅ 存 localStorage |
+| 缓存策略 / staleTime | —— | ❌ 不存在此设置 |
+
+**没有任何缓存策略或 staleTime 的用户可配置项。**
+
+#### 7.7.4 Apollo Client 缓存配置的「硬编码」现状
+
+**Apollo Client 的所有缓存配置都是硬编码的：**
+
+文件：`ui/src/apolloClient.ts`
+
+```javascript
+const memoryCache = new InMemoryCache({
+  typePolicies: {
+    SiteInfo: { merge: true },
+    MediaURL: { keyFields: ['url'] },
+    Album: { fields: { media: paginateCache(...) } },
+  },
+})
+
+const client = new ApolloClient({
+  link: ApolloLink.from([linkError, link]),
+  cache: memoryCache,
+  // ↑ 未设置 defaultOptions → fetchPolicy 默认为 cache-first
+  // ↑ 未设置任何可由用户调整的参数
+})
+```
+
+**配置项全部硬编码，无运行时修改能力：**
+- ❌ 无 `defaultOptions` 配置
+- ❌ 无 `fetchPolicy` 运行时切换
+- ❌ 无 `staleTime` 概念（Apollo 没有这个 API）
+- ❌ 无用户可调整的缓存参数
+- ❌ 无 localStorage 缓存持久化
+
+**缓存的生命周期：**
+- 仅存在于内存中（`InMemoryCache`）
+- 页面刷新（F5）后全部清空
+- 关闭浏览器后全部清空
+- 不同标签页之间不共享
+
+#### 7.7.5 为什么这些概念不存在
+
+`useShareSettings`、`staleTime`、「缓存设置持久化」这些概念在 Photoview 中不存在的原因：
+
+1. **技术栈不匹配**：用的是 Apollo Client，不是 react-query，没有 `staleTime` API
+2. **设计哲学**：分享链接是「即发即用」的简单功能，不需要复杂的缓存调优
+3. **后端校验兜底**：即使前端缓存了过期数据，HTTP 路由层每次请求都会重新校验 token，不会出现安全问题
+4. **面向最终用户**：不是面向开发者的高级工具，不需要暴露缓存参数
+
+**因此：**
+- ❌ 没有 `useShareSettings` hook
+- ❌ 没有 `staleTime` 配置项
+- ❌ 没有用户可调整的缓存设置
+- ❌ 没有 localStorage 持久化缓存配置
+- ✅ 仅主题设置存在 localStorage，其他设置存数据库
+
 ---
 
 ## 八、完整协作流程图
@@ -1072,7 +1314,7 @@ useQuery 发起请求
   一次 DB 更新即可生效，无需重新生成 token
 ```
 
-### 9.3 六处深入发现的关键结论
+### 9.3 九处深入发现的关键结论
 
 | 问题 | 结论 | 关键代码 |
 |------|------|----------|
@@ -1082,6 +1324,9 @@ useQuery 发起请求
 | **高负载扫描延迟** | ⚠️ 同步阻塞的 Ticker + event 累积，可能导致「扫描风暴」，无指标层 | `periodic_scanner.go:159`、`queue.go:47` |
 | **账号禁用续期** | ❌ 无禁用功能，只有删除；删除级联清空 ShareToken | `user.go:14`、`share_token.go:11` |
 | **staleTime 配置** | ❌ 用的是 Apollo Client，不是 react-query，无 staleTime，无用户可调 | `apolloClient.ts:161`、所有 useQuery 调用 |
+| **token_cleanup_lag 告警** | ❌ 完全不存在此概念，无监控系统、无告警阈值、无自适应调整 | —— |
+| **禁用账号清理 ShareToken** | ❌ 无禁用功能；删除用户时 CASCADE 级联清理，改密码不清理 | `share_token.go:11`、`user.go:110` |
+| **useShareSettings 持久化** | ❌ 无此 hook；仅主题存 localStorage，缓存配置全部硬编码 | `theme.ts`、`apolloClient.ts` |
 
 ### 9.4 关键文件索引
 
@@ -1111,3 +1356,7 @@ useQuery 发起请求
 | 侧边栏管理 | `ui/src/components/sidebar/Sharing.tsx` | 创建/删除/加密码/设置过期 UI |
 | 并发 worker 配置 | `ui/src/Pages/SettingsPage/ScannerConcurrentWorkers.tsx` | 1-24 可调，默认 PG=3/SQLite=1 |
 | 定期扫描配置 | `ui/src/Pages/SettingsPage/PeriodicScanner.tsx` | 扫描间隔可调（秒/分/时/天/月）|
+| 主题管理 | `ui/src/theme.ts` | 唯一使用 localStorage 的地方（明暗主题）|
+| 前端 Hook 目录 | `ui/src/hooks/` | 5 个 Hook，无分享/缓存相关 |
+| 用户更新 resolver | `api/graphql/resolvers/user.go:110` | UpdateUser 仅改 username/password/admin |
+| 删除用户动作 | `api/graphql/models/actions/user_actions.go:14` | DeleteUser + CASCADE 级联删除 |
