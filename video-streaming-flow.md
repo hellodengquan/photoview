@@ -890,10 +890,324 @@ Photoview 这四层全部缺失，连最基础的访问日志都没有。
 
 ---
 
-## 十四、总结
+## 十四、cleanup_orphan_segments worker 触发周期分析
 
-Photoview 的视频方案设计非常务实，本质是**个人相册级别的简单视频播放方案**：
+### 14.1 核心结论：不存在此 worker
 
+全局代码搜索结果：
+- ❌ 没有 `cleanup_orphan_segments` 函数/变量
+- ❌ 没有 `orphan` 关键词（除了一个翻译文件中的无关文本）
+- ❌ 没有 `segment` 清理相关逻辑
+- ❌ 没有独立的后台 worker 进程（除了 scanner queue worker）
+
+### 14.2 唯一的周期性任务：Periodic Scanner
+
+系统中只有一个周期性任务 —— **周期性扫描器** (api/scanner/periodic_scanner/periodic_scanner.go)，但它的功能是**扫描相册媒体文件**，不是清理 orphan segments。
+
+**触发逻辑**：
+
+```go
+// periodic_scanner.go:36-43
+func getPeriodicScanInterval(db *gorm.DB) (time.Duration, error) {
+    var siteInfo models.SiteInfo
+    if err := db.First(&siteInfo).Error; err != nil {
+        return 0, err
+    }
+    return time.Duration(siteInfo.PeriodicScanInterval) * time.Second, nil
+}
+```
+
+**触发周期配置**：
+
+| 配置入口 | 位置 |
+|---------|------|
+| 数据库字段 | `site_info.periodic_scan_interval` (单位：秒) |
+| GraphQL Mutation | `setPeriodicScanInterval(interval: Int!)` |
+| 前端 UI | `SettingsPage → PeriodicScanner.tsx` |
+| 后端 API | `periodic_scanner.go:91-118` `ChangePeriodicScanInterval()` |
+| 默认值 | 0（禁用） |
+
+**前端配置界面** (ui/src/Pages/SettingsPage/PeriodicScanner.tsx:181-253) 支持的时间单位：
+- 秒 / 分钟 / 小时 / 天 / 月
+
+### 14.3 暴露给运维的配置方式
+
+**方式 1：Web 管理后台**
+- 登录管理员账号 → Settings → Periodic scanner
+- 可视化配置，实时生效
+
+**方式 2：GraphQL API**
+```graphql
+mutation {
+  setPeriodicScanInterval(interval: 3600)  # 每小时
+}
+```
+
+**方式 3：直接修改数据库**
+```sql
+UPDATE site_info SET periodic_scan_interval = 3600;
+```
+
+**没有环境变量配置**（api/utils/environment_variables.go 中无相关配置）。
+
+### 14.4 与 "orphan segments 清理" 的差距
+
+周期性扫描器实际做的事情：
+```go
+// periodic_scanner.go:159-163
+case <-ticker.C:
+    log.Info(nil, "Scan interval runner: Starting periodic scan")
+    if err := ps.scannerQueue.AddAllToQueue(); err != nil {
+        log.Error(nil, "Scan interval runner: Failed to add all users to queue", "error", err)
+    }
+```
+
+它调用 `AddAllToQueue()` 触发完整的媒体扫描流程，其中会：
+1. 扫描磁盘上的媒体文件
+2. 处理新增/修改的文件
+3. 触发 `CleanupMedia` 清理**数据库存在但磁盘不存在**的媒体
+
+但它**不会**：
+- ❌ 扫描缓存目录中的不完整文件
+- ❌ 清理残留的转码失败文件
+- ❌ 检查单个缓存文件的完整性
+- ❌ 专门处理 orphan segments（因为根本没有 segments）
+
+### 14.5 运维配置现状总结
+
+| 配置项 | 是否暴露给运维 | 配置方式 |
+|--------|--------------|---------|
+| 扫描周期 | ✅ 是 | Web UI / GraphQL / 数据库 |
+| 并发 worker 数 | ✅ 是 | Web UI / GraphQL / 数据库 |
+| 缓存容量限制 | ❌ 否 | 无此功能 |
+|  orphan 文件清理周期 | ❌ 否 | 无此功能 |
+| 清理阈值配置 | ❌ 否 | 无此功能 |
+
+---
+
+## 十五、monitor_throughput 采样间隔分析
+
+### 15.1 核心结论：不存在此监控
+
+全局代码搜索结果：
+- ❌ 没有 `monitor_throughput` 函数/变量
+- ❌ 没有 `throughput` 关键词
+- ❌ 没有 `sampling` / `sample` 采样相关代码
+- ❌ 没有 `500ms` 硬编码间隔（唯一的 500ms 是 scanner notification throttle）
+
+### 15.2 唯一的 500ms 相关代码
+
+`api/scanner/scanner_queue/queue.go:102` 中有一个 500ms 的 throttling：
+```go
+notifyThrottle := utils.NewThrottle(500 * time.Millisecond)
+```
+
+这是**扫描进度通知的限流**，不是吞吐量监控：
+```go
+// queue.go:183-191
+notifyThrottle.Trigger(func() {
+    notification.BroadcastNotification(&models.Notification{
+        Key:     globalScannerProgress,
+        Type:    models.NotificationTypeMessage,
+        Header:  "Scanning media",
+        Content: fmt.Sprintf("%d jobs in progress\n%d jobs waiting", inProgressLength, upNextLength),
+    })
+})
+```
+
+目的是避免扫描进度通知过于频繁地推送到前端。
+
+### 15.3 网络吞吐量监控的缺失链条
+
+要实现 `monitor_throughput` + 动态采样间隔，需要：
+
+```
+吞吐量监控系统需要的组件：
+├─ 1. 网络流量采集点
+│   ├─ /api/video 路由处记录字节数
+│   ├─ 记录请求开始/结束时间
+│   └─ 计算即时吞吐量 (bytes/ms)
+├─ 2. 采样调度器
+│   ├─ 可变间隔的 ticker
+│   ├─ 根据当前网络状况动态调整
+│   └─ 5G 高频网络下缩短间隔
+├─ 3. 带宽估计算法
+│   ├─ 滑动窗口平均
+│   ├─ 突发流量检测
+│   └─ 趋势预测
+└─ 4. 决策执行
+    ├─ 触发码率切换（需要 ABR）
+    ├─ 调整预取策略
+    └─ 通知前端
+```
+
+Photoview 这四层**全部缺失**。
+
+### 15.4 5G 高频网络下的现状
+
+在 5G 网络下，Photoview 的表现：
+
+| 特性 | 现状 | 理想情况（有动态采样） |
+|------|------|----------------------|
+| 吞吐量检测 | ❌ 无 | ✅ 10-50ms 采样间隔 |
+| 网络波动响应 | ❌ 依赖浏览器 | ✅ 实时检测并调整 |
+| 码率适配 | ❌ 单码率 1080p | ✅ 动态切换 480p/720p/1080p |
+| 缓冲策略 | ❌ 固定（浏览器默认） | ✅ 根据带宽调整预缓冲 |
+| 卡顿恢复 | ❌ 被动等待 | ✅ 主动降码率恢复 |
+
+**为什么 5G 下需要更短的采样间隔**：
+- 5G 网络波动更快（毫秒级），500ms 采样会错过快速变化
+- 5G 带宽高但不稳定，需要实时检测吞吐量下降
+- 动态采样可以在网络稳定时间隔拉长（省电），在波动时间隔缩短（灵敏）
+
+但 Photoview 没有吞吐量监控，讨论采样间隔调整是无意义的。
+
+### 15.5 所有时间间隔配置一览
+
+| 间隔 | 位置 | 用途 | 可配置 |
+|------|------|------|-------|
+| 500ms | `queue.go:102` | 扫描进度通知限流 | ❌ 硬编码 |
+| 1000 (LRU 容量) | `graphql_endpoint.go:44` | GraphQL 查询缓存大小 | ❌ 硬编码 |
+| 100 (LRU 容量) | `graphql_endpoint.go:48` | 持久化查询缓存大小 | ❌ 硬编码 |
+| periodic_scan_interval | `site_info` 表 | 周期性扫描间隔 | ✅ 可配置 |
+| concurrent_workers | `site_info` 表 | 并发扫描任务数 | ✅ 可配置 |
+
+---
+
+## 十六、lru_evict_predict 算法分析
+
+### 16.1 核心结论：不存在此算法
+
+全局代码搜索结果：
+- ❌ 没有 `lru_evict_predict` 函数/变量
+- ❌ 没有 `predict` 预测相关代码
+- ❌ 没有 `algorithm` 算法相关代码
+- ❌ 没有 `evict` 淘汰逻辑（除了 gqlgen 内部 LRU）
+
+### 16.2 唯一的 LRU 实现：gqlgen 内置缓存
+
+`api/graphql/endpoint/graphql_endpoint.go:41,44`：
+```go
+import "github.com/99designs/gqlgen/graphql/handler/lru"
+
+graphqlServer.SetQueryCache(lru.New[*ast.QueryDocument](1000))
+graphqlServer.Use(extension.AutomaticPersistedQuery{
+    Cache: lru.New[string](100),
+})
+```
+
+这是 **gqlgen 框架内置的 LRU 缓存**，用于缓存 GraphQL 查询的 AST 解析结果和持久化查询。它的实现是**标准 LRU**，没有预测功能。
+
+**标准 LRU 的工作原理**：
+```
+┌─────────────────────────────────────────┐
+│  新数据插入 → 放在链表头部              │
+│  数据被访问 → 移到链表头部              │
+│  缓存满时 → 删除链表尾部元素（最久未用）│
+└─────────────────────────────────────────┘
+```
+
+**没有的特性**：
+- ❌ 没有访问频率统计（LRU 只看最近访问时间，不看访问次数）
+- ❌ 没有预测下一个要访问的元素
+- ❌ 没有突发流量检测
+- ❌ 没有误判率统计
+- ❌ 没有预热机制
+
+### 16.3 突发流量场景下的表现
+
+由于根本没有预测算法，讨论 "误判率指标" 是无意义的。但可以分析**标准 LRU 在突发流量下的行为**：
+
+**场景 1：突然大量访问冷门视频（缓存击穿）**
+```
+用户 A 访问冷门视频 V1 → 缓存不命中 → 触发转码
+用户 B 同时访问 V1 → 缓存不命中 → 重复触发转码
+用户 C 同时访问 V1 → 缓存不命中 → 重复触发转码
+...
+转码完成 → V1 进入缓存 → 后续请求命中
+```
+
+问题：突发访问同一冷门资源时，会触发多次重复转码，直到第一个转码完成。
+
+**场景 2：循环访问大量视频（缓存颠簸）**
+```
+访问 V1 → V1 入队
+访问 V2 → V2 入队
+...
+访问 V1001 → V1 被淘汰（因为容量是 1000）
+访问 V1 → 缓存不命中 → 重新转码
+```
+
+问题：当访问量超过缓存容量时，会发生频繁的淘汰和重新转码。
+
+**场景 3：热点视频突然变冷**
+```
+V1 连续被访问 1000 次 → 一直在缓存头部
+突然没人访问 V1 → V1 逐渐被新数据挤到尾部
+最终被淘汰 → 下次访问需要重新转码
+```
+
+标准 LRU 无法预测 "这个热点以后还会不会被访问"。
+
+### 16.4 预测算法需要的组件
+
+要实现 `lru_evict_predict` 并计算误判率，需要：
+
+```
+预测淘汰系统需要的组件：
+├─ 1. 访问历史记录
+│   ├─ 记录每个视频的所有访问时间
+│   ├─ 记录访问间隔分布
+│   └─ 记录访问频次
+├─ 2. 预测模型
+│   ├─ 基于历史访问模式预测下次访问时间
+│   ├─ 计算每个缓存项的 "剩余寿命"
+│   └─ 选择 "最不可能被访问" 的项淘汰
+├─ 3. 误判率统计
+│   ├─ 记录被淘汰后 T 时间内又被访问的次数（误判）
+│   ├─ 计算误判率 = 误判次数 / 总淘汰次数
+│   └─ 阈值触发告警
+└─ 4. 动态调整
+    ├─ 突发流量时切换算法（如 LFU）
+    ├─ 根据误判率调整缓存容量
+    └─ 热点数据保护机制
+```
+
+Photoview 这四层**全部缺失**，连最基础的访问日志都没有。
+
+### 16.5 误判率指标的计算方法
+
+如果未来要实现，可以参考以下指标定义：
+
+| 指标 | 公式 | 理想值 |
+|------|------|--------|
+| 误判率 | 被淘汰后 ΔT 内又被访问的次数 / 总淘汰次数 | < 5% |
+| 缓存命中率 | 缓存命中次数 / 总请求次数 | > 95% |
+| 平均访问间隔 | 同一视频两次访问的平均时间 | - |
+| 淘汰后重访时间分布 | 被淘汰后多久被重新访问的分布 | - |
+| 突发流量敏感度 | 突发流量期间误判率上升幅度 | < 2x |
+
+其中 `ΔT` 是可配置的时间窗口（如 1 小时、1 天）。
+
+### 16.6 相关模块现状总结
+
+| 功能 | 现状 | 代码位置 |
+|------|------|---------|
+| LRU 缓存 | ✅ 有（仅 GraphQL 查询） | `graphql_endpoint.go:41,48` |
+| LRU 容量 | 1000 + 100（硬编码） | `graphql_endpoint.go:44,48` |
+| 媒体缓存 LRU | ❌ 无 | - |
+| 访问预测 | ❌ 无 | - |
+| 误判率统计 | ❌ 无 | - |
+| 突发流量检测 | ❌ 无 | - |
+| 动态算法切换 | ❌ 无 | - |
+
+---
+
+## 十七、总结
+
+Photoview 的视频方案设计非常务实，本质是**个人相册级别的简单视频播放方案**，很多企业级特性都没有实现：
+
+### 已实现的特性
 1. **没有 HLS/m3u8 分片** —— 使用浏览器原生 `<video>` + HTTP Range 实现伪流式播放
 2. **按需转码 + 后台预转码双通道**：扫描时预转码，用户访问也能实时触发
 3. **缓存结构清晰**：`{cache}/{albumID}/{mediaID}/` 按相册和媒体分层存储
@@ -901,8 +1215,14 @@ Photoview 的视频方案设计非常务实，本质是**个人相册级别的�
 5. **硬件加速可选**：支持 qsv/vaapi/nvenc 硬件编码
 6. **鉴权一体化**：Cookie 登录或分享 token 两种方式
 7. **降级路径隐晦**：只有原视频是 Web 兼容格式时，DataLoader 才能 fallback 到 Original
-8. **无 ABR 自适应码率**：单码率 MP4，无多版本转码，无移动端网络适配
-9. **无 LRU 缓存管理**：媒体缓存无限增长，无淘汰策略，无容量限制
-10. **无 prefetch 机制**：无热度统计，无分片预加载，无预取队列
-11. **转码失败残留文件**：失败时不清理不完整的输出文件，会占用磁盘空间
-12. **无 QoE 监控**：无播放质量指标采集，无网络稳定性统计
+8. **周期性扫描可配置**：扫描周期和并发 worker 数暴露给运维配置
+
+### 未实现的特性
+9. **无 ABR 自适应码率**：单码率 MP4，无多版本转码，无移动端网络适配
+10. **无 LRU 缓存管理**：媒体缓存无限增长，无淘汰策略，无容量限制
+11. **无 prefetch 机制**：无热度统计，无分片预加载，无预取队列
+12. **转码失败残留文件**：失败时不清理不完整的输出文件，会占用磁盘空间
+13. **无 QoE 监控**：无播放质量指标采集，无网络稳定性统计
+14. **无 orphan 文件清理 worker**：只有周期性扫描，不清理残留转码文件
+15. **无吞吐量监控**：无采样间隔，无动态调整，无 5G 网络适配
+16. **无 LRU 预测算法**：只有标准 LRU（gqlgen 内置），无预测，无误判率统计
