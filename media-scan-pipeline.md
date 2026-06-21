@@ -480,3 +480,392 @@ Photoview 的媒体扫描管线是一个**拉取式、全量比对、任务链�
 4. **处理层**：`ScannerTask` 接口的 7 个钩子将处理逻辑解耦为 11 个独立 Task，按注册顺序串行执行
 5. **转码层**：照片走 ImageMagick MagickWand（RAW→JPEG + Thumbnail），视频走 FFmpeg CLI（转 MP4 + 截帧缩略图）
 6. **持久层**：文件写入 `MediaCachePath/albumID/mediaID/` 目录，元数据写入 `MediaURL` 数据库记录，两者在同一事务内完成，并通过 Stat 检测 + Cleanup 保障一致性
+
+---
+
+## 十一、.photoviewignore 过滤规则优先级与符号链接处理
+
+### 11.1 两层过滤机制：BFS 阶段 vs ProcessMedia 阶段
+
+Photoview 对 `.photoviewignore` 的应用分为两层，作用于不同阶段，过滤对象也不同：
+
+**第一层：BFS 目录遍历阶段**（`scanner_user.go`）
+
+在 `FindAlbumsForUser()` 的 BFS 中，ignore 规则用于**剪枝目录**：
+
+```
+对每个出队的目录 albumPath：
+  1. 用当前累积的 albumIgnore 编译 gitignore 对象
+  2. ignorePaths.MatchesPath(albumPath + "/")  ← 检查目录本身是否被忽略
+     命中 → continue，跳过整个目录（不创建 Album、不入队子目录）
+  3. 读取当前目录的 .photoviewignore，append 到 albumIgnore
+  4. 对子目录：directoryContainsPhotos(subalbumPath, cache, albumIgnore)
+     → 内部也会合并 .photoviewignore 并检查文件级匹配
+```
+
+**第二层：ProcessMedia 阶段**（`ignorefile_task.go`）
+
+在 `findMediaForAlbum()` 的 `MediaFound` 钩子中，`IgnorefileTask` 再次过滤**文件级**匹配：
+
+```go
+func (t IgnorefileTask) BeforeScanAlbum(ctx TaskContext) (TaskContext, error) {
+    // 从缓存中取出该 Album 目录在 BFS 阶段收集的 ignore 规则
+    albumIgnore := ignore.CompileIgnoreLines(*ctx.GetCache().GetAlbumIgnore(ctx.GetAlbum().Path)...)
+    return ctx.WithValue(albumIgnoreKey, albumIgnore), nil
+}
+
+func (t IgnorefileTask) MediaFound(ctx TaskContext, fileInfo fs.FileInfo, mediaPath string) (bool, error) {
+    // 用文件名（不是完整路径）做匹配
+    if getAlbumIgnore(ctx).MatchesPath(fileInfo.Name()) {
+        return true, nil  // skip
+    }
+    return false, nil
+}
+```
+
+### 11.2 Ignore 规则的继承与累积
+
+`.photoviewignore` 的规则在 BFS 中是**向下累积继承**的，但有两个关键细节：
+
+**累积方式**：`albumIgnore = append(albumIgnore, photoviewIgnore...)`
+
+- 每进入一个新目录，读取该目录的 `.photoviewignore`（如存在），追加到当前 `albumIgnore`
+- 子目录继承父目录的全部规则 + 自己目录的规则
+- 规则一旦追加，在整棵子树中永久生效（不存在"取消忽略"机制）
+
+**规则来源的时序问题**：
+
+在 `FindAlbumsForUser()` 的 BFS 中，目录处理的顺序是：
+
+```
+1. 先用当前 albumIgnore 检查目录自身是否被忽略（第 110-114 行）
+2. 然后才读取当前目录的 .photoviewignore 并合并（第 117-122 行）
+```
+
+这意味着：**一个目录的 `.photoviewignore` 只影响其子目录和子文件，不会影响自身是否被忽略**。例如：
+
+```
+/root/
+  .photoviewignore   ← 内容：tmp/
+  tmp/
+    photo.jpg
+```
+
+- `/root/` 的 `.photoviewignore` 规则在处理 `/root/` 时被读取并追加
+- 当 BFS 遍历到 `/root/tmp/` 时，`albumIgnore` 已包含 `tmp/` 规则
+- `ignorePaths.MatchesPath("/root/tmp/")` 为 true → `/root/tmp/` 整个被跳过
+
+但如果 `/root/tmp/` 自身有一个 `.photoviewignore` 想把自己排除在忽略之外，是做不到的——因为目录自身是否被忽略取决于**父目录传入的规则**，自身的 `.photoviewignore` 还没被读取。
+
+**缓存传递**：`albumIgnore` 通过 `AlbumScannerCache.InsertAlbumIgnore()` 存入缓存，后续 `IgnorefileTask.BeforeScanAlbum()` 从缓存取出，供 `findMediaForAlbum()` 的文件级过滤使用。缓存中存储的是 BFS 阶段最终累积的完整 ignore 列表。
+
+### 11.3 directoryContainsPhotos 中的 ignore 处理
+
+`directoryContainsPhotos()` (`scanner_user.go:228`) 是 BFS 的剪枝函数，其 ignore 处理与主 BFS 有微妙差异：
+
+```go
+func directoryContainsPhotos(rootPath string, cache *AlbumScannerCache, albumIgnore []string) bool {
+    // ...
+    for scanQueue.Front() != nil {
+        // 读取当前目录的 .photoviewignore → 追加到 albumIgnore
+        photoviewIgnore, err := getPhotoviewIgnore(dirPath)
+        albumIgnore = append(albumIgnore, photoviewIgnore...)
+        ignoreEntries := ignore.CompileIgnoreLines(albumIgnore...)
+
+        for _, fileInfo := range dirContent {
+            if fileInfo.IsDir() || isDirSymlink {
+                scanQueue.PushBack(filePath)  // 目录：直接入队，不做 ignore 检查
+            } else {
+                if cache.IsPathMedia(filePath) {
+                    if ignoreEntries.MatchesPath(fileInfo.Name()) {
+                        continue  // 文件：被忽略则跳过，不算"包含照片"
+                    }
+                    return true    // 找到未被忽略的媒体文件 → 目录含照片
+                }
+            }
+        }
+    }
+    return false
+}
+```
+
+**关键差异**：
+
+1. **目录不做 ignore 检查**：子目录直接入队继续遍历，不像主 BFS 那样先检查目录是否被忽略。这意味着 `directoryContainsPhotos()` 可能遍历被 ignore 的子目录，只要其中的未被忽略的文件也是媒体文件，就会返回 true
+2. **只过滤文件级**：ignore 规则只用于判断文件是否被忽略，被忽略的媒体不算"照片存在"
+3. **副作用**：函数会修改 `albumIgnore`（因为 `append`），但由于 Go slice 的 append 语义，调用方的 slice 不会被修改（append 产生新 slice），所以不影响主 BFS
+
+### 11.4 符号链接（Symlink）处理
+
+Photoview 对符号链接的处理分散在多个位置，行为因阶段而异：
+
+**`IsDirSymlink()` 的实现**（`api/utils/utils.go:68`）：
+
+```go
+func IsDirSymlink(linkPath string) (bool, error) {
+    fileInfo, err := os.Lstat(linkPath)        // Lstat：不跟随链接，获取链接自身信息
+    if fileInfo.Mode()&os.ModeSymlink == os.ModeSymlink {
+        resolvedPath, err := filepath.EvalSymlinks(linkPath)  // 解析链接目标
+        resolvedFile, err := os.Stat(resolvedPath)            // Stat：跟随链接，获取目标信息
+        return resolvedFile.IsDir(), nil       // 仅当目标为目录时返回 true
+    }
+    return false, nil
+}
+```
+
+- 只识别**指向目录的符号链接**，指向文件的符号链接返回 false
+- 链接解析失败（目标不存在等）→ 返回 error
+- 指向文件的符号链接不会被 `IsDirSymlink` 识别，但 `os.ReadDir` 返回的 `item.IsDir()` 为 false，所以文件符号链接会被当作普通文件处理
+
+**三个阶段的 symlink 处理**：
+
+| 阶段 | 位置 | 行为 |
+|------|------|------|
+| **BFS 目录发现** (`FindAlbumsForUser`) | `scanner_user.go:206-212` | `item.IsDir() \|\| isDirSymlink` → 当作子目录，加入 BFS 队列。链接解析失败 → 记录错误并 continue |
+| **剪枝检查** (`directoryContainsPhotos`) | `scanner_user.go:264-271` | `fileInfo.IsDir() \|\| isDirSymlink` → 当作子目录入队。链接解析失败 → **静默视为非目录**（`isDirSymlink = false`），不影响整体判断 |
+| **文件发现** (`findMediaForAlbum`) | `scanner_album.go:129-135` | `!item.IsDir() && !isDirSymlink` → 只处理非目录、非目录符号链接的条目。链接解析失败 → **静默视为非目录**，当作文件处理 |
+
+**隐藏目录的统一过滤**：
+
+在 BFS 阶段，`scanner_user.go:202-204`：
+
+```go
+if path.Base(subalbumPath)[0:1] == "." {
+    continue
+}
+```
+
+所有以 `.` 开头的目录（包括 `.photoviewignore` 所在目录的隐藏子目录）都被跳过，且这个判断**在 symlink 检查之前**，所以即使符号链接指向的名称以 `.` 开头也会被跳过。
+
+在文件发现阶段，`scanner_cache/cache.go:112`：
+
+```go
+if path.Base(mediaPath)[0:1] == "." {
+    return false
+}
+```
+
+同样过滤隐藏文件（`IsPathMedia` 中）。
+
+**总结**：指向目录的符号链接被透明地当作真实目录处理（可递归遍历），指向文件的符号链接被当作普通文件处理（可被扫描为 media），解析失败的链接在不同阶段有不同的容错策略。
+
+---
+
+## 十二、错误处理路径与回滚语义
+
+### 12.1 ScannerTask 链的错误传播：fail-fast
+
+`scannerTasks` 的所有钩子都采用 **fail-fast** 策略——一旦某个 Task 返回 error，后续 Task 全部跳过，错误立即向上传播。
+
+以 `ProcessMedia` 为例（`scanner_tasks.go:128-149`）：
+
+```go
+func (t scannerTasks) ProcessMedia(ctx TaskContext, mediaData *EncodeMediaData, mediaCachePath string) ([]*MediaURL, error) {
+    allNewMedia := make([]*models.MediaURL, 0)
+    for _, task := range allTasks {
+        // context 取消检查
+        select { case <-ctx.Done(): return nil, ctx.Err(); default: }
+
+        newMedia, err := task.ProcessMedia(ctx, mediaData, mediaCachePath)
+        if err != nil {
+            return []*models.MediaURL{}, err   // ← 立即返回，后续 task 不执行
+        }
+        allNewMedia = append(allNewMedia, newMedia...)
+    }
+    return allNewMedia, nil
+}
+```
+
+所有钩子统一遵循此模式：
+
+| 钩子 | 传播策略 | 说明 |
+|------|---------|------|
+| `BeforeScanAlbum` | 第一个 error 即返回 | 后续 Task 的 `BeforeScanAlbum` 不执行 |
+| `MediaFound` | error → 返回 `(false, err)`；skip → 返回 `(true, nil)` 不再调用后续 Task | skip 是"短路"而非错误 |
+| `AfterMediaFound` | fail-fast | 通过 `simpleCombinedTasks` 实现 |
+| `BeforeProcessMedia` | fail-fast，同时 ctx 不再传递 | 后续 Task 拿不到被中断的 ctx |
+| `ProcessMedia` | fail-fast | 已成功执行的 Task 产生的 MediaURL 丢失 |
+| `AfterProcessMedia` | fail-fast | 通过 `simpleCombinedTasks` 实现 |
+| `AfterScanAlbum` | fail-fast | 通过 `simpleCombinedTasks` 实现 |
+
+**`ProcessMedia` 的部分写入问题**：
+
+如果 11 个 Task 中排在前面的 Task（如 SidecarTask）的 `ProcessMedia` 成功并写入了文件和数据库记录，但后面的 Task（如 ProcessPhotoTask）失败了，`ProcessMedia` 返回 error。此时前面 Task 已经产生的副作用（文件落盘、数据库写入）**不会被回滚**——因为 `ProcessMedia` 在 `scanMedia()` 的数据库事务内执行，事务回滚只影响数据库，文件系统上的文件不会撤销。
+
+### 12.2 事务边界与回滚范围
+
+`scanMedia()` (`media_scan.go:11-39`) 定义了管线中最关键的事务边界：
+
+```go
+func scanMedia(ctx TaskContext, media *models.Media, mediaData *EncodeMediaData, mediaIndex int, mediaTotal int) error {
+    newCtx, err := Tasks.BeforeProcessMedia(ctx, mediaData)  // ① 事务外
+    if err != nil { return err }
+
+    mediaCachePath, err := media.CachePath()                  // ② 事务外：创建缓存目录
+    if err != nil { return err }
+
+    transactionError := newCtx.DatabaseTransaction(func(ctx TaskContext) error {
+        updatedURLs, err := Tasks.ProcessMedia(newCtx, mediaData, mediaCachePath)  // ③ 事务内
+        if err != nil { return err }
+
+        if err = Tasks.AfterProcessMedia(newCtx, mediaData, updatedURLs, mediaIndex, mediaTotal); err != nil {  // ④ 事务内
+            return err
+        }
+        return nil
+    })
+    // ⑤ 事务回滚只影响 ③ 和 ④ 的数据库写入
+}
+```
+
+**事务内 vs 事务外**：
+
+| 操作 | 位置 | 是否在事务内 | 回滚影响 |
+|------|------|:-:|------|
+| `BeforeProcessMedia` | ① | ❌ | 不受事务保护 |
+| `CachePath()` 创建目录 | ② | ❌ | 目录已创建，事务回滚不删除 |
+| `ProcessMedia` 中的文件写入 | ③ 内 | ❌ | 文件已落盘，事务回滚不删除 |
+| `ProcessMedia` 中的数据库写入 | ③ 内 | ✅ | 事务回滚会撤销 |
+| `AfterProcessMedia` 中的数据库写入 | ④ | ✅ | 事务回滚会撤销 |
+
+**核心问题：文件系统与数据库的非原子性**
+
+`ProcessMedia` 内部的 FFmpeg/ImageMagick 调用是先写文件到磁盘，再在同一个事务中写 `MediaURL` 记录。如果事务回滚：
+
+- 文件系统：缩略图/Web 视频文件**已经写入磁盘**，不会自动清理
+- 数据库：`MediaURL` 记录**被回滚**，不存在
+
+这导致**孤立缓存文件**——磁盘上有文件但数据库中无记录。不过这不是严重问题：下次扫描时，`ProcessPhotoTask`/`ProcessVideoTask` 会发现数据库中没有对应的 `MediaURL`，重新生成缩略图时会覆盖这些孤立文件。
+
+### 12.3 findMediaForAlbum 中的错误隔离
+
+`findMediaForAlbum()` (`scanner_album.go:116-172`) 对每个文件有独立的错误隔离：
+
+```go
+for _, item := range dirContent {
+    // ...
+    if !item.IsDir() && !isDirSymlink && ctx.GetCache().IsPathMedia(mediaPath) {
+        // MediaFound 钩子错误 → 整个 findMediaForAlbum 返回 error
+        skip, err := scanner_tasks.Tasks.MediaFound(ctx, itemInfo, mediaPath)
+        if err != nil {
+            return nil, err          // ← 中断整个目录扫描
+        }
+
+        // 每个文件一个独立事务
+        err = ctx.DatabaseTransaction(func(ctx TaskContext) error {
+            media, isNewMedia, err := ScanMedia(...)
+            if err != nil { return err }
+            if err = scanner_tasks.Tasks.AfterMediaFound(ctx, media, isNewMedia); err != nil { return err }
+            albumMedia = append(albumMedia, media)
+            return nil
+        })
+
+        if err != nil {
+            scanner_utils.ScannerError(ctx, "Error scanning media for album (%d): %s\n", ctx.GetAlbum().ID, err)
+            continue     // ← 单文件失败不影响其他文件
+        }
+    }
+}
+```
+
+- **`MediaFound` 失败** → `findMediaForAlbum` 整体返回 error → `ScanAlbum` 中止
+- **`ScanMedia` + `AfterMediaFound` 失败** → 单文件事务回滚 + `ScannerError` 记录 + `continue` 跳过，**其他文件继续处理**
+
+### 12.4 ScanAlbum 中的错误隔离
+
+`ScanAlbum()` (`scanner_album.go:87-114`) 对每个 media 的处理也是隔离的：
+
+```go
+for i, media := range albumMedia {
+    mediaData := media_encoding.NewEncodeMediaData(media)
+    if err := scanMedia(ctx, media, &mediaData, i, len(albumMedia)); err != nil {
+        scanner_utils.ScannerError(ctx, "Error scanning media for album (%d) file (%s): %s\n", ...)
+        // ← 没有 return，继续处理下一个 media
+    }
+}
+
+if err := scanner_tasks.Tasks.AfterScanAlbum(ctx, changedMedia, albumMedia); err != nil {
+    return errors.Wrap(err, "after scan album")
+}
+```
+
+- 单个 media 的 `scanMedia` 失败 → `ScannerError` 记录错误 + 继续处理下一个
+- `AfterScanAlbum` 失败 → `ScanAlbum` 整体返回 error → `ScannerJob.Run()` 中 `scanner_utils.ScannerError` 记录
+
+### 12.5 Album 级事务
+
+`FindAlbumsForUser()` 中，每个目录的 Album 创建/查找是在独立事务中（`scanner_user.go:127-190`）：
+
+```go
+transErr := db.Transaction(func(tx *gorm.DB) error {
+    // 查找或创建 Album + 设置 Owner
+})
+if transErr != nil {
+    scanErrors = append(scanErrors, ...)
+    continue   // ← 单个 Album 事务失败，记录错误，继续处理下一个目录
+}
+```
+
+Album 事务失败**不影响其他 Album 的扫描**，也不影响已经成功入队的 Album。
+
+### 12.6 各 Task 内部的容错策略
+
+不同 Task 对自身错误的处理策略不同：
+
+| Task | 钩子 | 错误处理 | 是否向上传播 |
+|------|------|---------|:-:|
+| **ExifTask** | `AfterMediaFound` | `SaveEXIF` 失败仅 `log.Warn`，**吞掉错误**返回 `nil` | ❌ |
+| **VideoMetadataTask** | `AfterMediaFound` | `ScanVideoMetadata` 失败仅 `log.Printf("WARN:...")`，返回 `nil` | ❌ |
+| **FaceDetectionTask** | `AfterProcessMedia` | `DetectFaces` 失败调 `ScannerError` 记录，返回 `nil` | ❌ |
+| **NotificationTask** | 各阶段 | 无可能出错的 I/O 操作 | N/A |
+| **IgnorefileTask** | `BeforeScanAlbum` | 缓存中无 ignore 数据 → `CompileIgnoreLines(nil...)` 不报错 | N/A |
+| **CounterpartFilesTask** | `MediaFound` | 不支持的文件类型直接 skip，不报错 | N/A |
+| **SidecarTask** | `ProcessMedia` | sidecar 变更重生成失败 → 返回 error | ✅ |
+| **ProcessPhotoTask** | `ProcessMedia` | 缩略图/highres 生成失败 → 返回 error | ✅ |
+| **ProcessVideoTask** | `ProcessMedia` | FFmpeg 转码/截帧失败 → 返回 error | ✅ |
+| **BlurhashTask** | `AfterProcessMedia` | blurhash 编码失败 → 返回 error | ✅ |
+| **MediaCleanupTask** | `AfterScanAlbum` | 清理失败调 `ScannerError` 记录，但**不返回 error** | ❌ |
+
+**三类错误处理模式**：
+
+1. **吞掉错误，仅日志**（ExifTask、VideoMetadataTask、FaceDetectionTask、MediaCleanupTask）：非关键操作失败不阻塞管线，元数据缺失不影响核心展示
+2. **向上传播**（SidecarTask、ProcessPhotoTask、ProcessVideoTask、BlurhashTask）：核心转码/生成失败需要让上层感知，触发事务回滚
+3. **短路跳过**（IgnorefileTask、CounterpartFilesTask）：不是错误而是过滤决策，通过 `skip=true` 表达
+
+### 12.7 完整错误传播路径图
+
+```
+ScannerJob.Run(db)
+  └─ scanner.ScanAlbum(ctx)
+       │
+       ├─ Tasks.BeforeScanAlbum(ctx)  失败
+       │    └─ return error ──────────────────────▶ ScannerError 记录，Album 扫描中止
+       │
+       ├─ findMediaForAlbum(ctx)
+       │    ├─ Tasks.MediaFound() 失败
+       │    │    └─ return nil, err ──────────────▶ findMediaForAlbum 整体返回 error
+       │    │                                      → ScanAlbum 中止
+       │    │
+       │    └─ 单文件 [事务: ScanMedia + AfterMediaFound] 失败
+       │         └─ 事务回滚 + ScannerError + continue ──▶ 其他文件继续
+       │
+       ├─ 对每个 media: scanMedia(ctx, media, ...)
+       │    ├─ BeforeProcessMedia 失败 (事务外)
+       │    │    └─ return error ─────────────────▶ ScannerError 记录，下一个 media 继续
+       │    │
+       │    └─ [事务: ProcessMedia + AfterProcessMedia] 失败
+       │         ├─ 数据库事务回滚（MediaURL 记录撤销）
+       │         ├─ 文件系统已写入的缩略图/视频不回滚（孤立文件）
+       │         └─ return error ─────────────────▶ ScannerError 记录，下一个 media 继续
+       │
+       └─ Tasks.AfterScanAlbum(ctx, ...) 失败
+            └─ return error ──────────────────────▶ ScanAlbum 返回 error
+                                                   → ScannerJob.Run 中 ScannerError 记录
+                                                   → 该 Album 的 job 完成，队列继续处理下一个
+```
+
+**关键结论**：
+
+- **Album 级别没有整体回滚**：`ScanAlbum` 不是在单一事务中执行，每个 media 的处理有独立事务。一个 media 失败不影响其他 media 的已提交结果
+- **单 media 级别有数据库回滚**：`ProcessMedia` + `AfterProcessMedia` 在同一事务中，失败会回滚该 media 的所有数据库写入
+- **文件系统操作不可回滚**：FFmpeg/MagickWand 写入的文件在事务回滚后成为孤立文件，但下次扫描会被覆盖
+- **元数据类 Task 主动吞错**：EXIF、视频元数据、人脸检测等失败不阻塞管线，保证了核心缩略图生成的鲁棒性
