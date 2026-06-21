@@ -118,6 +118,61 @@ func (fd *faceDetector) classifyDescriptor(descriptor face.Descriptor) int32 {
 
 **没有任何配置项可以调整距离阈值**。如果需要修改，必须改代码重新编译。这也反映了设计上的一个取舍：把阈值固化在代码中，避免用户随意调整导致聚类结果不稳定。
 
+### 2.6 阈值调整后：历史 FaceGroup 不会自动触发重新聚类
+
+阈值变更后，已经聚类完成的 FaceGroup **不会被自动重新处理**。原因是：
+
+**1. `DetectFaces` 不检查 ImageFace 是否已存在**
+
+`DetectFaces` (`face_detector_impl.go:92`) 的流程是：
+1. 加载缩略图
+2. 调用 `rec.RecognizeFile(thumbnailPath)` 从图像中检测人脸（提取 embedding + 矩形框）
+3. 对每个检测到的人脸直接调用 `classifyFace`
+
+**没有任何"这个 media 是否已存在 image_faces"的检查。** 所以每次媒体被扫描，都会重新检测并写入新的 ImageFace 记录——这意味着重复扫描会产生重复的人脸条目（这本身也是一个潜在问题）。
+
+**2. 扫描触发入口是 `AfterProcessMedia`**
+
+`FaceDetectionTask.AfterProcessMedia` (`face_detection_task.go:15`) 在**每次处理媒体**时都会触发，条件是：
+
+```go
+didProcess := len(updatedURLs) > 0
+if didProcess && mediaData.Media.Type == models.MediaTypePhoto {
+    // 执行 DetectFaces
+}
+```
+
+`didProcess` 表示是否有新缩略图被生成。只有当媒体被重新编码/处理时才会触发人脸检测。**正常的增量扫描不会重新检测已有媒体。**
+
+**3. 没有"重新聚类"的专用接口**
+
+代码中不存在类似 `ReclusterAllFaces`、`ResetFaceGroups` 或 `RunFaceDetectionAgain` 的 mutation。GraphQL schema 中只有扫描相关的两个入口：
+
+| Mutation | 作用 |
+|----------|------|
+| `scanAll` | 把所有用户加入扫描队列（`scanner_queue.AddAllToQueue`） |
+| `scanUser` | 把指定用户加入扫描队列（`scanner_queue.AddUserToQueue`） |
+
+但这些扫描任务是否会触发人脸重检测，取决于媒体是否被重新处理（即 `updatedURLs > 0`）。正常情况下，已有媒体不会被重新编码，所以**即便执行 `scanAll`，历史媒体的人脸也不会被重新检测。**
+
+**阈值调整后的实际影响范围**：
+
+```
+阈值 0.2 → 调整为 0.3（假设）
+       │
+       ├── 已有 FaceGroup / ImageFace：完全不变
+       │    DB 中已有的分组关系不会被重新评估
+       │
+       ├── 新扫描的媒体：使用新阈值
+       │    后续新增照片的 classifyDescriptor 会走新阈值
+       │
+       └── RecognizeUnlabeledFaces：使用新阈值
+            用户点击"识别未标记人脸"时，
+            classifyDescriptor 也会走新阈值
+```
+
+**要让阈值变更作用于历史数据，需要手动操作数据库**——清除历史 `image_faces` 和 `face_groups` 表，然后让媒体重新被处理（例如删除缩略图缓存强制重编码），或者重新实现一个重新聚类的 batch job。
+
 ---
 
 ## 3. 数据模型
@@ -448,6 +503,22 @@ query = models.FormatSQL(query, nil, paginate)  // order 参数为 nil
 
 `CombineFaceGroups` 的去重步骤保留 `MIN(id)`（`faces.go:204`），这与封面排序逻辑一致——保留最早创建的人脸记录，也保留了它作为封面的可能性。
 
+### 7.5 没有 keep_oldest_cover / keep_largest 封面策略切换
+
+代码中**不存在** `keep_oldest_cover`、`keep_largest` 或任何类似的封面策略配置项。封面选择规则是完全硬编码的行为，由以下两个隐式机制决定：
+
+1. **排序规则**：`ImageFaces` resolver 没有显式 ORDER BY，默认按 id 升序（即按创建时间升序）
+2. **UI 选取**：`PeoplePage` 的 `imageFaces(paginate: { limit: 1 })` 总是取第一条，`SingleFaceGroup` 也是同样
+
+**整个系统中没有"选择最大人脸作封面"的逻辑**。不存在按矩形面积（`(MaxX-MinX)*(MaxY-MinY)`）排序的代码，也没有可配置的策略开关。
+
+如果要实现 `keep_largest` 策略，需要修改两个层面：
+
+- **Backend**：`ImageFaces` resolver 中添加 ORDER BY 计算矩形面积降序
+- **UI**：GraphQL query 中传入新的 sort 参数，或者后端自动处理
+
+但这些修改在当前代码中都不存在。
+
 ---
 
 ## 8. 关于 face_state 与 unmerge 回退路径
@@ -498,7 +569,40 @@ if err := deleteFaceGroups(sourceFaceGroups, tx); err != nil {
 
 **设计意图**：合并被视为一个**不可逆的决策**。用户确认合并后，原组就消失了。如果合并错了，用户只能手动把人脸拆出来（Detach），但无法恢复原组的身份。
 
-### 8.4 为什么没有状态机？
+### 8.4 DetachImageFaces 之后：不会自动触发新的聚类检测
+
+即便 `DetachImageFaces` 可以近似地"拆分组"，拆分完成后**不会自动触发任何重新聚类或重新检测**。
+
+让我们追踪 `DetachImageFaces` 的完整执行路径（`faces.go:328`）：
+
+```
+用户请求 detachImageFaces(imageFaceIDs)
+       │
+       └── DB 事务：
+            ├── 校验用户权限
+            ├── 创建新 FaceGroup（INSERT face_groups）
+            ├── UPDATE image_faces SET face_group_id = newID
+            │
+            └── 内存同步：MergeImageFaces(userOwnedImageFaceIDs, newID)
+```
+
+**没有后续自动操作**：
+
+- 不会调用 `DetectFaces` 重新检测人脸
+- 不会调用 `RecognizeUnlabeledFaces` 重新识别
+- 不会触发扫描任务（`AddUserToQueue` / `AddAllToQueue`）
+- 不会重建分类器样本集（`SetSamples` 只在 `classifyFace` 中被调用）
+
+**拆分后新组的状态**：
+
+1. 新 FaceGroup 的 `label` 为 `NULL`（未标记）
+2. 新组的 ImageFace 的 embedding **不变**（只改了 `face_group_id`）
+3. 新组的 `faceGroupID` 会被更新到内存的 `faceGroupIDs` 映射中
+4. 但分类器样本集不会被重新 `SetSamples`，所以**在下次新人脸被检测之前，这个新组不会参与自动分类**
+
+用户如果希望拆分后的人脸被重新识别，只能**手动点击**"识别未标记人脸"按钮来触发 `RecognizeUnlabeledFaces`。
+
+### 8.5 为什么没有状态机？
 
 从代码设计来看，Photoview 的人脸识别采用了**极简模型**：
 
@@ -635,6 +739,9 @@ if err := deleteFaceGroups(sourceFaceGroups, tx); err != nil {
 | 环境变量定义 | `api/utils/environment_variables.go` | 21, 43 |
 | FormatSQL 排序处理 | `api/graphql/models/utils.go` | 11 |
 | FaceCircleImage 封面渲染 | `ui/src/Pages/PeoplePage/FaceCircleImage.tsx` | 1-136 |
+| 扫描入口 scanAll / scanUser | `api/graphql/resolvers/scanner.go` | 21-52 |
+| FaceDetectionTask 触发条件 | `api/scanner/scanner_tasks/face_detection_task.go` | 15-28 |
+| ReloadFacesFromDatabase 调用点 | `api/scanner/scanner_tasks/cleanup_tasks/cleanup_media.go` | 57-61, 129-133 |
 
 ---
 
@@ -644,18 +751,26 @@ if err := deleteFaceGroups(sourceFaceGroups, tx); err != nil {
 
 2. **阈值硬编码，运维侧不可调**：`0.2` 是字面量写死在代码中，没有环境变量或配置项可以调整。运维侧只能开关人脸识别，不能调阈值。
 
-3. **Label 是状态机的分水岭**：有 label 的 FaceGroup 成为重识别的"锚点"，无 label 的组是待确认的候选。用户的标记行为实质上在驱动状态转换。
+3. **阈值调整不影响历史数据**：阈值变更后，已有的 FaceGroup/ImageFace 不会被重新评估。只有新扫描的媒体和 `RecognizeUnlabeledFaces` 会用新阈值。要让历史数据生效，需手动清库并重扫。
 
-4. **冲突检查保护语义一致性**：同一 FaceGroup 中同一 Media 只能有一个 ImageFace，避免"同一人在同一照片中被识别两次"的矛盾。
+4. **没有重新聚类专用接口**：不存在 `ReclusterAllFaces` 或类似 mutation。`scanAll` 是否触发人脸重检测取决于媒体是否被重新编码（`updatedURLs > 0`），正常情况下不会。
 
-5. **封面是隐式的，无冲突处理**：FaceGroup 没有 `cover_image` 字段，封面由 `imageFaces[0]`（id 最小的人脸）自然决定。合并后封面归属是排序规则的副作用，而非专门设计。
+5. **Label 是状态机的分水岭**：有 label 的 FaceGroup 成为重识别的"锚点"，无 label 的组是待确认的候选。用户的标记行为实质上在驱动状态转换。
 
-6. **没有 face_state，没有状态机**：整个系统不追踪合并历史，不维护状态字段。合并即物理删除 source 组，拆分即新建组。
+6. **冲突检查保护语义一致性**：同一 FaceGroup 中同一 Media 只能有一个 ImageFace，避免"同一人在同一照片中被识别两次"的矛盾。
 
-7. **合并不可逆，无 unmerge 路径**：合并操作是单向的，source 组被物理删除。用户只能通过 `DetachImageFaces` 近似回退，但无法恢复原组身份和结构。
+7. **封面是隐式的，无冲突处理**：FaceGroup 没有 `cover_image` 字段，封面由 `imageFaces[0]`（id 最小的人脸）自然决定。合并后封面归属是排序规则的副作用，而非专门设计。
 
-8. **内存同步的延迟性**：`MergeImageFaces` 仅修改 `faceGroupIDs` 映射，不触发 `SetSamples`。分类器样本集的更新发生在下次 `classifyFace` 或 `RecognizeUnlabeledFaces` 时。
+8. **没有封面策略切换**：不存在 `keep_oldest_cover` / `keep_largest` 的配置项。排序规则和 UI 选择逻辑都是硬编码的，无法切换到按人脸矩形面积选封面。
 
-9. **CombineFaceGroups 的去重是防御性代码**：由于冲突检查在前，合并后的去重步骤在正常路径上不会触发，仅作为安全网存在。
+9. **没有 face_state，没有状态机**：整个系统不追踪合并历史，不维护状态字段。合并即物理删除 source 组，拆分即新建组。
 
-10. **RecognizeUnlabeledFaces 会重建样本集**：先把未标记样本从内存中移除，用已标记样本作为训练集重新分类，这确保了标记操作对重识别的即时影响。
+10. **合并不可逆，无 unmerge 路径**：合并操作是单向的，source 组被物理删除。用户只能通过 `DetachImageFaces` 近似回退，但无法恢复原组身份和结构。
+
+11. **Detach 后不会自动触发重聚类**：拆分完成后不会调用 `DetectFaces`、`RecognizeUnlabeledFaces` 或触发扫描任务。新组不会立即参与自动分类，需用户手动触发重识别。
+
+12. **内存同步的延迟性**：`MergeImageFaces` 仅修改 `faceGroupIDs` 映射，不触发 `SetSamples`。分类器样本集的更新发生在下次 `classifyFace` 或 `RecognizeUnlabeledFaces` 时。
+
+13. **CombineFaceGroups 的去重是防御性代码**：由于冲突检查在前，合并后的去重步骤在正常路径上不会触发，仅作为安全网存在。
+
+14. **RecognizeUnlabeledFaces 会重建样本集**：先把未标记样本从内存中移除，用已标记样本作为训练集重新分类，这确保了标记操作对重识别的即时影响。
