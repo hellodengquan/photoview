@@ -265,6 +265,81 @@ notification.BroadcastNotification(&models.Notification{
 - ❌ 没有随系统负载自适应调整的逻辑
 - ❌ 没有任何监控告警系统集成
 
+### 2.6 EWMA 平滑因子 alpha：不存在的算法概念
+
+**核心结论：代码库中完全没有 EWMA（Exponentially Weighted Moving Average，指数加权移动平均）算法，不存在 alpha 平滑因子，更没有运维侧可调配置。**
+
+#### 2.6.1 搜索证据链
+
+| 搜索类别 | 关键词 | 匹配结果 |
+|---------|--------|---------|
+| EWMA 核心词 | `ewma` | ❌ 0 个匹配 |
+| 指数加权平均 | `exponential.*weight`、`moving.*average` | ❌ 0 个匹配 |
+| 平滑因子 | `smooth.*factor`、`alpha.*factor` | ❌ 0 个匹配 |
+| 滑动窗口 | `sliding.*window`、`window.*size` | ❌ 0 个匹配 |
+| 限流/退避 | `rate.*limit`、`backoff`、`retry` | ❌ 0 个匹配 |
+
+#### 2.6.2 唯一的「类限流」机制：固定间隔 Throttle
+
+项目中仅有一个简单的节流器 `Throttle`，完全不是 EWMA：
+
+文件：`api/utils/throttle.go`
+
+```go
+type Throttle struct {
+    interval   time.Duration  // 固定间隔，硬编码
+    lastAction time.Time
+}
+
+func (t *Throttle) Trigger(action func()) {
+    if time.Now().After(t.lastAction.Add(t.interval)) {
+        t.lastAction = time.Now()
+        action()
+    }
+}
+```
+
+**使用场景：** Scanner 队列状态的 WebSocket 通知，节流间隔 500ms（硬编码在 `queue.go:175`）
+
+```go
+throttle := utils.NewThrottle(500 * time.Millisecond)
+// 间隔固定为 500ms，不可调
+```
+
+**Throttle 与 EWMA 的本质区别：**
+
+| 特性 | Throttle（本项目） | EWMA |
+|------|-------------------|------|
+| 算法 | 固定时间间隔，简单比较 | 指数衰减加权平均 |
+| 参数 | 1 个：固定间隔 interval | 1 个：平滑因子 alpha |
+| 自适应 | ❌ 无，间隔恒定 | ✅ 有，根据历史数据平滑 |
+| 可调性 | ❌ 硬编码 500ms | ——（本项目不存在） |
+| 使用场景 | WebSocket 通知防刷屏 | 通常用于负载指标平滑、限流 |
+
+#### 2.6.3 其他扫描通知的时间处理
+
+- **Scanner Ticker**（`periodic_scanner.go`）：固定周期 Ticker，无平滑
+- **Scanner Progress**（`queue.go`）：简单 Throttle（500ms 固定间隔）
+- **Exiftool MarkReader**（`mark_reader.go`）：基于定界符的流式读取，有固定 bufferSize（10240 硬编码），无 EWMA
+- **Executable Worker**（`executable_worker.go`）：semaphore 并发控制，固定 worker 数，无平滑
+
+#### 2.6.4 运维侧可调的扫描参数（非 EWMA）
+
+运维侧唯一可调的与「时间/速率」相关的参数：
+
+| 参数 | 位置 | 默认值 | 可调范围 |
+|------|------|--------|---------|
+| 定期扫描间隔 | `PeriodicScanner.tsx` | 1 小时 | 秒/分/时/天/月 可配 |
+| 并发 Worker 数 | `ScannerConcurrentWorkers.tsx` | PostgreSQL=3, SQLite=1 | 1-24 |
+
+这两个参数都与 EWMA 或 alpha 平滑因子无关。
+
+**结论：**
+- ❌ 没有 EWMA 算法
+- ❌ 没有 alpha 平滑因子
+- ❌ 没有运维侧可调的 alpha 参数
+- ✅ 仅有固定间隔的简单 Throttle（500ms，硬编码，不可调）
+
 ---
 
 ## 三、续期接口的权限校验深度剖析
@@ -558,6 +633,109 @@ func (r *mutationResolver) UpdateUser(ctx context.Context, id int,
 3. **删除用户**：最彻底的方式，但数据也没了
 
 **代码中没有任何类似「setUserDisabled」或「deactivateUser」的 mutation。**
+
+### 3.7 InvalidateUserShareTokens：不存在的操作，同步 CASCADE 删除无阻塞
+
+**核心结论：没有 `InvalidateUserShareTokens` 操作。用户删除时 ShareToken 的清理走数据库级 CASCADE 同步删除，没有异步队列，也没有「大量 token 阻塞」的处理机制。**
+
+#### 3.7.1 搜索证据链
+
+| 搜索类别 | 关键词 | 匹配结果 |
+|---------|--------|---------|
+| 操作名称 | `InvalidateUserShareTokens`、`invalidate.*share`、`revoke.*share` | ❌ 0 个匹配（仅 share-link-flow.md 文档文本） |
+| 批量删除 | `bulk.*delete`、`batch.*delete`、`delete.*where.*owner` | ❌ 0 个匹配（数据库 CASCADE 自动处理） |
+| 异步队列 | `async.*queue`、`queue.*invalidate`、`background.*job` | ❌ 0 个匹配 |
+| 分页/分块删除 | `chunk.*delete`、`limit.*delete`、`offset.*delete` | ❌ 0 个匹配 |
+
+#### 3.7.2 ShareToken 删除的唯一路径：CASCADE 同步删除
+
+**三种触发 ShareToken 删除的场景（全部是数据库级同步 CASCADE）：**
+
+| 触发场景 | 删除 SQL | 执行方式 | 阻塞风险 |
+|---------|---------|---------|---------|
+| **删除用户** | `DELETE FROM users WHERE id = ?` → CASCADE `share_tokens.owner_id` | 同步，单 SQL 事务 | ⚠️ 大量 token 时可能阻塞 |
+| **删除相册** | `DELETE FROM albums WHERE id = ?` → CASCADE `share_tokens.album_id` | 同步，单 SQL 事务 | ⚠️ 同上 |
+| **删除媒体** | `DELETE FROM media WHERE id = ?` → CASCADE `share_tokens.media_id` | 同步，单 SQL 事务 | ✅ 单个媒体通常 token 少 |
+| **手动删除 token** | `DELETE FROM share_tokens WHERE value = ?` | 同步，单条删除 | ✅ 无阻塞 |
+
+**删除用户的完整同步调用链（无异步队列）：**
+
+文件：`api/graphql/models/actions/user_actions.go:14`
+
+```go
+func DeleteUser(db *gorm.DB, userId int) error {
+    var user models.User
+    if err := db.First(&user, userId).Error; err != nil {
+        return err
+    }
+    return db.Delete(&user).Error  // ★ 同步执行 GORM Delete
+    // CASCADE 在数据库层面触发：
+    // DELETE FROM access_tokens WHERE user_id = userId
+    // DELETE FROM share_tokens WHERE owner_id = userId
+    // DELETE FROM user_albums WHERE user_id = userId
+    // ... 所有关联表
+}
+```
+
+**GraphQL resolver（`user.go:161-176`）也同步调用：**
+```go
+func (r *mutationResolver) DeleteUser(ctx context.Context, id int) (*models.User, error) {
+    // ... 权限检查（仅 Admin）
+    user := models.User{}
+    user.Id = id
+    if err := actions.DeleteUser(database, id); err != nil {  // 同步阻塞
+        return nil, err
+    }
+    return &user, nil
+}
+```
+
+#### 3.7.3 大量 token 时的阻塞风险
+
+**当前实现的风险点：**
+
+1. **无分页/分块删除**：CASCADE 删除在单个事务中完成，若用户有大量 ShareToken（如 10 万+），会导致：
+   - 长事务锁表
+   - 数据库连接占用时间长
+   - 其他请求被阻塞
+
+2. **无异步队列**：整个删除过程在 HTTP 请求的 goroutine 中同步完成，没有：
+   - `ScannerQueue` 异步任务
+   - goroutine 后台执行
+   - 消息队列
+   - 分批删除
+
+3. **无进度反馈**：删除用户的 mutation 是「all-or-nothing」，没有进度通知，前端只能等待超时或成功。
+
+**Dataloader 的 batch 机制不是删除队列：**
+文件：`api/dataloader/gen_userloader.go:17-42`
+
+```go
+type UserLoaderConfig struct {
+    Wait     time.Duration  // 默认 16ms，等待合并
+    MaxBatch int            // 默认 100，最多合并 100 个查询
+}
+```
+Dataloader 的 batch 是用于**读查询合并优化**（N+1 问题），与删除操作无关。
+
+#### 3.7.4 为什么不需要 InvalidateUserShareTokens？
+
+现有设计下 ShareToken 的「失效」有三种方式，均不需要独立的 invalidate 操作：
+
+| 失效方式 | 机制 | 即时性 |
+|---------|------|--------|
+| **过期时间到达** | HTTP 路由和 GraphQL resolver 每次请求实时检查 `Expire < NOW()` | ✅ 即时（请求时检查） |
+| **数据库 CASCADE 删除** | 删除用户/相册/媒体时自动级联 | ✅ 即时（同事务） |
+| **手动删除 token** | `DeleteShareToken` mutation 单条删除 | ✅ 即时 |
+
+由于 ShareToken 是轻量级记录（仅 value、expire、password、外键），即使数量大，CASCADE 删除的性能通常也在可接受范围内，因此设计上没有引入异步队列的复杂度。
+
+**结论：**
+- ❌ 没有 `InvalidateUserShareTokens` 操作
+- ❌ 没有异步队列处理批量删除
+- ❌ 没有大量 token 时分页/分块删除的防阻塞机制
+- ✅ 所有删除走数据库 CASCADE 同步删除，单个事务内完成
+- ⚠️ 极端场景（10 万+ token）可能存在长事务阻塞风险
 
 ---
 
@@ -1165,6 +1343,136 @@ const client = new ApolloClient({
 - ❌ 没有 localStorage 持久化缓存配置
 - ✅ 仅主题设置存在 localStorage，其他设置存数据库
 
+### 7.8 localStorage 在浏览器隐私模式下的兼容性：无 try/catch 降级处理
+
+**核心结论：代码仅在 `theme.ts` 中直接使用 localStorage，没有任何 try/catch 异常捕获、降级策略或隐私模式兼容处理。在 Safari 隐私模式下会抛出异常，但由于仅影响主题，不影响核心功能。**
+
+#### 7.8.1 搜索证据链
+
+| 搜索类别 | 关键词 | 匹配结果 |
+|---------|--------|---------|
+| 异常捕获 | `try.*localStorage`、`catch.*localStorage` | ❌ 0 个匹配 |
+| 隐私/无痕模式 | `privat`、`incognito`、`private.*browsing` | ❌ 0 个匹配 |
+| 存储异常 | `SecurityError`、`QuotaExceededError`、`DOMException` | ❌ 0 个匹配 |
+| Feature 检测 | `typeof localStorage`、`localStorage in window` | ❌ 0 个匹配 |
+| 降级存储 | `sessionStorage`、`memoryStorage`、`fallback.*storage` | ❌ 0 个匹配 |
+
+#### 7.8.2 localStorage 的唯一使用场景
+
+文件：`ui/src/theme.ts`
+
+```typescript
+import { createTheme } from '@mui/material/styles'
+
+export const darkTheme = createTheme({ /* ... */ })
+export const lightTheme = createTheme({ /* ... */ })
+
+export function getInitialTheme() {
+  if (
+    typeof window !== 'undefined' &&
+    (localStorage.theme === 'dark' ||
+      (!('theme' in localStorage) &&
+        window.matchMedia('(prefers-color-scheme: dark)').matches))
+  ) {
+    return darkTheme
+  }
+  return lightTheme
+}
+
+export function setTheme(theme: 'light' | 'dark' | 'system') {
+  if (theme === 'light') {
+    localStorage.theme = 'light'        // ★ 直接写入，无 try/catch
+    document.documentElement.classList.remove('dark')
+  } else if (theme === 'dark') {
+    localStorage.theme = 'dark'         // ★ 直接写入，无 try/catch
+    document.documentElement.classList.add('dark')
+  } else {
+    localStorage.removeItem('theme')    // ★ 直接删除，无 try/catch
+    document.documentElement.classList.remove('dark')
+  }
+}
+
+export function isLightTheme(): boolean {
+  if (localStorage.theme == 'light') {   // ★ 直接读取，无 try/catch
+    return true
+  } else if (localStorage.theme == 'dark') {
+    return false
+  }
+  // fallback to system preference
+  return !window.matchMedia('(prefers-color-scheme: dark)').matches
+}
+```
+
+**4 处 localStorage 访问全部裸写，没有任何异常处理。**
+
+#### 7.8.3 各浏览器隐私模式下的 localStorage 行为
+
+| 浏览器 | 隐私模式名称 | localStorage 行为 |
+|--------|------------|-------------------|
+| **Safari** | 私密浏览 | `QuotaExceededError`：写入时 quota=0，所有 setItem 抛异常 |
+| **Chrome** | 无痕模式 | ✅ 正常可用，但数据仅在当前会话有效，关闭即清空 |
+| **Firefox** | 隐私窗口 | ✅ 正常可用，但数据仅在当前会话有效，关闭即清空 |
+| **Brave** | 私人窗口 | ✅ 正常可用，类 Chrome 行为 |
+| **Edge** | InPrivate | ✅ 正常可用，类 Chrome 行为 |
+
+**Safari 私密浏览的特殊性：**
+```javascript
+// Safari 私密浏览下，localStorage 存在但 quota=0
+typeof localStorage !== 'undefined'  // true
+localStorage.setItem('test', '1')    // throws QuotaExceededError
+```
+
+**对 Photoview 的实际影响：**
+
+| 场景 | Safari 私密浏览行为 | 是否影响核心功能 |
+|------|-------------------|----------------|
+| 首次加载 | `getInitialTheme()` 中 `localStorage.theme` 读取 → 返回 `undefined` → fallback 到系统偏好 | ❌ 不影响，fallback 生效 |
+| 用户切换主题 | `setTheme('dark')` 中 `localStorage.theme = 'dark'` → **抛出 QuotaExceededError** | ⚠️ 主题切换失败，但页面不会崩溃（React 错误边界） |
+| 刷新页面 | 主题恢复到系统偏好（因为写入失败） | ❌ 不影响，只是主题不持久化 |
+| 登录/分享/下载等核心功能 | 完全不依赖 localStorage（用 Cookie） | ❌ 完全不受影响 |
+
+#### 7.8.4 分享相关的存储不使用 localStorage
+
+**关键：ShareToken 相关的凭证全部用 Cookie，不用 localStorage：**
+
+文件：`ui/src/helpers/authentication.ts`
+
+```typescript
+// 登录凭证：Cookie（14天过期）
+Cookies.set('auth-token', token, { expires: 14, path: '/', sameSite: 'Lax' })
+
+// 分享密码：Cookie（session 级，浏览器关闭失效）
+Cookies.set(`share-token-pw-${shareToken}`, password, { path: '/', sameSite: 'Lax' })
+```
+
+**为什么用 Cookie 而不是 localStorage：**
+- Cookie 会自动随 HTTP 请求发送（`credentials: 'include'`）
+- Cookie 可以设置 HttpOnly/SameSite/Secure 等安全属性
+- Cookie 在隐私模式下**可用**（同样仅会话级），不抛异常
+- localStorage 需要手动附加到请求，且 Safari 私密浏览会抛异常
+
+**因此：**
+- ✅ 分享功能、登录功能、下载功能 — 全部不受 Safari 隐私模式影响
+- ⚠️ 仅主题设置切换在 Safari 私密浏览下会失败，但有 fallback 到系统偏好，不崩溃
+
+#### 7.8.5 其他不依赖持久化存储的部分
+
+| 模块 | 存储方式 | 隐私模式兼容性 |
+|------|---------|--------------|
+| Apollo Client 缓存 | 内存（`InMemoryCache`） | ✅ 不受影响 |
+| 登录凭证 | Cookie（`js-cookie`） | ✅ Cookie 在隐私模式可用 |
+| 分享密码 | Cookie（`js-cookie`） | ✅ 同上 |
+| 用户偏好 | 数据库（`user_preferences` 表） | ✅ 服务端存储 |
+| 站点设置 | 数据库（`site_info` 表） | ✅ 服务端存储 |
+| 主题 | localStorage | ⚠️ Safari 私密浏览写入失败 |
+
+**结论：**
+- ❌ 没有 try/catch 异常捕获
+- ❌ 没有 localStorage 可用性 Feature 检测
+- ❌ 没有降级到 sessionStorage 或内存存储
+- ⚠️ Safari 私密浏览下切换主题会抛 `QuotaExceededError`，但不影响核心功能
+- ✅ 所有分享/登录/下载功能用 Cookie，完全不受隐私模式影响
+
 ---
 
 ## 八、完整协作流程图
@@ -1314,7 +1622,7 @@ const client = new ApolloClient({
   一次 DB 更新即可生效，无需重新生成 token
 ```
 
-### 9.3 九处深入发现的关键结论
+### 9.3 十二处深入发现的关键结论
 
 | 问题 | 结论 | 关键代码 |
 |------|------|----------|
@@ -1327,6 +1635,9 @@ const client = new ApolloClient({
 | **token_cleanup_lag 告警** | ❌ 完全不存在此概念，无监控系统、无告警阈值、无自适应调整 | —— |
 | **禁用账号清理 ShareToken** | ❌ 无禁用功能；删除用户时 CASCADE 级联清理，改密码不清理 | `share_token.go:11`、`user.go:110` |
 | **useShareSettings 持久化** | ❌ 无此 hook；仅主题存 localStorage，缓存配置全部硬编码 | `theme.ts`、`apolloClient.ts` |
+| **EWMA 平滑因子 alpha** | ❌ 无 EWMA 算法；只有固定间隔 Throttle（500ms，硬编码） | `utils/throttle.go` |
+| **InvalidateUserShareTokens** | ❌ 无此操作；所有删除走 CASCADE 同步删除，无异步队列 | `user_actions.go:14`、`share_token.go:11` |
+| **localStorage 隐私模式** | ⚠️ 无 try/catch；Safari 私密浏览切换主题抛异常，核心功能不受影响 | `theme.ts`、`authentication.ts` |
 
 ### 9.4 关键文件索引
 
@@ -1360,3 +1671,7 @@ const client = new ApolloClient({
 | 前端 Hook 目录 | `ui/src/hooks/` | 5 个 Hook，无分享/缓存相关 |
 | 用户更新 resolver | `api/graphql/resolvers/user.go:110` | UpdateUser 仅改 username/password/admin |
 | 删除用户动作 | `api/graphql/models/actions/user_actions.go:14` | DeleteUser + CASCADE 级联删除 |
+| 节流工具 | `api/utils/throttle.go` | 固定间隔 Throttle（500ms），非 EWMA |
+| Exiftool 封装 | `api/scanner/externaltools/exiftool/exiftool.go` | 定界符流式读取，无 EWMA |
+| MarkReader | `api/scanner/externaltools/exiftool/mark_reader.go` | 缓冲区读取器，无 EWMA |
+| Dataloader 批量 | `api/dataloader/gen_userloader.go:17` | 读查询合并（N+1 优化），非删除队列 |
