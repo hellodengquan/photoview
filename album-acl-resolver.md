@@ -816,3 +816,436 @@ if tokenCredentials != nil {
 2. **分享 Token 过期不回退是设计决策**：`album.go:134` 中 `if err != nil { return nil, err }` 使得分享 Token 过期时不会回退到登录态，即使用户已登录且有效。这是一种安全策略——避免攻击者通过提供无效 token 来探测合法登录用户的权限。
 
 3. **HTTP 路由层的互斥性不同**：`authenticate_routes.go:19-46` 中，登录态和分享 Token 是 `if/else` 互斥关系（`user != nil` 走登录，`user == nil` 走 token），不存在双过期冲突问题。但 GraphQL 层是顺序执行（先 token 后登录），存在上述优先级问题。
+
+---
+
+## 补充三：完全公开链接（无 token）与登录态共存时的优先级判定
+
+### 场景描述
+
+"完全公开链接"指的是请求**不携带任何分享 token**（GraphQL 参数无 `tokenCredentials`，HTTP URL 无 `?token=`），但请求可能携带了有效的登录 Cookie。此时系统如何判断权限？
+
+### 1. GraphQL 层：无 token 直接走登录态
+
+**文件**: `api/graphql/resolvers/album.go:128-162`
+
+```go
+func (r *queryResolver) Album(ctx context.Context, id int, tokenCredentials *models.ShareTokenCredentials) (*models.Album, error) {
+    db := r.DB(ctx)
+
+    if tokenCredentials != nil {   // ← tokenCredentials 为 nil，整个分支跳过
+        // ... 分享 token 逻辑
+    }
+
+    // 直接走到这里
+    user := auth.UserFromContext(ctx)
+    if user == nil {
+        return nil, auth.ErrUnauthorized   // 未登录 → 拒绝
+    }
+
+    return actions.Album(db, user, id)     // 登录态 → OwnsAlbum 校验
+}
+```
+
+当 `tokenCredentials == nil` 时，分享 token 分支完全跳过，直接进入登录态校验。逻辑极其清晰：**没有 token 就只看登录态**。
+
+#### 各 Query 字段在无 token 时的行为
+
+| Query 字段 | 无 token + 已登录 | 无 token + 未登录 |
+|-----------|-----------------|-----------------|
+| `album(id)` | `OwnsAlbum` 校验 | `ErrUnauthorized` |
+| `media(id)` | `user_albums` SQL 校验 | `ErrUnauthorized` |
+| `myAlbums` | directive `@isAuthorized` 通过 → `FillAlbums` | directive 拦截 |
+| `myMedia` | directive `@isAuthorized` 通过 → `FillAlbums` | directive 拦截 |
+| `search` | resolver 内 `UserFromContext` 通过 → `user_albums` | `ErrUnauthorized` |
+| `shareToken(credentials)` | 不涉及（需提供 credentials） | 不涉及 |
+
+**结论**：GraphQL 层不存在"无 token 时的优先级歧义"——没有 token 就只有登录态一条路，没登录就拒绝。
+
+### 2. HTTP 路由层：无 token 时匿名请求直接被拒
+
+**文件**: `api/routes/authenticate_routes.go:19-46`
+
+```go
+func authenticateMedia(media *models.Media, db *gorm.DB, r *http.Request) (...) {
+    user := auth.UserFromContext(r.Context())
+
+    if user != nil {
+        // 有登录态 → OwnsAlbum 校验
+        ownsAlbum, _ := user.OwnsAlbum(db, &album)
+        if !ownsAlbum { return false }
+    } else {
+        // 无登录态 → 走分享 token
+        shareTokenFromRequest(db, r, &media.ID, &media.AlbumID)
+    }
+    return true
+}
+```
+
+`shareTokenFromRequest`（`authenticate_routes.go:71-76`）：
+
+```go
+func shareTokenFromRequest(...) (...) {
+    token := r.URL.Query().Get("token")
+    if token == "" {
+        return false, "unauthorized", http.StatusForbidden, errors.New("share token not provided")
+    }
+    // ...
+}
+```
+
+**关键**：URL 中没有 `?token=` 参数时，`shareTokenFromRequest` 直接返回 403 `"unauthorized"`，不会尝试其他鉴权方式。
+
+#### HTTP 路由层四种组合
+
+| 登录态 | URL ?token= | 结果 | 走哪条路 |
+|--------|------------|------|---------|
+| 有效 | 无 | `OwnsAlbum` 校验 | `user != nil` 分支 |
+| 有效 | 有 | `OwnsAlbum` 校验 | `user != nil` 分支（**token 被忽略**） |
+| 无 | 有 | `shareTokenFromRequest` | `user == nil` 分支 |
+| 无 | 无 | **403 拒绝** | `shareTokenFromRequest` 返回 "token not provided" |
+
+**核心发现**：HTTP 路由层中，**一旦有登录态，分享 token 完全被忽略**。这是与 GraphQL 层最大的差异——GraphQL 层先看 token 再看登录态，HTTP 层只看登录态（有登录态就不看 token）。
+
+### 3. 与 GraphQL 层优先级差异的根因
+
+| 维度 | GraphQL 层 | HTTP 路由层 |
+|------|-----------|------------|
+| 代码模式 | `if tokenCredentials != nil { ... } ; user := ...` 顺序 | `if user != nil { ... } else { ... }` 互斥 |
+| token 优先级 | token 优先，登录态兜底 | 登录态优先，token 仅匿名可用 |
+| 有登录 + 有 token | 两条路径都走（token 优先） | 只走登录态，忽略 token |
+| 有登录 + 无 token | 只走登录态 | 只走登录态 |
+| 无登录 + 无 token | `ErrUnauthorized` | 403 "share token not provided" |
+
+差异的根因在于两层的代码结构不同：
+- GraphQL 层 `album(id, tokenCredentials)` 把 token 作为显式参数，先处理参数再查 context，形成"token 优先"。
+- HTTP 路由层 `authenticateMedia` / `authenticateAlbum` 先查 context 中的 user，有 user 就不需要 token，形成"登录态优先"。
+
+**实际影响**：一个已登录用户通过分享链接访问时，两层的鉴权路径不同。GraphQL 层会先校验分享 token（如果提供了的话），HTTP 层则完全靠登录态。这意味着：
+- 如果用户有权访问某相册，但分享 token 无效/过期，GraphQL 请求可能失败（token 优先，失败不回退），而 HTTP 图片请求正常（忽略 token，只看登录态）。
+- 这会导致分享页面上出现"GraphQL 查询报错但图片能加载"的不一致现象。
+
+---
+
+## 补充四：匿名访问下相册封面缩略图的 ACL 检查路径
+
+### 场景描述
+
+匿名用户（未登录）通过分享链接访问相册时，前端需要加载：
+1. 相册封面缩略图（`Album.thumbnail` → `Media.thumbnail` → `MediaURL.url`）
+2. 相册内的媒体缩略图（`Album.media` → `Media.thumbnail` → `MediaURL.url`）
+
+这些图片 URL 指向 HTTP `/photo/{mediaName}` 路由，请求到达后端时需经过 ACL 检查。以下追踪完整路径。
+
+### 1. GraphQL 层：封面缩略图的数据获取
+
+#### 1.1 Album.thumbnail resolver
+
+**文件**: `api/graphql/resolvers/album.go:72-75`
+
+```go
+func (r *albumResolver) Thumbnail(ctx context.Context, obj *models.Album) (*models.Media, error) {
+    return obj.Thumbnail(r.DB(ctx))
+}
+```
+
+**文件**: `api/graphql/models/album.go:83-115`
+
+```go
+func (a *Album) Thumbnail(db *gorm.DB) (*Media, error) {
+    if a.CoverID != nil {
+        return db.First(&media, *a.CoverID)  // 有手动封面 → 直接查
+    }
+    // 无手动封面 → 递归 CTE 找子相册中最新的一条 media
+    db.Raw(`
+        WITH RECURSIVE sub_albums AS (
+            SELECT id FROM albums WHERE id = ?
+            UNION ALL
+            SELECT children.id FROM albums AS children
+            INNER JOIN sub_albums ON children.parent_album_id = sub_albums.id
+        )
+        SELECT * FROM media WHERE media.album_id IN (SELECT id FROM sub_albums)
+        ORDER BY media.id DESC LIMIT 1
+    `, a.ID).Scan(&media)
+}
+```
+
+**ACL 检查**：无。`Album.thumbnail` resolver 不检查 `UserFromContext`，不检查 `user_albums`，不检查分享 token。只要父 Album 对象已通过入口校验，thumbnail 就能获取。
+
+#### 1.2 Media.thumbnail resolver
+
+**文件**: `api/graphql/resolvers/media.go:23-25`
+
+```go
+func (r *mediaResolver) Thumbnail(ctx context.Context, obj *models.Media) (*models.MediaURL, error) {
+    return dataloader.For(ctx).MediaThumbnail.Load(obj.ID)
+}
+```
+
+**文件**: `api/dataloader/mediaURLLoader.go:44-52`
+
+```go
+func NewThumbnailMediaURLLoader(db *gorm.DB) *MediaURLLoader {
+    return &MediaURLLoader{
+        fetch: makeMediaURLLoader(db, func(query *gorm.DB) *gorm.DB {
+            return query.Where("purpose IN ?", []string{"thumbnail", "video-thumbnail"})
+        }),
+    }
+}
+```
+
+dataloader 只按 `media_id` 和 `purpose` 查 `media_urls` 表，**无 ACL 检查**。
+
+#### 1.3 MediaURL.URL() — 生成图片 HTTP 地址
+
+**文件**: `api/graphql/models/media.go:118-128`
+
+```go
+func (p *MediaURL) URL() string {
+    imageURL := utils.ApiEndpointUrl()
+    if p.Purpose != VideoWeb {
+        imageURL.Path = path.Join(imageURL.Path, "photo", p.MediaName)
+    } else {
+        imageURL.Path = path.Join(imageURL.Path, "video", p.MediaName)
+    }
+    return imageURL.String()
+}
+```
+
+`URL()` 生成的是类似 `http://host/api/photo/abc123_thumb.jpg` 的地址，**不带任何 token 参数**。token 的附加由前端完成。
+
+### 2. 前端：分享链接中的 token 注入
+
+**文件**: `ui/src/components/photoGallery/ProtectedMedia.tsx:13-25`
+
+```typescript
+const getProtectedUrl = (url?: string) => {
+    if (url == undefined) return undefined
+
+    const imgUrl = new URL(url, location.origin)
+
+    // 从当前 URL 路径中提取分享 token
+    const tokenRegex = location.pathname.match(/^\/share\/([\d\w]+)(\/?.*)$/)
+    if (tokenRegex) {
+        const token = tokenRegex[1]
+        imgUrl.searchParams.set('token', token)   // ← 注入 ?token=xxx
+    }
+
+    return imgUrl.href
+}
+```
+
+**关键逻辑**：前端 `getProtectedUrl` 从浏览器当前路径 `/share/<token>/...` 中提取 token，然后拼接到图片 URL 的 query 参数中。最终生成的图片请求形如：
+
+```
+GET /api/photo/abc123_thumb.jpg?token=SHARE_TOKEN_VALUE
+```
+
+**使用位置**：
+- `ProtectedImage` 组件：`<img src={getProtectedUrl(src)} crossOrigin="use-credentials" />`
+- `ProtectedVideo` 组件：`poster={getProtectedUrl(media.thumbnail?.url)}` 和 `<source src={getProtectedUrl(media.videoWeb.url)} />`
+- `AlbumBox` 组件：`<AlbumBoxImage src={album.thumbnail?.thumbnail?.url} />` → 内部用 `ProtectedImage`
+
+所有图片/视频的 `<img>` 和 `<video>` 标签都通过 `ProtectedImage` / `ProtectedVideo` 渲染，都会经过 `getProtectedUrl` 注入 token。
+
+### 3. 后端 HTTP 层：图片请求的 ACL 校验完整路径
+
+#### 3.1 请求到达路由处理器
+
+**文件**: `api/server.go:74-98`
+
+```
+rootRouter.Use(dataloader.Middleware(db))    // 1. dataloader 注入
+rootRouter.Use(auth.Middleware(db))          // 2. 登录态注入（从 Cookie）
+rootRouter.Use(server.LoggingMiddleware)
+rootRouter.Use(server.CORSMiddleware(devMode))
+
+photoRouter := endpointRouter.PathPrefix("/photo").Subrouter()
+routes.RegisterPhotoRoutes(db, photoRouter)  // 3. /photo/{name} 路由
+```
+
+中间件执行顺序：dataloader → auth → 业务路由。`auth.Middleware` 从 Cookie 读取登录态，匿名用户没有 Cookie，所以 `UserFromContext` 返回 `nil`。
+
+#### 3.2 Photo 路由处理器
+
+**文件**: `api/routes/photos.go:15-80`
+
+```go
+func RegisterPhotoRoutes(db *gorm.DB, router *mux.Router) {
+    router.HandleFunc("/{name}", func(w http.ResponseWriter, r *http.Request) {
+        mediaName := mux.Vars(r)["name"]
+
+        // 1. 用 mediaName 查 MediaURL → 关联的 Media
+        var mediaURL models.MediaURL
+        db.Model(&models.MediaURL{}).Joins("Media").
+            Select("media_urls.*").
+            Where("media_urls.media_name = ?", mediaName).Scan(&mediaURL)
+
+        // 2. ACL 校验
+        if success, response, status, err := authenticateMedia(media, db, r); !success {
+            w.WriteHeader(status)
+            w.Write([]byte(response))
+            return
+        }
+
+        // 3. 返回文件
+        http.ServeFile(w, r, cachedPath)
+    })
+}
+```
+
+#### 3.3 authenticateMedia — 匿名 + 有 token 的路径
+
+**文件**: `api/routes/authenticate_routes.go:19-46`
+
+```go
+func authenticateMedia(media, db, r) {
+    user := auth.UserFromContext(r.Context())
+
+    if user != nil {
+        // 已登录路径（不会走到这里，因为是匿名）
+    } else {
+        // 匿名路径 → 走分享 token 校验
+        shareTokenFromRequest(db, r, &media.ID, &media.AlbumID)
+    }
+}
+```
+
+#### 3.4 shareTokenFromRequest — 完整校验链
+
+**文件**: `api/routes/authenticate_routes.go:71-155`
+
+匿名请求到达 `shareTokenFromRequest` 时的完整校验链：
+
+```
+1. 提取 ?token= 参数
+   └─ URL: /api/photo/abc123_thumb.jpg?token=SHARE_TOKEN_VALUE
+   └─ token = "SHARE_TOKEN_VALUE"
+   └─ 若 token 为空 → 403 "share token not provided"
+
+2. 数据库查 ShareToken
+   └─ db.Where("value = ?", token).First(&shareToken)
+   └─ 不存在 → 403 "invalid share token"
+
+3. 过期检查
+   └─ if shareToken.Expire != nil && time.Now().After(*shareToken.Expire)
+   └─ 过期 → 403 "invalid share token"
+
+4. 密码检查（如有）
+   └─ Cookie "share-token-pw-<token>" 中取密码
+   └─ bcrypt 比对
+   └─ 不匹配 → 403 "share token password invalid"
+
+5. 类型匹配检查
+   ├─ ShareToken 关联的是 AlbumID：
+   │   ├─ token.AlbumID == media.AlbumID → 通过（精确匹配）
+   │   └─ token.AlbumID != media.AlbumID → 递归 CTE 查子相册
+   │       └─ 子相册包含该 album → 通过
+   │       └─ 不包含 → 403 "invalid share token"
+   └─ ShareToken 关联的是 MediaID：
+       └─ token.MediaID == media.ID → 通过（精确匹配）
+       └─ 不匹配 → 403 "invalid share token"
+```
+
+### 4. 封面缩略图的特殊路径
+
+#### 4.1 封面 media 可能来自子相册
+
+`Album.Thumbnail`（`album.go:83-115`）使用递归 CTE 从子相册中查找封面 media。这意味着封面 media 的 `album_id` 可能**不等于**分享 token 关联的 `AlbumID`。
+
+**文件**: `api/routes/authenticate_routes.go:125-147`
+
+```go
+if shareToken.AlbumID != nil && *albumID != *shareToken.AlbumID {
+    // 递归查子相册
+    var count int
+    db.Raw(`
+        WITH recursive child_albums AS (
+            SELECT * FROM albums WHERE parent_album_id = ?
+            UNION ALL
+            SELECT child.* FROM albums child
+            JOIN child_albums parent ON parent.id = child.parent_album_id
+        )
+        SELECT COUNT(id) FROM child_albums WHERE id = ?
+    `, *shareToken.AlbumID, albumID).Find(&count)
+    if count == 0 { return false }
+}
+```
+
+这个递归 CTE 起点是 `shareToken.AlbumID` 的直接子相册（`parent_album_id = ?`），能匹配到任意深度的子相册中的 media。**封面缩略图即使来自深层子相册，也能通过分享 token 校验。**
+
+#### 4.2 但递归方向与 OwnsAlbum 不同
+
+| 场景 | OwnsAlbum（登录态） | shareTokenFromRequest（匿名） |
+|------|-------------------|--------------------------|
+| 封面 media 在 token 相册自身 | ✅ 直接匹配 `album_id == token.AlbumID` | ✅ 直接匹配 |
+| 封面 media 在子相册 | ✅ `user_albums` 有子相册记录 | ✅ 递归 CTE 匹配子相册 |
+| 封面 media 在父相册 | ✅ `OwnsAlbum` 向上递归 | ❌ CTE 向下递归，**不匹配父相册** |
+
+**注意**：虽然封面 media 在父相册的情况在实际中不太可能发生（`Album.Thumbnail` 的 SQL 只从自身和子相册找 media），但如果封面被手动设置为父相册的 media（通过 `setAlbumCover`），匿名分享时该封面图片可能无法通过 HTTP 路由层的 ACL 校验。
+
+### 5. 完整调用链时序图
+
+```
+匿名用户访问分享页面 /share/ABC123/1
+│
+├─ 前端 GraphQL 查询
+│   shareToken(credentials: {token: "ABC123"})
+│   │
+│   ├─ shareToken resolver 校验（过期+密码）→ 通过
+│   │   └─ 返回 ShareToken { album: { id: 1, ... } }
+│   │
+│   └─ album(id: 1, tokenCredentials: {token: "ABC123"})
+│       │
+│       ├─ ShareToken 校验 → 通过
+│       ├─ AlbumID 精确匹配 → 返回 Album#1
+│       │
+│       ├─ Album.thumbnail resolver（无 ACL）→ 返回 Media#42
+│       │   └─ Media.thumbnail resolver（无 ACL）→ 返回 MediaURL { url: "/api/photo/abc_thumb.jpg" }
+│       │
+│       ├─ Album.subAlbums resolver（无 ACL）→ [Album#2, Album#3]
+│       │   └─ Album#2.thumbnail → MediaURL { url: "/api/photo/def_thumb.jpg" }
+│       │
+│       └─ Album.media resolver（无 ACL）→ [Media#50, Media#51, ...]
+│           └─ Media#50.thumbnail → MediaURL { url: "/api/photo/ghi_thumb.jpg" }
+│
+├─ 前端渲染图片
+│   ProtectedImage src="/api/photo/abc_thumb.jpg"
+│   │
+│   └─ getProtectedUrl() 注入 token
+│       → 实际请求: GET /api/photo/abc_thumb.jpg?token=ABC123
+│
+└─ HTTP 图片请求
+    │
+    ├─ auth.Middleware：无 Cookie → UserFromContext 为 nil
+    │
+    ├─ photo route handler：
+    │   1. 用 "abc_thumb" 查 MediaURL → Media{ID:42, AlbumID:1}
+    │   2. authenticateMedia(media, db, r)
+    │      ├─ user == nil → 走 shareTokenFromRequest
+    │      │   ├─ URL ?token=ABC123 → 非空
+    │      │   ├─ db 查 ShareToken → 找到，未过期，无密码
+    │      │   ├─ shareToken.AlbumID=1, media.AlbumID=1 → 精确匹配 ✅
+    │      │   └─ 返回 true
+    │      └─ ACL 通过 → 返回图片文件
+    │
+    └─ 子相册封面: GET /api/photo/def_thumb.jpg?token=ABC123
+        │
+        └─ shareTokenFromRequest
+            ├─ shareToken.AlbumID=1, media.AlbumID=2 → 不匹配
+            ├─ 递归 CTE 查 AlbumID=1 的子相册
+            │   → 子相册包含 Album#2 → count > 0 ✅
+            └─ ACL 通过
+```
+
+### 6. 关键发现
+
+1. **GraphQL 层与 HTTP 层的 ACL 检查是独立的两套**：GraphQL resolver 获取 MediaURL 对象时不做 ACL 检查，HTTP 图片请求到达时才做 ACL 检查。两层各有自己的逻辑，且互不感知。
+
+2. **前端 token 注入是唯一桥梁**：匿名用户能看到图片，完全依赖 `getProtectedUrl`（`ProtectedMedia.tsx:13-25`）从 URL 路径中提取分享 token 并拼到图片 URL 上。如果前端组件没有用 `ProtectedImage`/`ProtectedVideo`（比如直接用 `<img src={url}>`），token 就不会注入，图片请求会被 403 拒绝。
+
+3. **封面缩略图的 ACL 有隐藏风险**：当封面 media 来自子相册时，HTTP 层的 `shareTokenFromRequest` 能通过递归 CTE 匹配。但如果封面被 `setAlbumCover` 设置为不属于 token 相册树的 media（理论上不可能，但代码未显式防护），HTTP 层会返回 403，导致前端 GraphQL 拿到了 URL 但图片加载失败。
+
+4. **已登录用户通过分享链接访问时的冗余**：如果用户同时有登录 Cookie 和分享 token，HTTP 层会走 `user != nil` 分支（忽略 token），而 GraphQL 层会先走 token 校验。两层对同一请求的鉴权路径不同，可能导致不一致。
+
+5. **`crossOrigin="use-credentials"` 的必要性**：前端所有 `ProtectedImage` 和 `ProtectedVideo` 都设置了 `crossOrigin="use-credentials"`，这确保浏览器在请求图片/视频时会携带 Cookie（包括 `auth-token` 和 `share-token-pw-*`）。没有这个属性，浏览器在跨域请求中不会发 Cookie，导致即使用户已登录，HTTP 图片请求也会被当作匿名处理。
