@@ -784,50 +784,517 @@ HTTP 请求开始
 
 ---
 
-## 八、改进建议
+## 八、GraphQL Subscription 长连接场景下的 DataLoader 缓存生命周期
 
-### 8.1 解决 Album.thumbnail 的 N+1 问题（最高优先级）
+### 8.1 WebSocket 连接建立与 Context 传递
 
-**问题**：相册列表中，每个相册的 `thumbnail` 字段触发一次独立查询，含递归 CTE 的查询尤其昂贵。
+PhotoView 的 GraphQL subscription 基于 gqlgen 的 `transport.Websocket` 实现，DataLoader 通过 HTTP 中间件注入到 context 中后，会伴随整个 WebSocket 长连接的生命周期。
 
-**方案**：实现 AlbumThumbnail DataLoader，批量获取相册封面。
+**完整连接建立链路**：
+
+```
+客户端发起 WebSocket 升级请求 (HTTP GET + Upgrade header)
+    │
+    ▼
+rootRouter.Use(dataloader.Middleware(db))  [api/server.go:75]
+    └─ 创建 Loaders 对象，注入 context  ←─────── DataLoader 在此诞生
+    │
+    ▼
+rootRouter.Use(auth.Middleware(db))  [api/server.go:76]
+    └─ 尝试从 Cookie 读取 auth-token（WebSocket 通常不带 Cookie）
+    │
+    ▼
+/graphql endpoint → transport.Websocket
+    │
+    ▼
+WebSocket 协议升级成功 → 进入 WebSocket 协议
+    │
+    ▼
+客户端发送 "connection_init" 消息
+    │
+    ▼
+transport.Websocket.InitFunc = auth.AuthWebsocketInit()  [api/graphql/endpoint/graphql_endpoint.go:34]
+    └─ 从 initPayload["Authorization"] 提取 Bearer token
+    └─ 从 context 中获取 dataloader
+    └─ loaders.UserFromAccessToken.Load(token) → 验证用户
+    └─ 将 user 写入 context
+    └─ 返回新的 context（包含 user + 原始 dataloader）
+    │
+    ▼
+WebSocket 连接建立完成，等待 subscription 操作
+```
+
+**关键代码位置**：
+- WebSocket 传输配置：`api/graphql/endpoint/graphql_endpoint.go:31-35`
+- WebSocket 认证初始化：`api/graphql/auth/auth.go:92-130`
+
+### 8.2 DataLoader 在 WebSocket 中的存活范围
+
+**核心结论**：DataLoader 实例在整个 WebSocket 连接期间是**同一个实例**，缓存会在所有 subscription 操作之间共享和累积。
+
+原因分析：
 
 ```go
-// 伪代码：批量获取相册封面
+// api/dataloader/loaders.go:23-40
+// DataLoader 中间件在 HTTP 请求级别创建实例
+func Middleware(db *gorm.DB) mux.MiddlewareFunc {
+    return mux.MiddlewareFunc(func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            ctx := context.WithValue(r.Context(), loadersKey, &Loaders{...})
+            r = r.WithContext(ctx)
+            next.ServeHTTP(w, r)  // WebSocket 升级在此 handler 内完成
+        })
+    })
+}
+```
+
+WebSocket 升级发生在 `next.ServeHTTP` 调用内部，升级完成后：
+- 原始 HTTP 请求的 `context` 被 WebSocket 传输层持有
+- 后续所有 WebSocket 消息（包括 subscription）都从这个 context 派生
+- DataLoader 实例跟随 context 一起存活，**不会随单个 subscription 结束而销毁**
+
+### 8.3 Subscription 执行流程中的 DataLoader 使用
+
+以 `notification` subscription 为例：
+
+```
+客户端发送 "start" 消息（subscription 操作）
+    │
+    ▼
+gqlgen 执行 _Subscription(ctx, selectionSet)  [api/graphql/generated.go:11512]
+    └─ context 来自连接级 context（包含 dataloader）
+    │
+    ▼
+ec._Subscription_notification(ctx, field)  [api/graphql/generated.go:7567]
+    └─ graphql.ResolveFieldStream(...)
+        │
+        ├─ 调用 resolver → ec.Resolvers.Subscription().Notification(ctx)
+        │   └─ subscriptionResolver.Notification(ctx)  [api/graphql/resolvers/notification.go:18-34]
+        │       ├─ user := auth.UserFromContext(ctx)  ← 从连接级 context 获取用户
+        │       ├─ notification.RegisterListener(user, channel)
+        │       ├─ go func() { <-ctx.Done(); DeregisterListener() }()
+        │       └─ 返回 notificationChannel (<-chan *models.Notification)
+        │
+        └─ 监听 channel，每次有新值时：
+            ├─ 调用 marshalNNotification2...(ctx, selections, v)
+            │   └─ 解析 Notification 类型的各字段
+            │       ├─ key, type, header, content... （标量，无 DataLoader）
+            │       └─ 如果有嵌套复杂字段，会触发对应 resolver
+            │           └─ resolver 中可通过 dataloader.For(ctx) 获取 Loader
+            │
+            └─ 通过 WebSocket 发送 "next" 消息给客户端
+```
+
+**代码位置**：
+- Subscription resolver：`api/graphql/resolvers/notification.go:17-34`
+- 生成的 subscription 执行：`api/graphql/generated.go:7567-7585`
+
+### 8.4 多次推送事件下的缓存累积
+
+当前 Notification 类型的字段全是标量（String/Boolean/Float/Int），不触发 DataLoader 调用，因此缓存累积问题不明显。
+
+**但如果 Notification 包含嵌套的 Media 字段（如 notification.media），则会出现以下行为**：
+
+```
+时间线：
+T0: WebSocket 连接建立 → DataLoader 实例创建，cache = nil
+    │
+T1: 订阅 notification subscription
+    │
+T2: 第 1 次通知推送
+    │   └─ Notification.media 解析
+    │       └─ MediaThumbnail.Load(100) → 未命中缓存 → 加入 batch → fetch SQL
+    │       └─ 缓存写入 {100: MediaURL{...}}
+    │
+T3: 第 2 次通知推送
+    │   └─ Notification.media 解析
+    │       └─ MediaThumbnail.Load(100) → ✅ 命中缓存！无 SQL
+    │       └─ MediaThumbnail.Load(200) → 未命中 → 加入 batch → fetch SQL
+    │       └─ 缓存累积：{100: ..., 200: ...}
+    │
+T4: 第 N 次通知推送
+    │
+T5: WebSocket 连接断开 → DataLoader 被 GC 回收 → 缓存释放
+```
+
+**关键特性**：
+- 缓存**跨多次推送事件**持续累积
+- 同一 media ID 在第一次推送时查询，后续推送直接命中缓存
+- 缓存大小随推送次数单调增长（只要涉及新的 key）
+- 连接不断开，缓存不释放
+
+### 8.5 与普通 HTTP 请求的对比
+
+| 维度 | HTTP 请求 | WebSocket Subscription |
+|------|----------|---------------------|
+| DataLoader 生命周期 | 单次 HTTP 请求 | 整个 WebSocket 连接 |
+| 缓存持续时间 | 几百毫秒 ~ 几秒 | 几分钟 ~ 几小时 |
+| 缓存累积速度 | 单查询内累积 | 随推送事件持续增长 |
+| 内存风险 | 低（请求结束即释放） | 中高（长连接可能累积大量缓存） |
+| 缓存失效机制 | 请求结束自动失效 | 需手动 Clear 或连接断开 |
+
+### 8.6 长连接下的潜在问题与风险
+
+#### 8.6.1 内存累积风险
+
+对于高活跃、长时间保持连接的客户端：
+- `MediaThumbnail` 缓存：每个 key 约 ~100 字节，10000 条约 1MB（可接受）
+- 但如果新增更多 DataLoader（如 MediaFacesLoader），累积效应会放大
+- 极端场景下：用户浏览大量媒体后，连接保持数小时，缓存可能膨胀
+
+#### 8.6.2 数据过期问题
+
+HTTP 请求模式下，缓存随请求结束销毁，天然避免了数据过期问题。
+
+长连接模式下：
+- 数据更新（如重新生成缩略图、用户取消收藏）后，缓存中仍是旧值
+- 由于没有 TTL 失效机制，客户端会一直看到旧数据
+- 直到连接断开重连，才能获取新数据
+
+#### 8.6.3 UserFavoritesLoader 的指针问题被放大
+
+由于 `UserFavoritesLoader` 使用指针作为 cache key：
+- 每次推送创建新的 `*UserMediaData` 指针对象
+- 即使 (UserID, MediaID) 相同，也无法命中缓存
+- 长连接下，缓存条目持续增长但无法复用
+- 既浪费内存又无法获得缓存收益
+
+### 8.7 改进建议（长连接场景）
+
+1. **定期清理缓存**：为长连接场景的 DataLoader 添加定时清理机制
+   ```go
+   // 伪代码：每隔 5 分钟清空缓存
+   go func() {
+       ticker := time.NewTicker(5 * time.Minute)
+       defer ticker.Stop()
+       for range ticker.C {
+           l.mu.Lock()
+           l.cache = nil
+           l.mu.Unlock()
+       }
+   }()
+   ```
+
+2. **使用 LRU 缓存替代 map**：限制最大缓存条目数，避免无限增长
+
+3. **修复 UserFavoritesLoader 的 key 类型**：使用值类型或字符串复合 key
+
+4. **为不同场景配置不同的 DataLoader 策略**：
+   - HTTP 请求：保持现状（请求级缓存）
+   - WebSocket 长连接：使用带 TTL 的缓存或更小的 maxBatch
+
+---
+
+## 九、AlbumThumbnailLoader 批量获取相册封面的代码实现路径
+
+### 9.1 现有实现的 N+1 问题根源
+
+相册列表的 N+1 问题源于 `Album.Thumbnail()` 方法的逐次调用模式：
+
+```go
+// api/graphql/resolvers/album.go:72-75
+func (r *albumResolver) Thumbnail(ctx context.Context, obj *models.Album) (*models.Media, error) {
+    return obj.Thumbnail(r.DB(ctx))  // 每个相册调用一次
+}
+```
+
+每个相册独立调用 `obj.Thumbnail(db)`，而该方法内部有两条查询路径，每条都是一次独立的 SQL：
+
+```go
+// api/graphql/models/album.go:83-115
+func (a *Album) Thumbnail(db *gorm.DB) (*Media, error) {
+    var media Media
+
+    // 路径 A：有 CoverID → 简单查询（1 SQL）
+    if a.CoverID != nil {
+        if err := db.First(&media, *a.CoverID).Error; err != nil {
+            return nil, err
+        }
+        return &media, nil
+    }
+
+    // 路径 B：无 CoverID → 递归 CTE 查询（1 SQL，但更重）
+    query := `
+        WITH RECURSIVE sub_albums AS (
+            SELECT id FROM albums WHERE id = ?
+            UNION ALL
+            SELECT children.id FROM albums AS children
+            INNER JOIN sub_albums ON children.parent_album_id = sub_albums.id
+        )
+        SELECT * FROM media
+        WHERE media.album_id IN (SELECT id FROM sub_albums)
+        ORDER BY media.id DESC
+        LIMIT 1
+    `
+    if err := db.Raw(query, a.ID).Scan(&media).Error; err != nil {
+        return nil, err
+    }
+    // ...
+}
+```
+
+**代码位置**：`api/graphql/models/album.go:83-115`
+
+### 9.2 AlbumThumbnailLoader 的设计思路
+
+批量获取相册封面的核心挑战：同一批相册中，有的有 CoverID，有的没有，需要分别处理后合并结果。
+
+**整体策略：三阶段处理**
+1. **批量查询 CoverID**：一次性获取所有相册的 cover_id 字段
+2. **批量查询 Cover Media**：对有 CoverID 的相册，用 `IN` 查询批量获取对应 Media
+3. **批量递归查询**：对无 CoverID 的相册，使用批量递归 CTE 查询子相册媒体
+
+### 9.3 Fetch 函数的完整实现路径
+
+以下是完整的 `AlbumThumbnailLoader.fetch` 实现路径详解：
+
+```go
 func NewAlbumThumbnailLoader(db *gorm.DB) *AlbumThumbnailLoader {
     return &AlbumThumbnailLoader{
         maxBatch: 100,
         wait:     5 * time.Millisecond,
         fetch: func(albumIDs []int) ([]*models.Media, []error) {
-            // 步骤1: 查询有 CoverID 的相册
-            var albumsWithCover []struct {
-                AlbumID int
+            // ============================================================
+            // 阶段 1: 批量查询所有相册的 cover_id
+            // ============================================================
+            type albumCoverInfo struct {
+                ID      int
                 CoverID *int
             }
-            db.Model(&models.Album{}).
+            var coverInfos []albumCoverInfo
+            err := db.Model(&models.Album{}).
                 Select("id, cover_id").
                 Where("id IN (?)", albumIDs).
-                Find(&albumsWithCover)
-            
-            // 步骤2: 提取 CoverID 列表，批量查询对应 Media
-            coverIDs := collectCoverIDs(albumsWithCover)
-            var coverMedia []*models.Media
-            if len(coverIDs) > 0 {
-                db.Where("id IN (?)", coverIDs).Find(&coverMedia)
+                Find(&coverInfos).Error
+            if err != nil {
+                return nil, []error{err}
             }
-            
-            // 步骤3: 对无 CoverID 的相册，使用批量递归查询
-            // （可以用单个 UNION ALL 查询处理多个根相册）
-            
-            // 步骤4: 按输入顺序组装结果
+            // 用时：~1 次 SQL 查询
+            // 结果：coverInfos = [{ID: 1, CoverID: 100}, {ID: 2, CoverID: nil}, ...]
+
+            // ============================================================
+            // 阶段 2: 分组 - 有 CoverID vs 无 CoverID
+            // ============================================================
+            albumToCoverID := make(map[int]*int, len(coverInfos))
+            var withCoverAlbumIDs []int    // 有 CoverID 的相册
+            var withoutCoverAlbumIDs []int // 无 CoverID 的相册
+
+            for _, info := range coverInfos {
+                albumToCoverID[info.ID] = info.CoverID
+                if info.CoverID != nil {
+                    withCoverAlbumIDs = append(withCoverAlbumIDs, info.ID)
+                } else {
+                    withoutCoverAlbumIDs = append(withoutCoverAlbumIDs, info.ID)
+                }
+            }
+
+            // ============================================================
+            // 阶段 3: 批量查询有 CoverID 的相册对应的 Media
+            // ============================================================
+            coverMediaMap := make(map[int]*models.Media)
+            if len(withCoverAlbumIDs) > 0 {
+                // 提取去重的 CoverID
+                coverIDSet := make(map[int]struct{})
+                for _, albumID := range withCoverAlbumIDs {
+                    coverIDSet[*albumToCoverID[albumID]] = struct{}{}
+                }
+                coverIDList := make([]int, 0, len(coverIDSet))
+                for id := range coverIDSet {
+                    coverIDList = append(coverIDList, id)
+                }
+
+                // 批量查询 Media
+                var coverMedia []*models.Media
+                if err := db.Where("id IN (?)", coverIDList).Find(&coverMedia).Error; err != nil {
+                    return nil, []error{err}
+                }
+                // 构建 mediaID → Media 映射
+                for _, m := range coverMedia {
+                    coverMediaMap[m.ID] = m
+                }
+            }
+            // 用时：~1 次 SQL 查询（即使多个相册引用同一个 Cover Media，也只查一次）
+
+            // ============================================================
+            // 阶段 4: 批量查询无 CoverID 的相册（递归 CTE）
+            // ============================================================
+            noCoverThumbnailMap := make(map[int]*models.Media)
+            if len(withoutCoverAlbumIDs) > 0 {
+                // 对每个无 CoverID 的相册，递归查找其子相册中的最新媒体
+                // 策略：使用单个 SQL 同时处理多个根相册
+                query := `
+                    WITH RECURSIVE sub_albums AS (
+                        -- 锚点：每个根相册作为起点，标记 root_id
+                        SELECT id AS album_id, id AS root_id FROM albums WHERE id IN (?)
+                        UNION ALL
+                        -- 递归：子相册继承 root_id
+                        SELECT child.id AS album_id, sa.root_id
+                        FROM albums AS child
+                        INNER JOIN sub_albums sa ON child.parent_album_id = sa.album_id
+                    )
+                    -- 对每个 root_id，找到最新的媒体
+                    SELECT DISTINCT ON (sa.root_id) m.*
+                    FROM media m
+                    INNER JOIN sub_albums sa ON m.album_id = sa.album_id
+                    ORDER BY sa.root_id, m.id DESC
+                `
+                // 注意：DISTINCT ON 是 PostgreSQL 特性
+                // 如果是 MySQL 需要用其他方式（如窗口函数 ROW_NUMBER）
+
+                var thumbnailMedia []*models.Media
+                rows, err := db.Raw(query, withoutCoverAlbumIDs).Rows()
+                if err != nil {
+                    return nil, []error{err}
+                }
+                defer rows.Close()
+
+                // 扫描结果，构建 root_id → Media 映射
+                for rows.Next() {
+                    var rootID int
+                    var media models.Media
+                    // 需要手动扫描所有列...
+                    // 更简单的方式是使用 GORM 的 Scan 配合一个结构体
+                }
+            }
+            // 用时：~1 次 SQL 查询（无论多少个无 CoverID 的相册）
+            // 注意：这是最重的查询，但比 N 次递归查询快得多
+
+            // ============================================================
+            // 阶段 5: 按输入顺序组装结果
+            // ============================================================
+            result := make([]*models.Media, len(albumIDs))
+            for i, albumID := range albumIDs {
+                coverID := albumToCoverID[albumID]
+                if coverID != nil {
+                    // 有 CoverID：从 coverMediaMap 获取
+                    result[i] = coverMediaMap[*coverID]
+                } else {
+                    // 无 CoverID：从递归查询结果获取
+                    result[i] = noCoverThumbnailMap[albumID]
+                }
+                // 找不到则为 nil（空相册）
+            }
+
+            return result, nil
         },
     }
 }
 ```
 
-**预期收益**：相册列表查询次数从 N+3 降低到约 4-5 次。
+**SQL 查询次数对比**：
 
-### 8.2 解决 UserFavoritesLoader 的缓存问题
+| 方案 | 查询次数 | 说明 |
+|------|---------|------|
+| 原逐次查询 | N 次 | 每个相册 1 次，递归 CTE 代价高 |
+| AlbumThumbnailLoader | ~3 次 | 1次查 CoverID + 1次查 Cover Media + 1次批量递归查询 |
+| **优化后比例** | **~3/N** | N=100 时减少 97% 的查询次数 |
+
+### 9.4 集成到 Resolver 的方式
+
+修改 `albumResolver.Thumbnail` 方法，从直接调用改为使用 DataLoader：
+
+```go
+// 修改前：api/graphql/resolvers/album.go:72-75
+func (r *albumResolver) Thumbnail(ctx context.Context, obj *models.Album) (*models.Media, error) {
+    return obj.Thumbnail(r.DB(ctx))  // 每次单独查询
+}
+
+// 修改后
+func (r *albumResolver) Thumbnail(ctx context.Context, obj *models.Album) (*models.Media, error) {
+    return dataloader.For(ctx).AlbumThumbnail.Load(obj.ID)  // 批量合并
+}
+```
+
+**集成步骤**：
+
+1. **生成 Loader 代码**：使用 dataloaden 生成 `gen_albumthumbarloader.go`
+   ```bash
+   dataloaden -pkg dataloader -name AlbumThumbnail -key-type int -value-type "*github.com/photoview/photoview/api/graphql/models.Media"
+   ```
+
+2. **注册到 Loaders 结构体**：`api/dataloader/loaders.go`
+   ```go
+   type Loaders struct {
+       MediaThumbnail      *MediaURLLoader
+       MediaHighres        *MediaURLLoader
+       MediaVideoWeb       *MediaURLLoader
+       UserFromAccessToken *UserLoader
+       UserMediaFavorite   *UserFavoritesLoader
+       AlbumThumbnail      *AlbumThumbnailLoader  // 新增
+   }
+   ```
+
+3. **在 Middleware 中初始化**：`api/dataloader/loaders.go`
+   ```go
+   ctx := context.WithValue(r.Context(), loadersKey, &Loaders{
+       // ...
+       AlbumThumbnail: NewAlbumThumbnailLoader(db),  // 新增
+   })
+   ```
+
+4. **修改 albumResolver**：如上所示
+
+### 9.5 与现有代码的兼容性考量
+
+#### 9.5.1 保持模型方法不变
+
+`Album.Thumbnail(db)` 方法应保留，因为：
+- 其他地方可能直接调用（非 GraphQL 场景）
+- 单元测试直接使用该方法（如 `album_test.go`）
+- 符合单一职责原则（模型方法不依赖 DataLoader）
+
+#### 9.5.2 递归 CTE 的数据库兼容性
+
+当前代码使用 PostgreSQL 特有的 `DISTINCT ON` 语法。如果项目需要支持多种数据库：
+
+- **PostgreSQL**：使用 `DISTINCT ON (root_id)`（当前方案）
+- **MySQL 8.0+**：使用 `ROW_NUMBER() OVER (PARTITION BY root_id ORDER BY m.id DESC)` + 子查询
+- **MySQL 5.x**：使用 `GROUP BY` + `MAX(id)` 关联查询
+
+#### 9.5.3 错误处理
+
+当前实现返回 `[]error` 长度为 1 的全局错误。如果需要逐 key 错误：
+```go
+// 逐 key 错误模式（更灵活，但实现更复杂）
+errors := make([]error, len(albumIDs))
+// ...
+result[i] = media
+errors[i] = nil  // 或具体错误
+return result, errors
+```
+
+### 9.6 性能影响预估
+
+假设相册列表返回 50 个相册，其中 40 个有 CoverID，10 个没有：
+
+| 指标 | 现有方案 | DataLoader 方案 | 改善比例 |
+|------|---------|----------------|---------|
+| SQL 查询次数 | 50 次 | 3 次 | 94% ↓ |
+| 递归 CTE 执行次数 | 10 次 | 1 次 | 90% ↓ |
+| 总延迟（估算） | 50 × 5ms = 250ms | 3 × 5ms = 15ms | 94% ↓ |
+| 数据库连接占用 | 高（50 次往返） | 低（3 次往返） | 显著降低 |
+
+### 9.7 边界情况处理
+
+| 场景 | 处理方式 |
+|------|---------|
+| 相册不存在 | 返回 nil（与现有行为一致） |
+| 相册有 CoverID 但对应 Media 已删除 | 返回 nil（db.First 失败的等价行为） |
+| 空相册（无任何媒体） | 返回 nil（与现有 `media.ID == 0` 判断一致） |
+| CoverID 指向的媒体不属于该相册 | 仍然返回该媒体（与现有 db.First 行为一致，不校验归属） |
+| 子相册有多个媒体 | 返回 ID 最大的（与现有 ORDER BY id DESC LIMIT 1 一致） |
+
+---
+
+## 十、改进建议
+
+### 10.1 解决 Album.thumbnail 的 N+1 问题（最高优先级）
+
+详见第九章「AlbumThumbnailLoader 批量获取相册封面的代码实现路径」的完整实现方案。
+
+**预期收益**：相册列表查询次数从 N+3 降低到约 4-5 次，延迟降低 90% 以上。
+
+### 10.2 解决 UserFavoritesLoader 的缓存问题
 
 **问题**：使用指针作为 cache key，导致相同内容无法命中缓存，batch 去重也失效。
 
@@ -839,7 +1306,7 @@ func NewAlbumThumbnailLoader(db *gorm.DB) *AlbumThumbnailLoader {
 
 **方案 B**：自定义 hashCode 或实现 `comparable` 接口（Go 1.21+）。
 
-### 8.3 扩展更多 DataLoader
+### 10.3 扩展更多 DataLoader
 
 为高频查询字段添加 DataLoader：
 
@@ -852,7 +1319,7 @@ func NewAlbumThumbnailLoader(db *gorm.DB) *AlbumThumbnailLoader {
 
 ---
 
-## 九、关键代码位置索引
+## 十一、关键代码位置索引
 
 | 功能                | 文件路径                                                    | 行号   |
 | ------------------- | ----------------------------------------------------------- | ------ |
@@ -874,3 +1341,7 @@ func NewAlbumThumbnailLoader(db *gorm.DB) *AlbumThumbnailLoader {
 | MyAlbums action     | `api/graphql/models/actions/album_actions.go`               | 9-48   |
 | User.FillAlbums()   | `api/graphql/models/user.go`                                | 154-165|
 | 前端相册列表查询    | `ui/src/Pages/AllAlbumsPage/AlbumsPage.tsx`                 | 11-28  |
+| WebSocket 传输配置  | `api/graphql/endpoint/graphql_endpoint.go`                  | 31-35  |
+| WebSocket 认证      | `api/graphql/auth/auth.go`                                  | 92-130 |
+| Notification 订阅   | `api/graphql/resolvers/notification.go`                     | 17-34  |
+| 订阅生成代码        | `api/graphql/generated.go`                                  | 7567-7585 |
