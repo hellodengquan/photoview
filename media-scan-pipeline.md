@@ -1193,3 +1193,398 @@ for _, deletedAlbumID := range deletedAlbumIDs {
 | **并发安全** | `ScannerQueue.mutex` 保护 addJob | 安全——去重检查在锁内 |
 
 **核心结论**：Photoview 的多用户隔离以 **Album 为边界**而非以 User 为边界。User 通过 `user_albums` 多对多关系"视图化"地访问 Album 中的 Media，但 Album 及其 Media、缓存是全局共享的资源。对于 root_path 完全独立的用户，隔离是天然的；对于存在路径包含关系的用户，共享 Album 是设计意图（而非漏洞），但 `DeleteOldUserAlbums` 的清理逻辑在共享场景下存在潜在的误删风险
+
+---
+
+## 十五、扫描中途重启的 in-progress Job 恢复机制
+
+### 15.1 Photoview 没有 in-progress Job 的持久化恢复机制
+
+首先给出**明确结论**：Photoview 对 in-progress job 没有任何持久化恢复能力。扫描状态完全是内存状态，一旦进程终止，所有 in-progress 和 up-next job 都会丢失。
+
+### 15.2 ScannerQueue 的内存状态分析
+
+`ScannerQueue` 的核心数据结构（`queue.go:47-56`）：
+
+```go
+type ScannerQueue struct {
+    mutex       sync.Mutex
+    idle_chan   chan bool
+    in_progress []ScannerJob      // 正在执行的 jobs
+    up_next     []ScannerJob      // 等待执行的 jobs
+    db          *gorm.DB
+    settings    ScannerQueueSettings
+    close_chan  *chan bool
+    running     bool
+}
+
+// 全局单例
+var global_scanner_queue ScannerQueue
+```
+
+关键设计事实：
+
+1. **`in_progress` 和 `up_next` 是纯内存切片**，没有任何数据库持久化
+2. **`ScannerJob` 只包含一个 `TaskContext`**，其中封装了 `context.Context`、`*gorm.DB`、`*Album`、`*AlbumScannerCache`——全部是运行时对象，无法序列化到数据库
+3. **没有任何表存储扫描进度**：`albums` 表存扫描结果，`site_info` 表存配置，没有 `scanner_jobs`、`scan_progress` 之类的中间状态表
+4. **没有 checkpoint 机制**：`ScanAlbum()` 执行到一半被中断时，没有任何进度记录可以续跑
+
+### 15.3 服务启动时的状态重置
+
+`InitializeScannerQueue()` (`queue.go:60-86`) 在 `server.go:62` 被调用：
+
+```go
+func InitializeScannerQueue(db *gorm.DB) error {
+    // 从数据库读取配置
+    site_info, err := models.GetSiteInfo(db)
+    concurrentWorkers = site_info.ConcurrentWorkers
+
+    // 创建全新的 ScannerQueue
+    global_scanner_queue = ScannerQueue{
+        idle_chan:   make(chan bool, 1),
+        in_progress: make([]ScannerJob, 0),  // 空！
+        up_next:     make([]ScannerJob, 0),  // 空！
+        // ...
+    }
+
+    go global_scanner_queue.startBackgroundWorker()
+    return nil
+}
+```
+
+启动时 `in_progress` 和 `up_next` 都被重置为空切片。**没有任何从数据库恢复 jobs 的代码**。
+
+### 15.4 优雅关闭 vs 强制终止
+
+两种重启场景的行为差异：
+
+**场景一：优雅关闭（SIGINT/SIGTERM）**
+
+`setupGracefulShutdown()` (`server.go:140-159`) 的处理流程：
+
+```
+收到终止信号 →
+  ShutdownPeriodicScanner()      // 停止定时触发
+  CloseScannerQueue()            // 等待队列排空
+    ↓
+  CloseBackgroundWorker()        // queue.go:124-134
+    ↓
+  设置 close_chan → notify() 唤醒 worker →
+  worker 检查 close_chan != nil && len(in_progress) == 0 && len(up_next) == 0 →
+  等待所有 in_progress job 自然完成 →
+  向 close_chan 发信号，主 goroutine 继续 →
+  关闭 HTTP 服务器 → 进程退出
+```
+
+优雅关闭时，所有 in-progress job 会**自然运行到完成**，不会被中断。
+
+**场景二：强制终止（SIGKILL / kill -9 / 进程崩溃）**
+
+- 正在执行的 `ScanAlbum()` goroutine 被强制终止
+- `in_progress` 和 `up_next` 切片中的所有 job 全部丢失
+- 没有任何持久化状态可以恢复这些 job
+- 重启后需要等待下一次触发（定时扫描或手动触发）重新入队
+
+### 15.5 "恢复"的实际含义：幂等性兜底
+
+虽然没有显式的恢复机制，但 Photoview 依赖**幂等性**来确保重启后重新扫描不会产生副作用：
+
+| 中断位置 | 已完成的工作 | 重启后的行为 |
+|---------|-------------|-------------|
+| `FindAlbumsForUser` BFS 中 | 部分 Album 已创建 | 重新 BFS，`path_hash` 命中 → 跳过创建，继续入队 |
+| `findMediaForAlbum` 中 | 部分 Media 已入库 | 重新遍历，`path_hash` 命中 → `isNewMedia=false`，跳过 AfterMediaFound |
+| `scanMedia` 事务中 | 事务已回滚（数据库无记录），但可能有部分文件落盘 | 重新执行，文件已存在则覆盖，数据库重新写入 |
+| `scanMedia` 事务后 | 数据库有 MediaURL 记录，文件也落盘 | 重新执行，`photoURLFromDB` 命中 + `os.Stat` 命中 → 跳过 |
+| `AfterProcessMedia` 中（如人脸检测失败） | 缩略图已生成，MediaURL 已入库 | 重新执行，跳过缩略图生成，人脸检测重新执行（幂等） |
+
+**关键事实**：
+
+- `ScanMedia()` 按 `path_hash` 查询，命中则返回 `isNewMedia=false`，不会重复插入 Media 记录
+- `ProcessMedia` 中 `photoURLFromDB()` 按 `purpose` 查询，命中则跳过生成
+- `os.Stat` 检查缓存文件存在性，文件缺失才重新生成
+- 数据库事务保证 `ProcessMedia` + `AfterProcessMedia` 的原子性
+
+### 15.6 重启后的实际效果
+
+以一次包含 10 个 Album 的完整扫描为例：
+
+```
+执行顺序：
+  Album 1: ✓ 完成
+  Album 2: ✓ 完成
+  Album 3: 正在执行（处理第 127 张照片时崩溃）
+  Album 4-10: 在 up_next 队列中等待
+
+崩溃后重启：
+  in_progress: 空（丢失）
+  up_next: 空（丢失）
+
+下一次扫描触发：
+  Album 1: ✓ 0 代价（全部命中缓存）
+  Album 2: ✓ 0 代价（全部命中缓存）
+  Album 3:
+    前 126 张照片：✓ 0 代价（MediaURL 已存在）
+    第 127 张照片：如果事务未提交 → 重新处理；如果已提交 → 跳过
+    其余照片：从头处理
+  Album 4-10: 从头处理
+```
+
+### 15.7 恢复机制总结
+
+| 维度 | 现状 | 潜在改进方向 |
+|------|------|-------------|
+| **队列状态持久化** | ❌ 无，全部内存 | 引入 scanner_jobs 表，记录 job 状态（pending/running/done/failed） |
+| **断点续跑** | ❌ 无，Album 级从头开始 | 记录每张 media 的处理状态，从断点续跑 |
+| **优雅关闭** | ✅ 等待 in-progress 完成 | 已实现，无需改进 |
+| **强制终止恢复** | ❌ 完全丢失，依赖幂等性 | 持久化 job 状态，启动时恢复 pending/running jobs |
+| **部分写入处理** | ✅ 依赖事务回滚 + 幂等重跑 | 已足够，无需改进 |
+| **进度显示** | ❌ 重启后丢失，从 0% 开始 | 持久化扫描进度 |
+
+**核心结论**：Photoview 选择了**简单性优先**的设计——不实现复杂的状态持久化和断点续跑，而是依赖全链路的幂等性来保证重启后重新扫描的正确性。代价是每次崩溃都会丢失当前扫描进度，需要重新遍历和重新检查，但不会产生重复数据或不一致状态。
+
+---
+
+## 十六、AlbumScannerCache 缓存淘汰策略与 Worker 数量配置的协作
+
+### 16.1 AlbumScannerCache 的数据结构
+
+`AlbumScannerCache` (`cache.go:12-25`) 是一个纯内存的三级缓存：
+
+```go
+type AlbumScannerCache struct {
+    path_contains_photos map[string]bool          // 目录是否包含照片
+    photo_types          map[string]media_type.MediaType  // 文件 MIME 类型缓存
+    ignore_data          map[string][]string      // 目录的 .photoviewignore 规则
+    mutex                sync.Mutex               // 保护并发访问
+}
+
+func MakeAlbumCache() *AlbumScannerCache {
+    return &AlbumScannerCache{
+        path_contains_photos: make(map[string]bool),
+        photo_types:          make(map[string]media_type.MediaType),
+        ignore_data:          make(map[string][]string),
+    }
+}
+```
+
+### 16.2 无淘汰策略
+
+**AlbumScannerCache 没有任何淘汰策略**——这是一个非常关键的设计：
+
+- 没有 LRU（最近最少使用）
+- 没有 TTL（过期时间）
+- 没有大小限制（不会检查 map 长度）
+- 没有内存压力检测
+- 没有主动清理逻辑（除了 GC）
+
+三个缓存 map 都是只增不减的，只要 cache 对象还存活，所有条目都会一直保留。
+
+### 16.3 Cache 的生命周期与作用域
+
+`AlbumScannerCache` 的生命周期严格绑定在 **一次 `AddUserToQueue()` 调用**上：
+
+```
+AddUserToQueue(user)
+  ├─ albumCache := scanner_cache.MakeAlbumCache()   // 新建 cache，空 map
+  │
+  ├─ scanner.FindAlbumsForUser(db, user, albumCache)
+  │    ├─ BFS 遍历目录
+  │    │   ├─ directoryContainsPhotos()  // 写入 path_contains_photos
+  │    │   ├─ 每个目录事务：albumCache.InsertAlbumIgnore()  // 写入 ignore_data
+  │    │   └─ cache.GetMediaType()       // 第一次访问时写入 photo_types
+  │    │
+  │    └─ 返回 albums 列表
+  │
+  └─ 对每个 album 创建 ScannerJob：
+       ctx := scanner_task.NewTaskContext(..., album, albumCache)
+       addJob(&ScannerJob{ctx})
+```
+
+**关键发现**：同一个 `AddUserToQueue()` 产生的所有 Album Job **共享同一个 cache 对象**。cache 通过 `TaskContext` 传递给每个 Job：
+
+```go
+func NewTaskContext(parent context.Context, db *gorm.DB, album *models.Album,
+                     cache *scanner_cache.AlbumScannerCache) TaskContext {
+    ctx := ctx.WithValue(taskCtxKeyAlbumCache, cache)
+    // ...
+}
+```
+
+这意味着：
+
+- 用户 A 的扫描和用户 B 的扫描有各自独立的 cache（`AddUserToQueue` 每次新建）
+- 同一用户的多个 Album Job 共享一个 cache，子目录的 `directoryContainsPhotos()` 结果可以被兄弟目录复用
+- 当该用户的所有 Album Job 执行完毕后，cache 没有任何引用，会被 GC 回收
+
+### 16.4 多 Worker 并发访问 Cache
+
+`ScannerQueue.processQueue()` (`queue.go:142-167`) 中，多个 worker goroutine 并发执行时：
+
+```go
+for len(queue.in_progress) < maxJobs && len(queue.up_next) > 0 {
+    nextJob := queue.up_next[0]
+    queue.up_next = queue.up_next[1:]
+    queue.in_progress = append(queue.in_progress, nextJob)
+
+    go func() {
+        nextJob.Run(queue.db)  // ScanAlbum(job.ctx)
+        // ...
+    }()
+}
+```
+
+如果 `maxJobs=3`，且这 3 个 job 属于同一个 `AddUserToQueue()` 调用（共享 cache），那么会有 3 个 goroutine 并发访问同一个 `AlbumScannerCache`。
+
+每个缓存方法都用 `sync.Mutex` 保护：
+
+```go
+func (c *AlbumScannerCache) GetMediaType(path string) media_type.MediaType {
+    c.mutex.Lock()
+    defer c.mutex.Unlock()
+    // ... 读 photo_types map，miss 则调用 media_type.GetMediaType() 写入
+}
+
+func (c *AlbumScannerCache) AlbumContainsPhotos(path string) *bool {
+    c.mutex.Lock()
+    defer c.mutex.Unlock()
+    // ... 读 path_contains_photos map
+}
+```
+
+### 16.5 Worker 数量与 Cache 性能的协作关系
+
+| Worker 数 | Cache 竞争 | Cache 填充速度 | 总吞吐量 | 适用场景 |
+|----------|:----------:|:-------------:|:--------:|---------|
+| **1** (SQLite) | ❌ 无竞争 | 慢（线性填充） | 受限于单任务速度 | 小图库 |
+| **2-3** (默认) | ⚠️ 低竞争 | 较快（并行填充） | 提升 30-50% | 中等图库 |
+| **4-6** | ⚠️ 中等竞争 | 快（高并行） | 可能饱和 I/O | 大图库 + 高性能存储 |
+| **>6** | ❌ 高竞争 | 瓶颈转移到 mutex | 边际收益递减，可能下降 | 不推荐 |
+
+**互斥锁的性能特征**：
+
+- **读多写少**：`AlbumContainsPhotos()` 和 `GetMediaType()` 都是读多写少（第一次 miss 写，后续全是读）。理想场景下应该用 `sync.RWMutex` 允许多读，但实际用了 `sync.Mutex`，读操作也会互相阻塞
+- **临界区极小**：每次 Lock 只是 map 查找或写入，耗时极短（微秒级）。即使 6 个 worker 并发，锁等待时间也不会成为主要瓶颈
+- **BFS 阶段单线程**：`FindAlbumsForUser()` 的 BFS 是在 `AddUserToQueue()` 的主 goroutine 中同步执行的，此时 cache 填充是单线程的，没有并发。只有后续的 `ScanAlbum()` 阶段才是多 worker 并发
+
+### 16.6 Worker 数量的配置来源
+
+`ConcurrentWorkers` 存储在 `site_info` 表中：
+
+```go
+type SiteInfo struct {
+    InitialSetup         bool `gorm:"not null"`
+    PeriodicScanInterval int  `gorm:"not null"`
+    ConcurrentWorkers    int  `gorm:"not null"`   // ← worker 数量
+}
+```
+
+**默认值**（`site_info.go:19-29`）：
+
+```go
+func DefaultSiteInfo(db *gorm.DB) SiteInfo {
+    defaultConcurrentWorkers := 3
+    if db_drivers.SQLITE.MatchDatabase(db) {
+        defaultConcurrentWorkers = 1   // SQLite 强制单 worker
+    }
+    // ...
+}
+```
+
+**动态修改**（`scanner.go:81-107`）：
+
+```go
+func (r *mutationResolver) SetScannerConcurrentWorkers(ctx context.Context, workers int) (int, error) {
+    // 1. 参数校验：SQLite 不允许多 worker
+    if workers > 1 && drivers.DatabaseDriverFromEnv() == drivers.SQLITE {
+        return 0, errors.New("multiple workers not supported for SQLite databases")
+    }
+
+    // 2. 更新数据库
+    db.Model(&models.SiteInfo{}).Update("concurrent_workers", workers)
+
+    // 3. 动态更新队列设置（不重启服务）
+    scanner_queue.ChangeScannerConcurrentWorkers(siteInfo.ConcurrentWorkers)
+
+    return siteInfo.ConcurrentWorkers, nil
+}
+```
+
+`ChangeScannerConcurrentWorkers()` (`queue.go:92-98`) 只是更新 `settings.max_concurrent_tasks`：
+
+```go
+func ChangeScannerConcurrentWorkers(newMaxWorkers int) {
+    global_scanner_queue.mutex.Lock()
+    defer global_scanner_queue.mutex.Unlock()
+    global_scanner_queue.settings.max_concurrent_tasks = newMaxWorkers
+}
+```
+
+**重要**：动态修改 worker 数**不影响正在执行的 job**，只会影响 `processQueue()` 下一轮调度时启动的新 job 数量。已在 `in_progress` 中的 job 会继续执行直到完成。
+
+### 16.7 Cache 大小估算
+
+以 10 万张照片、1000 个子目录的图库为例，cache 的内存占用估算：
+
+| Cache Map | 条目数 | 单条目内存 | 总内存 |
+|----------|--------|:----------:|-------:|
+| `path_contains_photos` | 1000 个目录 | ~50 字节（路径字符串 + bool） | ~50 KB |
+| `photo_types` | 100000 个文件 | ~60 字节（路径字符串 + MediaType） | ~6 MB |
+| `ignore_data` | 100 个有 .photoviewignore 的目录 | ~200 字节（路径 + 规则数组） | ~20 KB |
+| **总计** | | | **~6 MB** |
+
+即使是百万张照片的图库，cache 总内存也才 ~60 MB。**这就是为什么不需要淘汰策略的根本原因——cache 峰值内存占用完全在可接受范围内**。当 `AddUserToQueue()` 完成后，cache 会被 GC 回收，内存立即释放。
+
+### 16.8 缓存协作全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ AddUserToQueue(User A)                                              │
+│   ┌──────────────────────────────────────────────────────────┐      │
+│   │ albumCache := MakeAlbumCache()  ← 空 map                │      │
+│   └──────────────────────────────────────────────────────────┘      │
+│                                                                     │
+│   FindAlbumsForUser(user, albumCache)  ← 单线程，无并发            │
+│     BFS 遍历:                                                        │
+│       directoryContainsPhotos()  → 写 path_contains_photos          │
+│       GetMediaType()               → 写 photo_types                │
+│       InsertAlbumIgnore()          → 写 ignore_data                │
+│                                                                     │
+│   对每个 Album 创建 ScannerJob:                                      │
+│     Job 1 ctx → albumCache  (共享)                                  │
+│     Job 2 ctx → albumCache  (共享)                                  │
+│     Job 3 ctx → albumCache  (共享)                                  │
+│     ...                                                             │
+│                                                                     │
+│   addJob(Job 1), addJob(Job 2), ...                                 │
+└─────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ ScannerQueue.processQueue()  ← max_concurrent_tasks = 3             │
+│   [Worker 1] ScanAlbum(Job 1 ctx)                                    │
+│     GetMediaType()          → mutex.Lock → 命中 → mutex.Unlock      │
+│     AlbumContainsPhotos()   → mutex.Lock → 命中 → mutex.Unlock      │
+│     ...                                                              │
+│   [Worker 2] ScanAlbum(Job 2 ctx)                                    │
+│     GetMediaType()          → mutex.Lock → 等待 Worker 1 释放        │
+│     ...                                                              │
+│   [Worker 3] ScanAlbum(Job 3 ctx)                                    │
+│     ...                                                              │
+└─────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+              所有 Job 完成 → albumCache 无引用 → GC 回收
+```
+
+### 16.9 总结
+
+| 维度 | 设计决策 | 理由 |
+|------|---------|------|
+| **缓存淘汰** | ❌ 无任何淘汰策略 | 单次扫描峰值内存仅几 MB 到几十 MB，完全可接受 |
+| **生命周期** | 绑定单次 `AddUserToQueue()` 调用 | 不同用户的扫描天然隔离，扫描完成后 GC 自动回收 |
+| **共享范围** | 同一用户的所有 Album Job 共享 | BFS 发现的目录信息可被子 Album 复用，减少重复 I/O |
+| **并发保护** | `sync.Mutex` 保护所有 map 访问 | 临界区极小，多 worker 下竞争不显著 |
+| **Worker 配置** | SQLite 强制 1，其他默认 3，可动态修改 | SQLite 写锁限制；MySQL/PostgreSQL 可充分利用多核 |
+| **动态修改** | 仅影响新启动的 Job，不中断运行中的 Job | 保证正在执行的扫描不受配置变更影响 |
+
+**核心结论**：AlbumScannerCache 的设计非常克制——不做复杂的 LRU/TLL 淘汰，不做跨扫描周期的持久化，甚至不用 `RWMutex` 优化读多写少场景。这种简单性是建立在对内存占用的准确估算之上的：一次完整扫描的缓存数据量即使在百万级图库下也不到 100 MB，扫描完成后立即被 GC 回收。Worker 数量与 cache 的协作也非常直接：多 worker 共享同一 cache 提升命中率，但 mutex 锁引入少量竞争开销，默认 3 个 worker 是在并行收益和锁开销之间的良好平衡点。
