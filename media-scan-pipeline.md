@@ -869,3 +869,327 @@ ScannerJob.Run(db)
 - **单 media 级别有数据库回滚**：`ProcessMedia` + `AfterProcessMedia` 在同一事务中，失败会回滚该 media 的所有数据库写入
 - **文件系统操作不可回滚**：FFmpeg/MagickWand 写入的文件在事务回滚后成为孤立文件，但下次扫描会被覆盖
 - **元数据类 Task 主动吞错**：EXIF、视频元数据、人脸检测等失败不阻塞管线，保证了核心缩略图生成的鲁棒性
+
+---
+
+## 十三、增量扫描 vs 全量扫描：触发条件与代价对比
+
+### 13.1 Photoview 没有"增量扫描"模式
+
+Photoview **没有真正的增量扫描机制**——每一次扫描触发，无论是定时触发还是手动触发，都会从用户根目录开始执行完整的 BFS 遍历。扫描的"增量性"完全依赖于管线各环节的**幂等短路逻辑**，而非入口处的差异检测。
+
+也就是说：**触发条件相同，代价不同**。每次扫描付出的代价取决于文件系统中实际有多少变更，而非扫描是如何被触发的。
+
+### 13.2 所有扫描触发均执行相同流程
+
+| 触发方式 | 入口函数 | BFS 遍历 | 逐 Album 扫描 |
+|---------|---------|:-------:|:------------:|
+| `scanAll` GraphQL mutation | `AddAllToQueue()` → 遍历所有用户 | ✅ | ✅ |
+| `scanUser` GraphQL mutation | `AddUserToQueue(user)` → 单用户 | ✅ | ✅ |
+| 定时扫描 | `AddAllToQueue()` → 遍历所有用户 | ✅ | ✅ |
+| 单文件重处理 | `ProcessSingleMedia()` | ❌ 跳过 | ❌ 跳过，直接 `scanMedia()` |
+
+前三种触发方式都经过 `FindAlbumsForUser()` 的完整 BFS，最终进入 `ScanAlbum()` → `findMediaForAlbum()` → `scanMedia()` 链路。只有 `ProcessSingleMedia()` 是唯一的特例——它跳过队列、跳过 BFS、跳过文件发现，直接对单个 media 执行 `scanMedia()`。
+
+### 13.3 幂等短路：管线各环节如何避免重复工作
+
+虽然每次触发都做全量 BFS，但管线中每个环节都有"跳过已处理内容"的逻辑，将无变更的代价降到最低：
+
+**第一层：目录发现阶段的剪枝**（`FindAlbumsForUser`）
+
+```
+BFS 遍历每个目录：
+  ├─ albumCache.AlbumContainsPhotos(path) 缓存命中 → 跳过 directoryContainsPhotos() 遍历
+  └─ directoryContainsPhotos() 首个找到未被 ignore 的媒体文件即返回 true
+```
+
+**第二层：文件发现阶段的快速跳过**（`findMediaForAlbum`）
+
+| 短路点 | 代码位置 | 条件 | 代价 |
+|--------|---------|------|------|
+| 非媒体文件 | `IsPathMedia()` | MIME 类型不在支持列表 | 一次 MIME 检测 + `os.Stat` |
+| ignore 过滤 | `IgnorefileTask.MediaFound` | 命中 .photoviewignore | 字符串匹配 |
+| RAW 的 JPEG 伴生 | `CounterpartFilesTask.MediaFound` | `FindRawCounterpart()` 找到 RAW | 一次 `filepath.Glob` |
+| 已存在的 media | `ScanMedia()` 中 `path_hash` 查询 | 数据库中已有记录 | 一次 SELECT 查询 |
+
+对于已存在的 media，`ScanMedia()` 返回 `(media, false, nil)`——`isNewMedia=false`，后续的 `AfterMediaFound` 中 ExifTask 和 VideoMetadataTask 检查 `!newMedia` 后直接返回 `nil`，不做任何 I/O。
+
+**第三层：媒体处理阶段的按需生成**（`ProcessMedia`）
+
+| 短路点 | 代码位置 | 条件 | 代价 |
+|--------|---------|------|------|
+| Original 已存在 | `photoURLFromDB(MediaOriginal)` | 数据库有记录 | 一次 SELECT |
+| HighRes 已存在 | `photoURLFromDB(PhotoHighRes)` | 数据库有记录 + 文件存在 | SELECT + `os.Stat` |
+| Thumbnail 已存在 | `photoURLFromDB(PhotoThumbnail)` | 数据库有记录 + 文件存在 | SELECT + `os.Stat` |
+| Sidecar 未变更 | `SidecarTask.ProcessMedia` | MD5 哈希一致 | 一次 MD5 计算 |
+| 视频已转码 | `mediaURLFromDB(VideoWeb)` | 数据库有记录 | 一次 SELECT |
+
+**关键发现**：对于已扫描过的媒体，`ProcessMedia` 的实际开销仅为**几次数据库 SELECT + 几次 `os.Stat`**，不做任何转码操作。
+
+### 13.4 代价对比：首次扫描 vs 重复扫描
+
+以一个包含 1000 张照片（全部 JPEG、无 RAW）、10 个子目录的 Album 为例：
+
+| 操作 | 首次扫描 | 重复扫描（无变更） | 增量扫描（10 张新照片） |
+|------|:-------:|:----------------:|:--------------------:|
+| **BFS 目录遍历** | 10 次 `os.ReadDir` | 10 次 `os.ReadDir` | 10 次 `os.ReadDir` |
+| **directoryContainsPhotos** | 递归遍历所有子目录 | 缓存命中，直接返回 | 缓存命中，直接返回 |
+| **IsPathMedia** | 1000 次 MIME 检测 | 1000 次 MIME 检测 | 1000 次 MIME 检测 |
+| **ScanMedia SELECT** | 1000 次未命中 → INSERT | 1000 次命中 → 跳过 | 990 次命中 + 10 次 INSERT |
+| **AfterMediaFound** | 1000 次 EXIF 解析 | 0 次（`!newMedia` 跳过） | 10 次 EXIF 解析 |
+| **ProcessMedia** | 1000 次 thumbnail 生成 | 1000 次 SELECT + Stat | 10 次 thumbnail + 990 次 SELECT+Stat |
+| **FFmpeg/MagickWand** | 1000 次 MagickWand 调用 | 0 次 | 10 次 MagickWand 调用 |
+
+**结论**：
+
+- **I/O 不可省**：BFS 目录遍历和 MIME 检测每次都执行，无法跳过——这是"全量扫描"策略的固有代价
+- **计算可省**：转码/缩略图生成是最昂贵的操作，通过数据库比对完全跳过
+- **增量代价 ≈ 新增文件的处理代价**：由于幂等短路，重复扫描的额外开销仅为"每文件一次 SELECT + 两次 Stat"
+
+### 13.5 "真增量"的缺失与影响
+
+Photoview 不使用 inotify/fswatch，意味着：
+
+- **无法实时响应**文件系统变更，只能等待下次定时扫描或手动触发
+- **大量无变更目录的 `os.ReadDir` 重复开销**无法避免（虽然 `ReadDir` 本身很快）
+- 无法检测文件内容的变更（如照片被覆盖更新但路径不变）——`ScanMedia()` 只按 `path_hash` 比对，不检查文件修改时间或内容哈希。**已存在的 media 永远不会被重新处理**，除非：
+  - 缓存文件丢失（`os.Stat` 检测到文件不存在）
+  - sidecar `.xmp` 文件变更（MD5 哈希比对）
+  - 用户手动调用 `ProcessSingleMedia()` 强制重处理
+
+---
+
+## 十四、多用户图库分割：每用户独立 root_dir 的扫描隔离边界
+
+### 14.1 数据模型：User ↔ Album 的多对多关系
+
+```
+┌─────────┐     user_albums      ┌─────────┐
+│  User   │◀───────────────────▶│  Album  │
+│         │  (user_id, album_id) │         │
+│ ID      │                      │ ID      │
+│ Username│                      │ Path    │
+│ Admin   │                      │ PathHash│
+└─────────┘                      │ ParentID│
+                                 │ Owners  │
+                                 └─────────┘
+                                     │ 1:N
+                                     ▼
+                                 ┌─────────┐
+                                 │  Media  │
+                                 │ ID      │
+                                 │ Path    │
+                                 │ AlbumID │
+                                 │ Type    │
+                                 └─────────┘
+```
+
+关键设计：
+
+- **Album 与 User 是多对多关系**（`user_albums` 中间表），一个 Album 可以有多个 Owner
+- **Album 不存储 OwnerID**——注释掉的 `// OwnerID int` 说明最初考虑过一对多，但最终选择了多对多
+- **Media 属于 Album**（`album_id` 外键），不属于 User——User 对 Media 的访问通过 Album 间接实现
+
+### 14.2 用户 Root Dir 的建立
+
+每个用户的图库根目录通过以下方式建立：
+
+**初始设置**（`InitialSetupWizard`，`resolvers/user.go:57`）：
+
+```go
+user, _ := models.RegisterUser(tx, username, &password, true)
+_, err = scanner.NewRootAlbum(tx, rootPath, user)
+```
+
+**添加 Root Path**（`UserAddRootPath`，`resolvers/user.go:174`）：
+
+```go
+newAlbum, err := scanner.NewRootAlbum(db, rootPath, &user)
+```
+
+**`NewRootAlbum()` 的隔离逻辑**（`scanner_album.go:19`）：
+
+```go
+func NewRootAlbum(db *gorm.DB, rootPath string, owner *models.User) (*models.Album, error) {
+    // 1. 按 path_hash 查找已存在的 Album
+    var matchedAlbums []models.Album
+    db.Where("path_hash = ?", models.MD5Hash(rootPath)).Find(&matchedAlbums)
+
+    if len(matchedAlbums) > 0 {
+        album := matchedAlbums[0]
+        // 2a. Album 已存在：检查用户是否已拥有此路径
+        if matchedUserAlbumCount > 0 {
+            return nil, errors.New("user already owns a path containing this path")
+        }
+        // 2b. 将用户添加为 Album 的 Owner
+        db.Model(&owner).Association("Albums").Append(&album)
+    } else {
+        // 3. Album 不存在：创建新 Album，用户为唯一 Owner
+        album := models.Album{Title: path.Base(rootPath), Path: rootPath, Owners: owners}
+        db.Create(&album)
+    }
+}
+```
+
+**关键隔离规则**：
+
+1. **同一目录路径全局唯一**：`path_hash` 唯一索引确保一个文件系统路径只对应一个 Album 记录
+2. **多用户可共享同一 Album**：如果两个用户的 root_path 相同或存在包含关系，它们会指向同一个 Album
+3. **防重复拥有**：同一用户不能重复添加已拥有的路径
+
+### 14.3 共享 Album 场景的隔离分析
+
+**场景一：两个用户的 root_path 完全相同**
+
+```
+User A: root_path = /photos
+User B: root_path = /photos
+```
+
+- `NewRootAlbum` 为 User A 创建 Album `/photos`（ID=1）
+- User B 添加时，`path_hash` 命中已有 Album，User B 被添加为 Owner
+- 数据库中只有一个 Album 记录，但有两条 `user_albums` 关联
+- 扫描时，两个用户各自触发 `FindAlbumsForUser()`，都会发现这个 Album，但 `ScannerQueue.jobOnQueue()` 按 album ID 去重，**同一 Album 只会被扫描一次**
+
+**场景二：一个用户的 root_path 是另一个的子目录**
+
+```
+User A: root_path = /photos
+User B: root_path = /photos/vacation
+```
+
+- 扫描 User A 时，BFS 发现 `/photos/vacation`，创建 Album 并设置 User A 为 Owner
+- User B 添加 root_path 时，`NewRootAlbum` 发现 Album 已存在，添加 User B 为 Owner
+- `/photos/vacation` Album 有两个 Owner（User A 和 User B）
+- 扫描 User A 时，BFS 会将 `/photos/vacation` 作为子 Album 入队
+- 扫描 User B 时，`FindAlbumsForUser` 也会发现 `/photos/vacation` 并入队
+- 队列去重保证只扫描一次
+
+**场景三：两个用户的 root_path 完全独立**
+
+```
+User A: root_path = /data/user_a_photos
+User B: root_path = /data/user_b_photos
+```
+
+- 两个 Album 完全独立，各自有唯一的 Owner
+- 扫描时各自的 job 互不影响
+- `AlbumScannerCache` 在 `AddUserToQueue` 中每次新建（`scanner_cache.MakeAlbumCache()`），**用户间缓存不共享**
+
+### 14.4 扫描任务隔离的五层边界
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ 层级 1：队列级隔离 — ScannerQueue                                  │
+│   addJob() 按 album ID 去重，同一 Album 不会重复入队                  │
+│   不同用户的 Album job 可并发执行（受 max_concurrent_tasks 限制）       │
+├──────────────────────────────────────────────────────────────────┤
+│ 层级 2：BFS 级隔离 — FindAlbumsForUser                             │
+│   每个 AddUserToQueue 调用创建独立的 AlbumScannerCache               │
+│   BFS 只遍历该用户的 root_albums 及其子目录                           │
+│   不会踏入其他用户的 root_path（除非路径有包含关系）                     │
+├──────────────────────────────────────────────────────────────────┤
+│ 层级 3：Album 级隔离 — ScanAlbum                                   │
+│   每个 ScannerJob 对应一个 Album，独立执行 ScanAlbum                  │
+│   Album 的 Media 处理在独立的数据库事务中                              │
+│   单 Album 失败不影响其他 Album                                      │
+├──────────────────────────────────────────────────────────────────┤
+│ 层级 4：Media 级隔离 — scanMedia                                   │
+│   每个 Media 在独立的数据库事务中处理                                  │
+│   ProcessMedia + AfterProcessMedia 在同一事务中                       │
+│   单 Media 失败不影响同 Album 中的其他 Media                          │
+├──────────────────────────────────────────────────────────────────┤
+│ 层级 5：缓存级隔离 — CachePath                                     │
+│   缓存目录按 albumID/mediaID 组织                                    │
+│   MediaCachePath/<albumID>/<mediaID>/ — Album 维度天然隔离            │
+│   共享 Album 的多个用户看到同一缓存（因为 Album ID 相同）                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 14.5 共享 Album 的并发安全问题
+
+当两个用户的 root_path 存在包含关系时，共享 Album 可能被两个 `AddUserToQueue` 调用同时入队。`ScannerQueue.jobOnQueue()` 的去重逻辑保证了同一 Album 不会被并发扫描：
+
+```go
+func (queue *ScannerQueue) jobOnQueue(job *ScannerJob) (bool, error) {
+    scannerJobs := append(queue.in_progress, queue.up_next...)
+    for _, scannerJob := range scannerJobs {
+        if scannerJob.ctx.GetAlbum().ID == job.ctx.GetAlbum().ID {
+            return true, nil  // 已在队列中，跳过
+        }
+    }
+    return false, nil
+}
+```
+
+但有一个**时序窗口**：`AddUserToQueue` 中 `FindAlbumsForUser` 和 `addJob` 不是原子操作。如果两个用户的扫描请求几乎同时到达：
+
+```
+时间线：
+  User A: FindAlbumsForUser → [Album 1, Album 2] → 加锁 addJob(Album 1), addJob(Album 2) → 解锁
+  User B: FindAlbumsForUser → [Album 2, Album 3] → 加锁 addJob(Album 2 已存在，跳过), addJob(Album 3) → 解锁
+```
+
+由于 `addJob` 在 `mutex.Lock()` 保护下执行，去重检查是安全的。但如果 User A 的 `FindAlbumsForUser` 还在执行（尚未 addJob），User B 的 `FindAlbumsForUser` 也可能完成并 addJob——此时 Album 2 可能被 User A 或 B 先入队，另一个被去重跳过。由于 `ScanAlbum` 是幂等的，无论哪个用户先扫描结果都相同。
+
+### 14.6 Cleanup 的隔离语义
+
+**`CleanupMedia`**（`cleanup_media.go:17`）：按 `album_id` 清理，只删除**当前 Album** 中文件系统已不存在的 Media。不影响其他 Album 的 Media。
+
+**`DeleteOldUserAlbums`**（`cleanup_media.go:68`）：按 `user_id` 过滤，只删除**该用户**关联但本次 BFS 未扫描到的 Album。但有一个重要细节——如果被删除的 Album 同时被另一个用户拥有：
+
+```go
+// 删除 user_albums 中该用户的关联
+tx.Where("album_id IN (?)", deleteAlbumIDs).Delete(&models.UserAlbums{})
+// 然后删除 Album 记录本身
+tx.Where("id IN (?)", deleteAlbumIDs).Delete(models.Album{})
+```
+
+**这里存在隔离漏洞**：`DeleteOldUserAlbums` 只检查**当前用户**的 `user_albums` 关联来判断哪些 Album 是"旧的"，但没有检查这些 Album 是否还有其他用户拥有。如果一个 Album 同时属于 User A 和 User B，而 BFS 只扫描了 User A 的 root_path（因为 Album 在 User A 的路径树下被发现了），那么这个 Album 不会出现在 User B 的 `scannedAlbumIDs` 中。当 User B 的 `FindAlbumsForUser` 执行 `DeleteOldUserAlbums` 时，可能会删除这个共享 Album。
+
+不过实际场景中这种情况较少发生，因为共享 Album 通常会被至少一个用户的 BFS 发现。
+
+### 14.7 用户删除时的隔离处理
+
+`DeleteUser()`（`user_actions.go:14`）的处理逻辑：
+
+```go
+// 1. 清除用户与 Album 的关联
+tx.Model(&user).Association("Albums").Clear()
+
+// 2. 对每个 Album，检查是否还有其他 Owner
+for _, album := range userAlbums {
+    associatedUsers := tx.Model(album).Association("Owners").Count()
+    if associatedUsers == 0 {
+        // 无其他 Owner → 删除 Album
+        tx.Delete(album)
+    }
+    // 还有其他 Owner → 保留 Album
+}
+
+// 3. 删除用户记录
+tx.Delete(&user)
+
+// 4. 事务外：清理缓存目录
+for _, deletedAlbumID := range deletedAlbumIDs {
+    os.RemoveAll(path.Join(utils.MediaCachePath(), strconv.Itoa(deletedAlbumID)))
+}
+```
+
+- 只删除**无其他 Owner** 的 Album 及其缓存
+- 共享 Album 保留，其他用户仍可访问
+- 缓存清理在事务外执行（`os.RemoveAll` 无法参与数据库事务）
+
+### 14.8 隔离边界总结
+
+| 维度 | 隔离机制 | 潜在风险 |
+|------|---------|---------|
+| **目录遍历** | BFS 从用户 root_albums 出发，不跨 root | 路径包含关系导致共享 Album |
+| **任务调度** | 队列按 album ID 去重，共享 Album 只扫描一次 | 无——幂等性保证安全 |
+| **数据库写入** | Media 属于 Album，不直接属于 User | 共享 Album 的 Media 对所有 Owner 可见 |
+| **缓存文件** | `MediaCachePath/albumID/mediaID/` 按 Album 隔离 | 共享 Album 的缓存天然共享 |
+| **Cleanup** | `DeleteOldUserAlbums` 按 user_id 过滤 | 共享 Album 可能被误删（BFS 未发现时） |
+| **用户删除** | 只删无 Owner 的 Album | 安全——有其他 Owner 的 Album 被保留 |
+| **并发安全** | `ScannerQueue.mutex` 保护 addJob | 安全——去重检查在锁内 |
+
+**核心结论**：Photoview 的多用户隔离以 **Album 为边界**而非以 User 为边界。User 通过 `user_albums` 多对多关系"视图化"地访问 Album 中的 Media，但 Album 及其 Media、缓存是全局共享的资源。对于 root_path 完全独立的用户，隔离是天然的；对于存在路径包含关系的用户，共享 Album 是设计意图（而非漏洞），但 `DeleteOldUserAlbums` 的清理逻辑在共享场景下存在潜在的误删风险
