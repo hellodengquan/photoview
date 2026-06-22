@@ -1286,15 +1286,564 @@ return result, errors
 
 ---
 
-## 十、改进建议
+## 十、分页大相册场景下的批量上限与降级机制
 
-### 10.1 解决 Album.thumbnail 的 N+1 问题（最高优先级）
+### 10.1 maxBatch 参数的含义与触发条件
+
+所有 DataLoader 均配置了两个关键参数：
+- `wait = 5 * time.Millisecond`：收集窗口
+- `maxBatch = 100`：单批次最大 key 数量
+
+**触发批量获取有两种独立的机制，先到先触发**：
+
+```go
+// api/dataloader/gen_mediaurlloader.go:181-203
+func (b *mediaURLLoaderBatch) keyIndex(l *MediaURLLoader, key int) int {
+    // ...去重检查...
+    
+    pos := len(b.keys)
+    b.keys = append(b.keys, key)
+    
+    // 条件 A: 第一个 key 加入 → 启动定时器
+    if pos == 0 {
+        go b.startTimer(l)  // 5ms 后触发
+    }
+
+    // 条件 B: 达到 maxBatch → 立即触发
+    if l.maxBatch != 0 && pos >= l.maxBatch-1 {
+        // pos 从 0 开始，所以 pos==99 时就是第 100 个 key
+        if !b.closing {
+            b.closing = true
+            l.batch = nil    // ★ 关键：断开当前 batch
+            go b.end(l)      // ★ 异步执行：不阻塞当前 Load 调用
+        }
+    }
+
+    return pos
+}
+```
+
+**代码位置**：`api/dataloader/gen_mediaurlloader.go:181-203`
+
+**两个触发条件的竞争关系**：
+
+```
+时间轴 (ms):  0        1        2        3        4        5
+              │                                                │
+条件 B:    [第100个 key 到达 → 立即触发]     [第200个 key → 再次触发]
+                │                                     │
+                └→ l.batch = nil, 新请求创建新 batch  └→ 同上
+
+条件 A:    [启动 5ms 定时器] ──────────────────────────── [5ms 到点 → 触发]
+                                                           │
+                                                           └→ 如果 batch 已被条件 B 关闭
+                                                              则 startTimer 中的 closing 检查
+                                                              会跳过 end() 调用
+```
+
+**关键细节**：
+- `pos >= l.maxBatch-1` 而非 `pos >= l.maxBatch`：pos 从 0 开始，第 100 个 key 的 pos = 99
+- `go b.end(l)` 异步执行：当前 goroutine 立即返回，不会阻塞等待 SQL 返回
+- `l.batch = nil` 断开引用：后续的 `Load` 调用会检测 `l.batch == nil`，创建新 batch
+
+### 10.2 大相册分页场景的完整链路分析
+
+**场景设定**：
+- 某个相册有 5000 张图片（大相册）
+- 前端查询：`album.media(paginate: { limit: 500, offset: 0 })`
+- Media 字段选择：`{ id, thumbnail { url }, highRes { url }, favorite }`
+- 即每个 Media 触发 **3 次 DataLoader 调用**（MediaThumbnail、MediaHighres、UserMediaFavorite）
+
+**分页查询入口**：
+```go
+// api/graphql/resolvers/album.go:21-51
+func (r *albumResolver) Media(ctx context.Context, obj *models.Album, order *models.Ordering, paginate *models.Pagination, onlyFavorites *bool) ([]*models.Media, error) {
+    db := r.DB(ctx)
+    query := db.Where("media.album_id = ?", obj.ID)
+          .Where("media.id IN (subquery for media_urls)")
+    // ... onlyFavorites 过滤 ...
+    
+    query = models.FormatSQL(query, order, paginate)  // 应用分页
+    // paginate.Limit = 500 → tx.Limit(500)
+    // paginate.Offset = 0   → tx.Offset(0)
+    
+    var media []*models.Media
+    query.Find(&media)  // 返回 500 个 Media 对象
+    return media, nil
+}
+```
+
+**代码位置**：`api/graphql/resolvers/album.go:21-51`
+
+**FormatSQL 实现**：
+```go
+// api/graphql/models/utils.go:11-40
+func FormatSQL(tx *gorm.DB, order *Ordering, paginate *Pagination) *gorm.DB {
+    if paginate != nil {
+        if paginate.Limit != nil {
+            tx.Limit(*paginate.Limit)    // 单页最大 500
+        }
+        if paginate.Offset != nil {
+            tx.Offset(*paginate.Offset)
+        }
+    }
+    // ... order 处理 ...
+    return tx
+}
+```
+
+### 10.3 500 个 Media 的 DataLoader 分批处理
+
+以 `MediaThumbnail` DataLoader 为例，500 个 Media 会触发 500 次 `Load(mediaID)` 调用。由于 gqlgen **并行执行** resolver，这些调用会在短时间内密集到来。
+
+**分批过程详解**：
+
+```
+T0 (ms):
+  gqlgen 启动 500 个并行 field resolver，每个调用 MediaThumbnail.Load(mediaID)
+
+  调用 1-100 (mediaID 1 到 100):
+    ├─ Load(1):  pos=0 → 启动 5ms 定时器
+    ├─ Load(2):  pos=1 → 无特殊操作
+    ├─ ...
+    └─ Load(100): pos=99 → 达到 maxBatch-1
+                     ├─ b.closing = true
+                     ├─ l.batch = nil  ← 断开！
+                     └─ go b.end(l)    ← 异步执行 Batch #1
+                            └→ SQL: WHERE media_id IN (1,2,...,100)
+
+T0.5 (ms, 调用 101):
+  Load(101): 检测到 l.batch == nil → 创建新 batch B2
+    ├─ pos=0 → 启动**新的** 5ms 定时器（定时器 #2）
+    └─ ...
+
+  调用 101-200 (mediaID 101 到 200):
+    └─ Load(200): pos=99 → 达到 maxBatch-1
+                    ├─ b.closing = true
+                    ├─ l.batch = nil
+                    └─ go b.end(l)   ← 异步执行 Batch #2
+                           └→ SQL: WHERE media_id IN (101,102,...,200)
+
+T1.0 (ms, 调用 201):
+  Load(201): l.batch == nil → 创建新 batch B3
+    ...
+
+T1.5 (ms): Batch #3 触发 (ID 201-300)
+T2.0 (ms): Batch #4 触发 (ID 301-400)
+T2.5 (ms): Batch #5 触发 (ID 401-500)
+
+T5.0 (ms):
+  定时器 #1 (从 T0 启动) 到时 → startTimer() 中检测 b.closing == true → 跳过，不重复执行
+  定时器 #2 (从 T0.5 启动) 到时 → 同样跳过
+  ...以此类推
+```
+
+**最终结果**：
+| DataLoader | 调用次数 | 实际 SQL 批次数 | 每批 key 数 |
+|-----------|---------|---------------|-----------|
+| MediaThumbnail | 500 | 5 | 100, 100, 100, 100, 100 |
+| MediaHighres | 500 | 5 | 100, 100, 100, 100, 100 |
+| UserMediaFavorite | 500 | **可能 ~500** | 受指针 key 去重失败影响 |
+
+**总计**：无分页限制时若 5000 张图片，会产生 50 批次 × 3 Loader = 150 次 SQL，远优于 5000×3 = 15000 次（降低 99%）。
+
+### 10.4 降级机制：maxBatch 的保护作用
+
+`maxBatch = 100` 不是性能优化参数，而是**数据库保护机制**：
+
+#### 10.4.1 防止超长 IN 列表
+
+PostgreSQL 对 SQL 语句长度和参数数量有限制（虽然很高，但不是无限）。超长 IN 列表会导致：
+- SQL 解析器负担增加
+- 查询计划优化时间变长
+- 网络传输数据量大
+
+**示例对比**：
+```sql
+-- 无 maxBatch 限制：5000 个 key 的 IN 列表
+SELECT * FROM media_urls WHERE media_id IN (1,2,3,...,5000);
+-- SQL 文本大小：约 30KB，参数绑定 5000 个
+
+-- 有 maxBatch=100：拆分为 50 次查询
+SELECT * FROM media_urls WHERE media_id IN (1,2,...,100);
+-- SQL 文本大小：约 500B，参数绑定 100 个 × 50 次
+```
+
+#### 10.4.2 防止查询超时
+
+单批次 10000 个 key 的查询可能因为：
+- 回表扫描行数过多
+- 临时表/排序内存不足
+- 单事务持有时间过长
+
+导致查询超时甚至数据库连接池耗尽。拆分为小批次后，每批查询时间可控。
+
+#### 10.4.3 锁持有时间限制
+
+InnoDB 等存储引擎在查询时会持有各种锁。超长查询会导致：
+- 锁等待队列增长
+- 写入操作被阻塞（ALTER TABLE、VACUUM 等维护操作无法执行）
+
+### 10.5 分页场景下的极端情况分析
+
+#### 情况 1：单个请求查询多个相册的媒体
+
+```graphql
+query {
+  myAlbums {
+    id
+    media(paginate: { limit: 50 }) { id thumbnail { url } }
+  }
+}
+```
+
+假设返回 20 个相册，每个相册 50 个 media，共 1000 个 media：
+- **注意**：不同相册的 `albumResolver.Media()` 是**并行执行**的（gqlgen 特性）
+- 它们返回的 media 总数 = 20 × 50 = 1000 个 Media 对象
+- gqlgen 解析这 1000 个 Media 的 `thumbnail` 字段时，所有 `Load` 调用会在 5ms 窗口内混合累积
+- **DataLoader 不区分 media 来自哪个相册**，只按 media_id 去重和分批
+- 最终 MediaThumbnail 会产生 **10 批次**（每批 100）
+
+#### 情况 2：同一批次中重复的 media_id
+
+场景：多个相册共享同一个封面（例如子相册继承父相册封面），此时 keyIndex 中的去重逻辑发挥作用：
+
+```go
+// api/dataloader/gen_mediaurlloader.go:182-187
+for i, existingKey := range b.keys {
+    if key == existingKey {   // 值比较
+        return i              // 返回已有位置
+    }
+}
+```
+
+500 个 Load 调用中若有 100 个是重复的 mediaID：
+- 实际 batch.keys 长度 = 400（而非 500）
+- 产生 4 批次而非 5 批次
+- 节省 20% 的 SQL 次数
+
+#### 情况 3：定时器先触发，key 不足 100
+
+场景：分页 limit = 50，且只有这一个字段需要 DataLoader。
+
+```
+T0: Load(1) → 启动 5ms 定时器
+T0.1: Load(2) ~ T0.5: Load(50)
+    └─ pos=49，未达到 maxBatch-1=99
+T5: 定时器到时
+    └─ 触发 batch.end() → SQL: media_id IN (1..50)
+```
+
+**降级**：产生 1 批次，每批 50 个 key。此时 SQL IN 列表较短，但仍然是批量查询，开销可接受。
+
+### 10.6 降级时机判断与配置建议
+
+当前 `maxBatch = 100`、`wait = 5ms` 是通用配置，但不同场景可以考虑不同策略：
+
+| 场景 | 建议 maxBatch | 建议 wait | 理由 |
+|-----|-------------|----------|-----|
+| 相册媒体缩略图 | 200~500 | 5ms | media_urls 表小、查询简单 |
+| 用户收藏（UserMediaFavorite） | 50~100 | 5ms | 笛卡尔积查询，查询更重 |
+| 递归 CTE 查询（AlbumThumbnail） | 10~20 | 10ms | 查询极重，宁可多分几批 |
+| 长连接 subscription | 20~50 | 10ms | 响应延迟比吞吐量更重要 |
+
+**注意**：当前所有 Loader 硬编码为 `maxBatch=100, wait=5ms`，无法按场景配置。如需调整需修改各 Loader 工厂函数的初始化参数。
+
+---
+
+## 十一、并发 Subscription 同时订阅同一字段时的批次合并行为
+
+### 11.1 进程级 Notification 广播机制
+
+PhotoView 的通知系统基于**全局进程内数组 + 互斥锁**实现广播：
+
+```go
+// api/graphql/notification/Notification.go:28-30
+var notificationListeners []*NotificationListener = make([]*NotificationListener, 0)
+var nextNotificationId = 0
+var notificationLock = &sync.Mutex{}
+```
+
+**广播过程**：
+
+```go
+// api/graphql/notification/Notification.go:70-83
+func BroadcastNotification(notification *models.Notification) {
+    notificationLock.Lock()
+    defer notificationLock.Unlock()
+
+    for _, listener := range notificationListeners {
+        listener.channel <- notification
+    }
+}
+```
+
+**代码位置**：`api/graphql/notification/Notification.go:70-83`
+
+**关键特性**：
+- `notificationListeners` 是**全局单例数组**：所有 WebSocket 连接的订阅者都注册到同一个数组
+- `BroadcastNotification` 是**同步遍历写入**：依次向每个 listener 的 channel 写入 notification 对象
+- `listener.channel` 是 `chan<- *models.Notification`（写端 channel）
+- 同一 notification 指针对象被**所有 listener 共享**（不是拷贝）
+
+### 11.2 多订阅者场景的 DataLoader 隔离性
+
+假设有 3 个客户端同时建立 WebSocket 连接并订阅 notification：
+
+```
+客户端 A (WebSocket Conn #1)
+    └─ DataLoader 实例 LA (cache_A: map[int]*MediaURL)
+    
+客户端 B (WebSocket Conn #2)
+    └─ DataLoader 实例 LB (cache_B: map[int]*MediaURL)
+    
+客户端 C (WebSocket Conn #3)
+    └─ DataLoader 实例 LC (cache_C: map[int]*MediaURL)
+
+全局 listeners 数组: [A-listener, B-listener, C-listener]
+                        │            │            │
+                        └─ channel_A  │            │
+                                     └─ channel_B  │
+                                                  └─ channel_C
+```
+
+**核心结论：跨连接 DataLoader 完全隔离，不共享 batch 和 cache。**
+
+根本原因：
+- `dataloader.Middleware` 在每个 WebSocket 升级的 HTTP 请求中创建独立的 Loaders 对象
+- 每个 WebSocket 连接持有独立的 context，包含独立的 DataLoader
+- `notificationListeners` 数组中只保存 channel，不共享任何 Loader 状态
+
+### 11.3 单次广播事件触发多连接解析的时序
+
+#### 11.3.1 假设 Notification 包含 Media 字段（扩展场景）
+
+假设 Schema 定义为：
+```graphql
+type Notification {
+    id: ID!
+    key: String!
+    relatedMedia: Media   # 新增：关联的媒体
+}
+```
+
+客户端查询：
+```graphql
+subscription {
+  notification {
+    relatedMedia {
+      id
+      thumbnail { url }   # 使用 MediaThumbnail DataLoader
+      favorite            # 使用 UserMediaFavorite DataLoader
+    }
+  }
+}
+```
+
+#### 11.3.2 广播到解析的完整时序
+
+```
+T0: 扫描完成，调用 BroadcastNotification(&Notification{relatedMediaID: 100})
+    │
+    ├─ notificationLock.Lock()
+    │
+    ├─ 遍历 listeners:
+    │   ├─ channel_A <- notif  (非阻塞写？取决于 channel buffer)
+    │   ├─ channel_B <- notif
+    │   └─ channel_C <- notif
+    │
+    └─ notificationLock.Unlock()
+
+T0.1: A、B、C 的 subscription resolver 各自从 channel 收到 notif
+    │
+    ├─ 连接 A: gqlgen 启动字段解析
+    │   ├─ Notification.relatedMedia → 返回 &Media{ID: 100}
+    │   └─ Media.thumbnail 解析 → LA.Load(100)
+    │       ├─ LA.cache[100] 未命中（首次加载）
+    │       ├─ 创建 batch_A_1，keys=[100]，pos=0 → 启动 5ms 定时器
+    │       └─ 返回 thunk_A
+    │
+    ├─ 连接 B: gqlgen 启动字段解析
+    │   └─ Media.thumbnail 解析 → LB.Load(100)
+    │       ├─ LB.cache[100] 未命中
+    │       ├─ 创建 batch_B_1，keys=[100]，pos=0 → 启动 5ms 定时器
+    │       └─ 返回 thunk_B
+    │
+    └─ 连接 C: gqlgen 启动字段解析
+        └─ Media.thumbnail 解析 → LC.Load(100)
+            ├─ LC.cache[100] 未命中
+            ├─ 创建 batch_C_1，keys=[100]，pos=0 → 启动 5ms 定时器
+            └─ 返回 thunk_C
+
+T5.0: 三个定时器**各自**到时
+    ├─ batch_A_1.end() → SQL (连接 A): WHERE media_id IN (100)  ← 独立查询
+    ├─ batch_B_1.end() → SQL (连接 B): WHERE media_id IN (100)  ← 独立查询  
+    └─ batch_C_1.end() → SQL (连接 C): WHERE media_id IN (100)  ← 独立查询
+
+结果：3 个客户端查询相同的 media_id=100，但产生了 3 次独立 SQL 查询！
+```
+
+### 11.4 同一连接内多个 Subscription 的合并
+
+**gqlgen 支持单个 WebSocket 连接上同时运行多个 subscription 操作**（通过 graphql-ws 协议的多 operation ID）。
+
+```
+同一个 WebSocket 连接 (Conn #1, DataLoader 实例 L1):
+    ├─ subscription Op #1: notification { relatedMedia { thumbnail } }
+    └─ subscription Op #2: mediaUpdated { media { thumbnail { url } } }
+```
+
+这两个订阅共享**同一个** DataLoader 实例 L1，存在 batch 合并的可能。
+
+#### 11.4.1 合并发生的条件
+
+```
+T0: Op #1 收到 notification，包含 mediaID=100
+    └─ L1.Load(100) → 创建 batch1，keys=[100]，启动 5ms 定时器
+
+T0.2 (在 5ms 内): Op #2 收到 mediaUpdated 事件，也包含 mediaID=100
+    └─ L1.Load(100) → 检测 batch1 存在
+        ├─ keyIndex 去重：100 已存在于 keys[0]，返回 pos=0
+        └─ 共享同一个 batch1，不重复添加 key
+
+T5: batch1.end() → 1 次 SQL: media_id IN (100)
+    ├─ thunk(Op #1, 100) ← 返回结果
+    └─ thunk(Op #2, 100) ← 返回结果（同一个 batch，同一个值）
+
+结果：合并成功，只产生 1 次 SQL（而不是 2 次）
+```
+
+#### 11.4.2 合并失败的场景
+
+```
+T0: Op #1 收到 notification，L1.Load(100) → batch1 创建，启动定时器
+
+T5.1 (超过 5ms): batch1 已经触发 end()，SQL 执行中但结果未返回
+    └─ 此时 Op #2 收到事件，L1.Load(100)
+        ├─ 检查 L1.cache[100] → nil（thunk 还未执行完，缓存未写入）
+        ├─ l.batch == nil（batch1 已被断开）
+        ├─ 创建新 batch2，keys=[100]，启动新定时器
+
+T6: batch1 的 SQL 执行完毕，thunk 执行 → L1.cache[100] = result
+
+T10: batch2 定时器触发
+    └─ end() → 第 2 次 SQL: media_id IN (100)
+       （可以通过「在 fetch 之前检查缓存」的优化来避免）
+
+结果：合并失败，产生 2 次相同 SQL（第 2 次可优化）
+```
+
+### 11.5 通知广播的阻塞风险与 channel buffer
+
+在 `BroadcastNotification` 中，向 channel 写入是**阻塞**操作（默认是无缓冲 channel）：
+
+```go
+listener.channel <- notification   // 阻塞直到有 goroutine 读取
+```
+
+**问题场景**：某个订阅者解析慢（例如字段复杂、DataLoader 批量等待时间长），其 channel 读取不及时。
+
+```
+Listeners: [Fast-A, Slow-B, Fast-C]
+
+Broadcast 循环：
+  1. channel_A <- notif → 立即成功（A 正在快速消费）
+  2. channel_B <- notif → **阻塞**！（B 还在处理上一条消息的字段解析）
+     ... B 的 channel 满了，整个循环停滞
+  3. channel_C 的写入永远不会发生
+```
+
+**全系统影响**：一个慢消费者会阻塞所有后续消费者的通知送达，且阻塞 `notificationLock` 的释放，导致新订阅/注销操作也被阻塞。
+
+**当前代码中未显式设置 channel buffer**。查看 subscription resolver：
+
+```go
+// api/graphql/resolvers/notification.go:18-34
+func (r *subscriptionResolver) Notification(ctx context.Context) (<-chan *models.Notification, error) {
+    user := auth.UserFromContext(ctx)
+    
+    notificationChannel := make(chan *models.Notification)  // ★ 无缓冲 channel!
+    
+    listenerID := notification.RegisterListener(user, notificationChannel)
+    
+    go func() {
+        <-ctx.Done()  // 连接断开时
+        notification.DeregisterListener(listenerID)
+        close(notificationChannel)
+    }()
+    
+    return notificationChannel, nil
+}
+```
+
+**代码位置**：`api/graphql/resolvers/notification.go:18-34`
+
+### 11.6 Batch 内去重 vs 跨 Batch 去重
+
+**同一连接内，不同 Subscription 事件触发的 Load 调用可以发生两种层面的去重**：
+
+| 去重层面 | 发生时机 | 机制 | 效果 |
+|---------|---------|------|-----|
+| Batch 内去重 | 5ms 窗口内 | keyIndex 线性扫描 `b.keys` | 相同 key 只在 batch 中存一份 |
+| 跨 Batch 去重 | 跨时间窗口 | l.cache 命中 | 相同 key 直接返回缓存，不进新 batch |
+
+**跨 Batch 缓存命中流程**：
+```
+时间窗口 #1 (T0~T5):
+  Load(100) → 未命中缓存 → batch1: [100] → SQL → 写入 cache[100] = url_A
+
+时间窗口 #2 (T20~T25):
+  Load(100) → 检查 cache[100] → 命中！
+    ├─ 不创建 batch
+    ├─ 不加入 keys
+    └─ 直接返回 url_A（无需 SQL）
+```
+
+**长连接场景下的缓存优势**：
+- 频繁更新的同一媒体（例如重新生成缩略图通知），在长连接中**只需查询一次**
+- HTTP 请求模式下每次请求都要重新查询
+- 这是长连接 DataLoader 缓存的**唯一正面效果**（需权衡内存与过期问题）
+
+### 11.7 并发安全性分析
+
+多个 goroutine 同时操作同一 DataLoader 时的锁互斥分析：
+
+```go
+// LoadThunk 中所有共享状态操作都在 mu.Lock 保护下：
+func (l *MediaURLLoader) LoadThunk(key int) func() (*models.MediaURL, error) {
+    l.mu.Lock()    // ★ 加锁
+    defer l.mu.Unlock()
+    
+    if it, ok := l.cache[key]; ok { ... }      // 读 cache
+    if l.batch == nil { l.batch = ... }        // 写 batch 指针
+    pos := l.batch.keyIndex(l, key)            // 写 batch.keys
+    ...
+    return func() { ... }
+}
+```
+
+**关键保证**：
+1. **Batch 创建原子性**：`l.batch == nil` 检查 + 创建赋值在锁内完成，不会创建两个 batch
+2. **Cache 读写安全**：所有读写都在锁内，不会出现并发 map 读写 panic
+3. **Batch.keys 安全**：keyIndex 只在锁内被调用，切片 append 是安全的
+4. **断开逻辑安全**：`l.batch = nil` + `b.closing = true` 在锁内完成，定时器到时的 startTimer 也会加锁检查
+
+**唯一非原子点**：`go b.end(l)` 是异步执行的，`end()` 调用 `l.fetch(b.keys)` 时不在锁内。但这是安全的，因为：
+- `b.keys` 切片在 `closing=true` 后不会再被修改（新 Load 创建新 batch）
+- 没有其他 goroutine 会读写 `b.data` 和 `b.error`
+- fetch 函数本身使用独立的 DB 连接（由 GORM 连接池管理）
+
+---
+
+## 十二、改进建议
+
+### 12.1 解决 Album.thumbnail 的 N+1 问题（最高优先级）
 
 详见第九章「AlbumThumbnailLoader 批量获取相册封面的代码实现路径」的完整实现方案。
 
 **预期收益**：相册列表查询次数从 N+3 降低到约 4-5 次，延迟降低 90% 以上。
 
-### 10.2 解决 UserFavoritesLoader 的缓存问题
+### 12.2 解决 UserFavoritesLoader 的缓存问题
 
 **问题**：使用指针作为 cache key，导致相同内容无法命中缓存，batch 去重也失效。
 
@@ -1306,7 +1855,7 @@ return result, errors
 
 **方案 B**：自定义 hashCode 或实现 `comparable` 接口（Go 1.21+）。
 
-### 10.3 扩展更多 DataLoader
+### 12.3 扩展更多 DataLoader
 
 为高频查询字段添加 DataLoader：
 
@@ -1317,9 +1866,34 @@ return result, errors
 | `AlbumByIDLoader`    | `Media.album`    | album ID     |
 | `SubAlbumsLoader`    | `Album.subAlbums`| parent album ID |
 
+### 12.4 配置化 DataLoader 参数（按场景优化）
+
+当前所有 Loader 硬编码 `maxBatch=100, wait=5ms`，建议改为可配置，见第十章 10.6 节的分场景建议表。
+
+### 12.5 为 Notification channel 增加 buffer
+
+解决慢消费者阻塞全局广播问题：
+
+```go
+// 修改前：无缓冲
+notificationChannel := make(chan *models.Notification)
+
+// 修改后：带缓冲，避免阻塞 Broadcast
+notificationChannel := make(chan *models.Notification, 100)
+```
+
+同时建议 Broadcast 使用 select + default 做非阻塞写入，避免慢消费者影响其他人。
+
+### 12.6 跨连接查询结果缓存（进阶）
+
+多连接查询同一 mediaID 时产生重复 SQL（第十一章 11.3.2 节），可引入**进程级共享查询结果缓存**：
+- 使用带 TTL 的全局 LRU Cache（如 `hashicorp/golang-lru`）
+- 在 fetch 函数执行前先查全局缓存，命中则直接返回
+- 在 DataLoader 之外独立维护，不影响请求级 DataLoader 隔离语义
+
 ---
 
-## 十一、关键代码位置索引
+## 十三、关键代码位置索引
 
 | 功能                | 文件路径                                                    | 行号   |
 | ------------------- | ----------------------------------------------------------- | ------ |
@@ -1329,19 +1903,29 @@ return result, errors
 | MediaURLLoader 生成 | `api/dataloader/gen_mediaurlloader.go`                      | -      |
 | LoadThunk 核心实现  | `api/dataloader/gen_mediaurlloader.go`                      | 73-112 |
 | keyIndex 批量收集   | `api/dataloader/gen_mediaurlloader.go`                      | 181-203|
+| startTimer 定时器   | `api/dataloader/gen_mediaurlloader.go`                      | 205-219|
+| end 批量获取        | `api/dataloader/gen_mediaurlloader.go`                      | 221-224|
 | MediaURL fetch 实现 | `api/dataloader/mediaURLLoader.go`                          | 13-82  |
 | UserFavorite fetch  | `api/dataloader/userFavoriteLoader.go`                      | 10-60  |
 | UserLoader fetch    | `api/dataloader/userLoader.go`                              | 10-71  |
 | UserFavorites 缓存  | `api/dataloader/gen_userfavoritesloader.go`                 | 47     |
 | 相册列表 resolver   | `api/graphql/resolvers/album.go`                            | 119-126|
 | 相册 thumbnail 解析 | `api/graphql/resolvers/album.go`                            | 72-75  |
+| 相册媒体分页查询    | `api/graphql/resolvers/album.go`                            | 21-51  |
 | 媒体 thumbnail 解析 | `api/graphql/resolvers/media.go`                            | 22-25  |
 | 媒体 favorite 解析  | `api/graphql/resolvers/media.go`                            | 69-80  |
 | Album.Thumbnail()   | `api/graphql/models/album.go`                               | 83-115 |
 | MyAlbums action     | `api/graphql/models/actions/album_actions.go`               | 9-48   |
 | User.FillAlbums()   | `api/graphql/models/user.go`                                | 154-165|
+| 分页 FormatSQL      | `api/graphql/models/utils.go`                               | 11-40  |
+| Pagination 模型     | `api/graphql/models/generated.go`                           | 63-68  |
 | 前端相册列表查询    | `ui/src/Pages/AllAlbumsPage/AlbumsPage.tsx`                 | 11-28  |
 | WebSocket 传输配置  | `api/graphql/endpoint/graphql_endpoint.go`                  | 31-35  |
 | WebSocket 认证      | `api/graphql/auth/auth.go`                                  | 92-130 |
 | Notification 订阅   | `api/graphql/resolvers/notification.go`                     | 17-34  |
-| 订阅生成代码        | `api/graphql/generated.go`                                  | 7567-7585 |
+| Notification 广播   | `api/graphql/notification/Notification.go`                  | 70-83  |
+| 监听器全局数组      | `api/graphql/notification/Notification.go`                  | 28-30  |
+| myAlbums 生成代码   | `api/graphql/generated.go`                                  | 6219-6251 |
+| subscription 生成代码| `api/graphql/generated.go`                                  | 7567-7585 |
+| childFields_Album   | `api/graphql/generated.go`                                  | 1642   |
+| childFields_Media   | `api/graphql/generated.go`                                  | 1732   |
